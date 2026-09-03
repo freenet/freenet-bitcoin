@@ -454,53 +454,6 @@ fn parse_address(s: &str, network: BitcoinNetwork) -> Result<Vec<u8>> {
     Ok(addr.script_pubkey().as_bytes().to_vec())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn addresses_parse_to_canonical_script_bytes() {
-        // A well-known mainnet P2PKH address (Bitcoin's genesis coinbase).
-        let spk = parse_address(
-            "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
-            BitcoinNetwork::Bitcoin,
-        )
-        .unwrap();
-        // OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
-        assert_eq!(spk.len(), 25);
-        assert_eq!(spk[0], 0x76);
-        assert_eq!(spk[1], 0xa9);
-        assert_eq!(spk[24], 0xac);
-    }
-
-    #[test]
-    fn an_address_from_the_wrong_network_is_rejected() {
-        // Accepting one would make the bridge watch a script that can never be
-        // paid on the network it is actually following.
-        assert!(
-            parse_address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", BitcoinNetwork::Signet).is_err()
-        );
-    }
-
-    #[test]
-    fn a_bech32_address_parses_to_a_witness_program() {
-        let spk = parse_address(
-            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
-            BitcoinNetwork::Bitcoin,
-        )
-        .unwrap();
-        assert_eq!(spk[0], 0x00, "v0 witness program");
-        assert_eq!(spk[1], 0x14, "20-byte push");
-        assert_eq!(spk.len(), 22);
-    }
-
-    #[test]
-    fn garbage_is_rejected_rather_than_silently_watched() {
-        assert!(parse_address("not-an-address", BitcoinNetwork::Bitcoin).is_err());
-        assert!(parse_address("", BitcoinNetwork::Bitcoin).is_err());
-    }
-}
-
 /// Read an address contract back out of Freenet and report what it proves.
 ///
 /// Deliberately re-verifies every claim from scratch rather than trusting the
@@ -658,4 +611,51 @@ async fn verify_address(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn addresses_parse_to_canonical_script_bytes() {
+        // A well-known mainnet P2PKH address (Bitcoin's genesis coinbase).
+        let spk = parse_address(
+            "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+            BitcoinNetwork::Bitcoin,
+        )
+        .unwrap();
+        // OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+        assert_eq!(spk.len(), 25);
+        assert_eq!(spk[0], 0x76);
+        assert_eq!(spk[1], 0xa9);
+        assert_eq!(spk[24], 0xac);
+    }
+
+    #[test]
+    fn an_address_from_the_wrong_network_is_rejected() {
+        // Accepting one would make the bridge watch a script that can never be
+        // paid on the network it is actually following.
+        assert!(
+            parse_address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", BitcoinNetwork::Signet).is_err()
+        );
+    }
+
+    #[test]
+    fn a_bech32_address_parses_to_a_witness_program() {
+        let spk = parse_address(
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            BitcoinNetwork::Bitcoin,
+        )
+        .unwrap();
+        assert_eq!(spk[0], 0x00, "v0 witness program");
+        assert_eq!(spk[1], 0x14, "20-byte push");
+        assert_eq!(spk.len(), 22);
+    }
+
+    #[test]
+    fn garbage_is_rejected_rather_than_silently_watched() {
+        assert!(parse_address("not-an-address", BitcoinNetwork::Bitcoin).is_err());
+        assert!(parse_address("", BitcoinNetwork::Bitcoin).is_err());
+    }
 }

@@ -1,0 +1,84 @@
+[config]
+default_to_workspace = false
+
+[env]
+CONTRACT_TARGET = "wasm32-unknown-unknown"
+
+[tasks.build-contracts]
+description = "Build both Bitcoin contracts to WASM"
+command = "cargo"
+args = ["build", "--target", "${CONTRACT_TARGET}", "-p", "bitcoin-address-contract",
+        "-p", "bitcoin-tip-contract", "--features", "contract", "--release"]
+
+[tasks.check-imports]
+description = "Fail if a contract imports a namespace the runtime does not register"
+dependencies = ["build-contracts"]
+script = '''
+./scripts/check-wasm-imports.sh \
+  target/${CONTRACT_TARGET}/release/bitcoin_address_contract.wasm \
+  target/${CONTRACT_TARGET}/release/bitcoin_tip_contract.wasm
+'''
+
+[tasks.code-hashes]
+description = "Print the contract code hashes, which ARE the contracts' identity"
+dependencies = ["build-contracts"]
+script = '''
+for f in target/${CONTRACT_TARGET}/release/bitcoin_*_contract.wasm; do
+  echo "$(b3sum --no-names "$f")  $(basename "$f")"
+done
+echo
+echo "If either differs from the 'current = true' entry in legacy_contracts.toml,"
+echo "the contracts have re-keyed. Record the outgoing hash there before publishing."
+'''
+
+[tasks.build-bridge]
+description = "Build the bridge daemon"
+command = "cargo"
+args = ["build", "--release", "-p", "bitcoin-freenet-bridge"]
+
+[tasks.test]
+command = "cargo"
+args = ["test", "-p", "freenet-bitcoin-common", "-p", "bitcoin-freenet-bridge"]
+
+[tasks.preflight]
+description = "Everything CI runs, before you push"
+dependencies = ["fmt-check", "clippy", "test", "check-imports", "code-hashes"]
+
+[tasks.fmt-check]
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+
+[tasks.clippy]
+command = "cargo"
+args = ["clippy", "--workspace", "--exclude", "bitcoin-address-contract",
+        "--exclude", "bitcoin-tip-contract", "--all-targets", "--", "-D", "warnings"]
+
+[tasks.verify-merge]
+description = "Run the network's own merge-law verifier against both contracts"
+dependencies = ["build-contracts"]
+script = '''
+# Requires an fdev new enough to have `verify-merge` (added after 0.3.273 --
+# the released binary does NOT have it; build from freenet-core main).
+FDEV="${FDEV:-fdev}"
+if ! "$FDEV" verify-merge --help >/dev/null 2>&1; then
+  echo "This fdev has no verify-merge. Build one from freenet-core main and set FDEV=/path/to/fdev." >&2
+  exit 1
+fi
+D=$(mktemp -d)
+cargo run --release -p bitcoin-freenet-bridge --example dump_states -- "$D"
+
+echo "--- address contract ---"
+"$FDEV" verify-merge \
+  --wasm target/${CONTRACT_TARGET}/release/bitcoin_address_contract.wasm \
+  --params "$D/params.bin" \
+  --state "$D/s0.bin" --state "$D/s1.bin" --state "$D/s2.bin" --state "$D/s3.bin" \
+  --transition "$D/t_base.bin" "$D/t_result.bin" 2>&1 | grep -E "^merge check|violation|no enforceable"
+
+echo "--- tip contract ---"
+"$FDEV" verify-merge \
+  --wasm target/${CONTRACT_TARGET}/release/bitcoin_tip_contract.wasm \
+  --params "$D/tip_params.bin" \
+  --state "$D/tip_s0.bin" --state "$D/tip_s1.bin" --state "$D/tip_s2.bin" --state "$D/tip_s3.bin" \
+  2>&1 | grep -E "^merge check|violation|no enforceable"
+rm -rf "$D"
+'''

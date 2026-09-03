@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the version; installing it explicitly keeps
+      # the contract code hashes reproducible across runners, since a
+      # different rustc emits different WASM and therefore different
+      # contract keys.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace
+             --exclude bitcoin-address-contract --exclude bitcoin-tip-contract
+             --all-targets -- -D warnings
+
+      # The merge laws, SPV verification, and the service layer. These assert
+      # convergence on exact serialized bytes, which is how peers actually
+      # decide they agree.
+      - name: Test
+        run: cargo test -p freenet-bitcoin-common -p bitcoin-freenet-bridge
+
+      - name: Build contracts for wasm32
+        run: cargo build --target wasm32-unknown-unknown
+             -p bitcoin-address-contract -p bitcoin-tip-contract
+             --features contract --release
+
+      # A contract that imports a namespace the runtime does not register
+      # builds and publishes fine, then silently fails to instantiate. This is
+      # the cheapest possible guard against shipping an unloadable module.
+      - name: Contract modules must be loadable
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq wabt
+          ./scripts/check-wasm-imports.sh \
+            target/wasm32-unknown-unknown/release/bitcoin_address_contract.wasm \
+            target/wasm32-unknown-unknown/release/bitcoin_tip_contract.wasm
+
+      # A contract's key is BLAKE3(BLAKE3(wasm) || params), so the code hash IS
+      # the contract's identity. Print it so a re-key is visible in the log of
+      # the run that caused it -- including one caused only by reformatting,
+      # since release binaries embed panic locations as file:line.
+      - name: Report contract code hashes
+        run: |
+          for f in target/wasm32-unknown-unknown/release/bitcoin_*_contract.wasm; do
+            echo "$(b3sum --no-names "$f" 2>/dev/null || sha256sum "$f" | cut -d' ' -f1)  $(basename "$f")"
+          done

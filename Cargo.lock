@@ -241,6 +241,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "freenet-bitcoin-common",
+ "freenet-scaffold",
  "freenet-stdlib",
  "futures",
  "ghostkey_lib",

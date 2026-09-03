@@ -12,6 +12,7 @@ freenet-bitcoin-common = { workspace = true, features = ["test-support"] }
 # the same version the contracts are built against so ContractKey and the wire
 # enums are one type, not two.
 freenet-stdlib = { workspace = true, features = ["net"] }
+freenet-scaffold = { workspace = true }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 

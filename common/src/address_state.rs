@@ -463,7 +463,7 @@ pub fn scanned_to_body(params: &BitcoinAddressParameters, as_of: BlockAnchor) ->
 mod tests {
     use super::*;
     use crate::spv::testing as spv_testing;
-    use crate::{BitcoinNetwork, BlockHash, Txid};
+    use crate::{BitcoinNetwork, BlockHash};
     use ed25519_dalek::SigningKey;
     use freenet_scaffold::ComposableState;
 
@@ -486,13 +486,6 @@ mod tests {
         BlockAnchor {
             height: h,
             hash: BlockHash(b),
-        }
-    }
-
-    fn outpoint(n: u8) -> OutPoint {
-        OutPoint {
-            txid: Txid([n; 32]),
-            vout: 0,
         }
     }
 
@@ -700,7 +693,7 @@ mod tests {
     fn a_claim_from_an_untrusted_bridge_is_rejected() {
         let p = params();
         let (spv, txid, block) =
-            spv_testing::payment_proof(&p.script_pubkey, 21_000_000_00000000, 1, [1; 32]);
+            spv_testing::payment_proof(&p.script_pubkey, 2_100_000_000_000_000, 1, [1; 32]);
         let rogue = SignedClaim::sign(
             &key(9), // not in trusted_bridges
             &ClaimBody {
@@ -709,7 +702,7 @@ mod tests {
                 as_of: anchor(1),
                 claim: Claim::ConfirmedOutput {
                     outpoint: OutPoint { txid, vout: 0 },
-                    value_sats: 21_000_000_00000000,
+                    value_sats: 2_100_000_000_000_000,
                     anchor: BlockAnchor {
                         height: 1,
                         hash: block,
@@ -899,7 +892,7 @@ mod tests {
 mod size_tests {
     use super::*;
     use crate::spv::testing as spv_testing;
-    use crate::{BitcoinNetwork, BlockAnchor, BlockHash, Txid};
+    use crate::{BitcoinNetwork, BlockAnchor, BlockHash};
     use ed25519_dalek::SigningKey;
 
     fn key() -> SigningKey {

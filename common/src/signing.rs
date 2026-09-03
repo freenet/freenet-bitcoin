@@ -215,7 +215,7 @@ impl SignedTipEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BitcoinNetwork, BlockAnchor, BlockHash, Claim, OutPoint, ScriptId, Txid};
+    use crate::{BitcoinNetwork, BlockAnchor, BlockHash, Claim, OutPoint, ScriptId};
     use ed25519_dalek::SigningKey;
 
     fn key(seed: u8) -> SigningKey {

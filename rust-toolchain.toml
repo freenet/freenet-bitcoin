@@ -1,0 +1,22 @@
+[toolchain]
+# Pinned so contract and delegate WASM builds are deterministic.
+#
+# Why this matters here specifically: a contract's key is
+# BLAKE3(BLAKE3(wasm) || params). A different rustc version emits different
+# WASM bytes and therefore a DIFFERENT contract key. For this project that
+# means every `BitcoinAddressContract` and `BitcoinTipContract` instance moves,
+# and any client holding a cached contract id silently reads an empty contract
+# rather than erroring — the failure looks exactly like "this address has no
+# activity yet".
+#
+# The bridge already mitigates the client half by publishing the current
+# `address_code_hash` and `tip_contract_id` over `/v1/status`, so a client that
+# re-resolves at runtime recovers automatically. The pin exists so the re-key
+# is a deliberate act rather than a side effect of a toolchain upgrade.
+#
+# When updating this pin: record the OUTGOING code hashes in
+# `legacy_contracts.toml` BEFORE changing the channel, then rebuild and commit
+# the new hashes and the pin together.
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
