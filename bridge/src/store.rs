@@ -24,6 +24,13 @@ use anyhow::Context;
 use freenet_bitcoin_common::{BitcoinNetwork, BlockAnchor, BlockHash};
 use rusqlite::{params, Connection, OptionalExtension};
 
+/// `(script_pubkey, txid, vout)` for an output a reorg has orphaned.
+pub type OrphanedOutput = (Vec<u8>, [u8; 32], u32);
+
+/// `(script_pubkey, txid, vout, value_sats, block_height)` for an output that
+/// is now buried deeply enough to warrant a headers-carrying claim.
+pub type PendingDeepClaim = (Vec<u8>, [u8; 32], u32, u64, u32);
+
 pub struct Store {
     conn: Connection,
 }
@@ -147,6 +154,23 @@ impl Store {
                 hash: BlockHash(b),
             })
         }))
+    }
+
+    /// Move the checkpoint BACKWARD so a newly-watched script gets backfilled.
+    ///
+    /// Without this, `scan_from_height` on a watch request is silently ignored
+    /// and a script added today never sees a payment made yesterday -- the
+    /// bridge would only ever scan forward from wherever it happened to be.
+    ///
+    /// Rewinding is safe because rescanning is idempotent: claims are keyed by
+    /// digest, so re-observing a payment produces a claim the contract already
+    /// holds. The cost of a rewind is bandwidth, never correctness.
+    pub fn rewind_checkpoint_to(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE chain_checkpoint SET height = ?2 WHERE network = ?1 AND height > ?2",
+            params![net.as_str(), height as i64],
+        )?;
+        Ok(())
     }
 
     pub fn set_checkpoint(&self, net: BitcoinNetwork, a: &BlockAnchor) -> anyhow::Result<()> {
@@ -318,7 +342,7 @@ impl Store {
         &self,
         net: BitcoinNetwork,
         height: u32,
-    ) -> anyhow::Result<Vec<(Vec<u8>, [u8; 32], u32)>> {
+    ) -> anyhow::Result<Vec<OrphanedOutput>> {
         let mut stmt = self.conn.prepare(
             "SELECT script_pubkey, txid, vout FROM observed_outputs
              WHERE network = ?1 AND block_height IS NOT NULL AND block_height > ?2",
@@ -356,7 +380,7 @@ impl Store {
         net: BitcoinNetwork,
         tip_height: u32,
         depth: u32,
-    ) -> anyhow::Result<Vec<(Vec<u8>, [u8; 32], u32, u64, u32)>> {
+    ) -> anyhow::Result<Vec<PendingDeepClaim>> {
         let max_height = tip_height.saturating_sub(depth.saturating_sub(1));
         let mut stmt = self.conn.prepare(
             "SELECT script_pubkey, txid, vout, value_sats, block_height

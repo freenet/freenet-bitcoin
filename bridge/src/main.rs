@@ -20,6 +20,7 @@ use clap::Parser;
 use freenet_bitcoin_common::BitcoinNetwork;
 
 use bitcoin_freenet_bridge::{
+    chain::ChainClient,
     config::BridgeConfig,
     freenet::FreenetPublisher,
     observer::{ClaimsByScript, Observer},
@@ -44,6 +45,18 @@ struct Cli {
     /// Check the configuration and exit without connecting to anything.
     #[arg(long)]
     check: bool,
+    /// Read an address's observations back OUT of Freenet and print what they
+    /// establish.
+    ///
+    /// This is the honest end-to-end check. "The PUT returned Ok" only says
+    /// the local node accepted the write; this says the data is retrievable
+    /// and that its Bitcoin evidence verifies. Those are different claims and
+    /// only the second means the integration works.
+    #[arg(long, value_name = "ADDRESS")]
+    verify: Option<String>,
+    /// Network for --verify.
+    #[arg(long, default_value = "signet")]
+    network: String,
 }
 
 fn main() -> Result<()> {
@@ -67,6 +80,15 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(address) = cli.verify.clone() {
+        let network: BitcoinNetwork =
+            cli.network.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(verify_address(cfg, network, &address));
+    }
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -84,7 +106,16 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
     // Seed the operator's public demo scripts. These are explicitly public
     // data -- a curated address whose activity anybody may see -- and are NOT
     // anybody's private watch. Marked so a user cannot unwatch them.
+    //
+    // They are seeded with a backfill window rather than from height 0: a
+    // pruned node has not kept the early chain, so asking for it would fail,
+    // and a demo only needs recent activity to be convincing.
     for net_cfg in &cfg.networks {
+        let backfill_from = ChainClient::connect(net_cfg)
+            .ok()
+            .and_then(|c| c.tip().ok())
+            .map(|t| t.height.saturating_sub(net_cfg.demo_backfill_blocks))
+            .unwrap_or(0);
         for addr_str in &net_cfg.always_watch {
             match parse_address(addr_str, net_cfg.network) {
                 Ok(spk) => {
@@ -92,11 +123,12 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
                         &WatchedScript {
                             network: net_cfg.network,
                             script_pubkey: spk,
-                            scan_from_height: 0,
+                            scan_from_height: backfill_from,
                             is_public_demo: true,
                         },
                         0,
                     )?;
+                    store.rewind_checkpoint_to(net_cfg.network, backfill_from)?;
                     tracing::info!(network = ?net_cfg.network, address = %addr_str, "public demo address registered");
                 }
                 Err(e) => {
@@ -152,13 +184,42 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
     };
     let address_code_hash = publisher.as_ref().map(|p| p.address_code_hash());
 
+    // Compute each network's tip-contract instance id and publish it via
+    // /v1/status.
+    //
+    // A client cannot derive this for itself: BitcoinTipParameters includes
+    // `trusted_bridges`, which is per-deployment, not a fixed per-network
+    // constant. Without the bridge publishing it, an application would have to
+    // hardcode a contract id -- and a hardcoded id goes stale silently on the
+    // next re-key, with every read coming back looking like "no data yet".
+    let mut tip_contract_ids: HashMap<BitcoinNetwork, String> = HashMap::new();
+    if let Some(p) = publisher.as_ref() {
+        for net_cfg in &cfg.networks {
+            let params = freenet_bitcoin_common::BitcoinTipParameters {
+                network: net_cfg.network,
+                trusted_bridges: vec![signer.bridge_id()],
+            };
+            match p.tip_key(&params) {
+                Ok(k) => {
+                    tracing::info!(
+                        network = ?net_cfg.network,
+                        contract = %k.id(),
+                        "tip contract id published via /v1/status"
+                    );
+                    tip_contract_ids.insert(net_cfg.network, k.id().to_string());
+                }
+                Err(e) => tracing::warn!("cannot derive tip contract id: {e}"),
+            }
+        }
+    }
+
     let state = Arc::new(ServiceState {
         cfg: cfg.clone(),
         signer: Signer::load_or_create(&cfg.signing_key_path)?,
         observers,
         store: std::sync::Mutex::new(Store::open(&cfg.database_path)?),
         address_code_hash,
-        tip_contract_ids: HashMap::new(),
+        tip_contract_ids,
     });
 
     let listen = cfg.listen.clone();
@@ -418,4 +479,103 @@ mod tests {
         assert!(parse_address("not-an-address", BitcoinNetwork::Bitcoin).is_err());
         assert!(parse_address("", BitcoinNetwork::Bitcoin).is_err());
     }
+}
+
+/// Read an address contract back out of Freenet and report what it proves.
+///
+/// Deliberately re-verifies every claim from scratch rather than trusting the
+/// bridge's own record, so the output describes what a third party could
+/// independently establish.
+async fn verify_address(cfg: BridgeConfig, network: BitcoinNetwork, address: &str) -> Result<()> {
+    use freenet_bitcoin_common::address_state::BitcoinAddressStateV1;
+    use freenet_bitcoin_common::tip_state::BitcoinTipStateV1;
+    use freenet_bitcoin_common::{
+        confirmations, from_cbor, BitcoinAddressParameters, BitcoinTipParameters, OutpointStatus,
+    };
+
+    let signer = Signer::load_or_create(&cfg.signing_key_path)?;
+    let script = parse_address(address, network)?;
+
+    let address_wasm = std::fs::read(cfg.contract_dir.join("bitcoin_address_contract.wasm"))?;
+    let tip_wasm = std::fs::read(cfg.contract_dir.join("bitcoin_tip_contract.wasm"))?;
+    let publisher = FreenetPublisher::connect(&cfg.freenet_ws, address_wasm, tip_wasm).await?;
+
+    let params = BitcoinAddressParameters {
+        network,
+        script_pubkey: script.clone(),
+        trusted_bridges: vec![signer.bridge_id()],
+        pow_floor: network.default_pow_floor(),
+    };
+    let key = publisher.address_key(&params)?;
+    println!("address  : {address}");
+    println!("network  : {}", network.as_str());
+    println!("script   : {}", hex::encode(&script));
+    println!("contract : {}", key.id());
+
+    let bytes = publisher.get_state(key).await?;
+    println!("state    : {} bytes retrieved from Freenet", bytes.len());
+
+    let state: BitcoinAddressStateV1 =
+        from_cbor(&bytes).map_err(|e| anyhow::anyhow!("decoding contract state: {e}"))?;
+
+    for claim in state.claims.claims.values() {
+        claim
+            .verify(&params)
+            .map_err(|e| anyhow::anyhow!("a claim in the retrieved state does not verify: {e}"))?;
+    }
+
+    match state.scanned_to() {
+        Some(h) => println!("scanned  : up to height {h}"),
+        None => println!("scanned  : NOT YET -- no bridge has reported on this script"),
+    }
+
+    let tip_params = BitcoinTipParameters {
+        network,
+        trusted_bridges: vec![signer.bridge_id()],
+    };
+    let tip_height = match publisher.tip_key(&tip_params) {
+        Ok(tk) => match publisher.get_state(tk).await {
+            Ok(b) => from_cbor::<BitcoinTipStateV1>(&b).ok().and_then(|t| t.tip_height()),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    if let Some(h) = tip_height {
+        println!("tip      : height {h} (from the public tip contract)");
+    }
+
+    let statuses = state.claims.outpoint_statuses();
+    if statuses.is_empty() {
+        println!("payments : none observed");
+    } else {
+        println!("payments :");
+        for (op, status) in &statuses {
+            let line = match status {
+                OutpointStatus::Confirmed { value_sats, anchor } => {
+                    let confs = tip_height.map(|t| confirmations(anchor, t)).unwrap_or(0);
+                    format!(
+                        "{value_sats} sats  confirmed in block {} ({confs} conf)",
+                        anchor.height
+                    )
+                }
+                OutpointStatus::Unconfirmed { value_sats } => {
+                    format!("{value_sats} sats  in mempool")
+                }
+                OutpointStatus::Retracted => "reorganized off the chain".to_string(),
+            };
+            println!("           {}:{}  {line}", op.txid.to_display_string(), op.vout);
+        }
+        if let Some(t) = tip_height {
+            println!(
+                "confirmed: {} sats at >=1 confirmation",
+                state.claims.confirmed_value_sats(t, 1)
+            );
+        }
+    }
+
+    println!();
+    println!("Every claim above was re-verified against its own Bitcoin evidence");
+    println!("(raw transaction, Merkle branch, and block-header proof-of-work),");
+    println!("not merely against the bridge's signature.");
+    Ok(())
 }

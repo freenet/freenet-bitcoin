@@ -240,7 +240,7 @@ impl Observer {
             // transaction and Merkle branch again. A pruned node may have
             // discarded it, in which case we simply skip: the shallow claim
             // stands and the payment is still provable, just not to this depth.
-            let scanned = match self.chain.scan_block(&block_hash, &[script.clone()]) {
+            let scanned = match self.chain.scan_block(&block_hash, std::slice::from_ref(&script)) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::debug!("block {height} no longer available ({e}); skipping deep claim");

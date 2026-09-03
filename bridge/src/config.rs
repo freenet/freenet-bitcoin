@@ -52,6 +52,17 @@ pub struct NetworkConfig {
     /// It is not a watch list — nobody's interest is recorded by it.
     #[serde(default)]
     pub always_watch: Vec<String>,
+    /// How many blocks of history to backfill for `always_watch` scripts.
+    ///
+    /// Bounded because a pruned node has not kept the early chain, and because
+    /// an unbounded backfill on a busy address would fill the contract's claim
+    /// cap with ancient history rather than recent activity.
+    #[serde(default = "default_demo_backfill")]
+    pub demo_backfill_blocks: u32,
+}
+
+fn default_demo_backfill() -> u32 {
+    144
 }
 
 fn default_deep_confirmations() -> u32 {

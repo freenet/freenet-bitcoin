@@ -206,6 +206,39 @@ impl FreenetPublisher {
             Err(_) => Err(anyhow!("timed out waiting for PUT response")),
         }
     }
+
+    /// Fetch a contract's current state from the network.
+    ///
+    /// Used by `verify`, which exists so an operator can confirm that
+    /// observations actually became retrievable Freenet state rather than
+    /// merely being accepted by the local node. "The PUT returned Ok" and
+    /// "the data is readable" are different claims, and only the second one
+    /// means the integration works.
+    pub async fn get_state(&self, key: ContractKey) -> Result<Vec<u8>> {
+        let mut api = self.api.lock().await;
+        api.send(ClientRequest::ContractOp(ContractRequest::Get {
+            key: key.into(),
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        }))
+        .await
+        .map_err(|e| anyhow!("sending GET: {e}"))?;
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(REQUEST_TIMEOUT_S),
+            api.recv(),
+        )
+        .await
+        {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                state, ..
+            }))) => Ok(state.as_ref().to_vec()),
+            Ok(Ok(other)) => Err(anyhow!("unexpected response to GET: {other:?}")),
+            Ok(Err(e)) => Err(anyhow!("GET failed: {e}")),
+            Err(_) => Err(anyhow!("timed out waiting for GET response")),
+        }
+    }
 }
 
 /// Render a contract instance id the way applications quote it.

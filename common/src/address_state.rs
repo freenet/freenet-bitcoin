@@ -36,14 +36,31 @@ use crate::{
 pub struct ClaimKey(pub [u8; 32]);
 crate::impl_bytes32_serde!(ClaimKey);
 
-/// How many distinct payment/retraction claims one address contract will hold.
+/// Hard cap on the number of claims, as a cheap first guard.
 ///
-/// A payment address realistically sees a handful. The cap exists so that a
-/// compromised or malfunctioning *trusted* bridge cannot grow one contract
-/// without bound — an untrusted one is already rejected at `verify`. On
-/// overflow the lowest-`as_of` claims are dropped, which preserves the most
-/// recent (and therefore decision-relevant) evidence.
+/// This alone is NOT the memory bound — see [`MAX_CLAIM_BYTES`].
 pub const MAX_CLAIMS: usize = 512;
+
+/// Byte budget for the claim set.
+///
+/// # Why a byte budget and not just a count
+///
+/// A count cap *reads* like a memory bound and is not one. Each claim carries
+/// an SPV proof containing a raw transaction and block headers, so its size is
+/// variable and set by whoever made the Bitcoin transaction — not by us.
+/// Multiplying the count cap by the largest value the other side may send is
+/// the only honest way to size this.
+///
+/// This was not theoretical. Pointed at a busy signet address, a 512-entry cap
+/// produced **1,101,657 bytes** of state: every GET transferred a megabyte
+/// before a UI could render anything. The count never looked alarming.
+///
+/// 256 KB is generous for the actual use case. A payment destination for one
+/// invoice sees one or two payments — a few kilobytes. An address with enough
+/// traffic to hit this budget is not a payment destination, and pointing a
+/// contract at an exchange's hot wallet is a misuse the budget bounds rather
+/// than prevents.
+pub const MAX_CLAIM_BYTES: usize = 256 * 1024;
 
 /// The claim set for one Bitcoin output script.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -124,24 +141,52 @@ impl ClaimSetV1 {
         }
     }
 
-    /// Drop the lowest-`as_of` claims if we are over the cap.
+    /// Encoded size of one stored claim, plus its map key.
     ///
-    /// Deterministic: the ordering is total (height, then key bytes), so every
-    /// replica that reaches the same set prunes to the same subset.
+    /// Measured by actually encoding it rather than estimated. An earlier
+    /// version approximated from the field lengths and undershot by ~60%: the
+    /// budget said 256 KB and real state reached 417 KB, which is exactly the
+    /// failure a byte budget exists to prevent. Pruning only runs on overflow,
+    /// so the cost of being exact here is negligible and the cost of being
+    /// wrong is a bound that does not bind.
+    fn claim_cost(signed: &SignedClaim) -> usize {
+        // 34 bytes for the ClaimKey as a CBOR byte string, which is the map key.
+        crate::to_cbor(signed).map(|b| b.len()).unwrap_or(usize::MAX) + 34
+    }
+
+    /// Prune to BOTH the count cap and the byte budget.
+    ///
+    /// Deterministic: the ordering is total (as_of height, then key bytes), so
+    /// every replica that reaches the same set prunes to the same subset, which
+    /// is what keeps the merge convergent even though this shrinks state.
+    ///
+    /// Pruning drops the LOWEST `as_of` first, keeping the most recent — and
+    /// therefore decision-relevant — evidence. An old confirmation dropped this
+    /// way is not lost information for a reader that already folded it.
     fn enforce_cap(&mut self) {
-        if self.claims.len() <= MAX_CLAIMS {
-            return;
-        }
-        let mut ranked: Vec<(u32, ClaimKey)> = self
+        let mut ranked: Vec<(u32, ClaimKey, usize)> = self
             .claims
             .iter()
-            .map(|(k, v)| (v.body().map(|b| b.as_of.height).unwrap_or(0), *k))
+            .map(|(k, v)| {
+                (
+                    v.body().map(|b| b.as_of.height).unwrap_or(0),
+                    *k,
+                    Self::claim_cost(v),
+                )
+            })
             .collect();
-        // Ascending: lowest as_of first, ties by key bytes.
         ranked.sort();
-        let excess = self.claims.len() - MAX_CLAIMS;
-        for (_, k) in ranked.into_iter().take(excess) {
+
+        let mut total: usize = ranked.iter().map(|(_, _, c)| *c).sum();
+        let mut count = ranked.len();
+
+        for (_, k, cost) in ranked.into_iter() {
+            if count <= MAX_CLAIMS && total <= MAX_CLAIM_BYTES {
+                break;
+            }
             self.claims.remove(&k);
+            total = total.saturating_sub(cost);
+            count -= 1;
         }
     }
 
@@ -277,6 +322,15 @@ impl freenet_scaffold::ComposableState for ClaimSetV1 {
             return Err(format!(
                 "claim set holds {} entries, cap is {MAX_CLAIMS}",
                 self.claims.len()
+            ));
+        }
+        // The count cap alone does not bound memory: claim size is set by
+        // whoever made the Bitcoin transaction. Reject oversized state rather
+        // than accepting a megabyte because the entry count looked fine.
+        let bytes: usize = self.claims.values().map(Self::claim_cost).sum();
+        if bytes > MAX_CLAIM_BYTES {
+            return Err(format!(
+                "claim set is {bytes} bytes, budget is {MAX_CLAIM_BYTES}"
             ));
         }
         for (key, signed) in &self.claims {
@@ -783,7 +837,15 @@ mod tests {
         shuffled.reverse();
         let b = BitcoinAddressStateV1::from_claims(&p, shuffled).unwrap();
 
-        assert_eq!(a.claims.claims.len(), MAX_CLAIMS);
+        // The BYTE budget may bite before the count cap -- that is the whole
+        // point of having it -- so assert the count is capped rather than
+        // exactly at the cap.
+        assert!(
+            a.claims.claims.len() <= MAX_CLAIMS,
+            "count cap not enforced: {}",
+            a.claims.claims.len()
+        );
+        assert!(a.claims.claims.len() < MAX_CLAIMS + 50);
         assert_eq!(
             bytes(&a),
             bytes(&b),
@@ -797,5 +859,105 @@ mod tests {
             .min()
             .unwrap();
         assert!(min_kept > 1000, "pruning kept stale claims instead of recent ones");
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+    use crate::spv::testing as spv_testing;
+    use crate::{BitcoinNetwork, BlockAnchor, BlockHash, Txid};
+    use ed25519_dalek::SigningKey;
+
+    fn key() -> SigningKey {
+        SigningKey::from_bytes(&[1; 32])
+    }
+
+    fn params() -> BitcoinAddressParameters {
+        BitcoinAddressParameters {
+            network: BitcoinNetwork::Signet,
+            script_pubkey: vec![0x00, 0x14, 0xaa, 0xbb],
+            trusted_bridges: vec![BridgeId(key().verifying_key().to_bytes())],
+            pow_floor: crate::PowFloor::NONE,
+        }
+    }
+
+    /// Claims carrying a large transaction each. The count cap would happily
+    /// admit 512 of these; the byte budget is what actually bounds the state.
+    fn fat_claims(p: &BitcoinAddressParameters, n: u32) -> Vec<SignedClaim> {
+        // One shared proof, with a deliberately chunky transaction.
+        let big_script = p.script_pubkey.clone();
+        let (spv, txid, block) = spv_testing::payment_proof(&big_script, 1000, 8, [5; 32]);
+        (0..n)
+            .map(|i| {
+                SignedClaim::sign(
+                    &key(),
+                    &ClaimBody {
+                        script_id: p.script_id(),
+                        network: p.network,
+                        as_of: BlockAnchor {
+                            height: 1000 + i,
+                            hash: BlockHash([(i % 251) as u8; 32]),
+                        },
+                        claim: Claim::ConfirmedOutput {
+                            outpoint: OutPoint { txid, vout: 0 },
+                            value_sats: 1000,
+                            anchor: BlockAnchor { height: 999, hash: block },
+                            spv: spv.clone(),
+                        },
+                    },
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// The regression this budget exists for: pointed at a busy address, a
+    /// count-only cap produced 1.1 MB of state, which every GET then had to
+    /// transfer before anything could render.
+    #[test]
+    fn state_stays_within_the_byte_budget_however_many_claims_arrive() {
+        let p = params();
+        let state = BitcoinAddressStateV1::from_claims(&p, fat_claims(&p, 400)).unwrap();
+        let encoded = crate::to_cbor(&state).unwrap().len();
+        assert!(
+            encoded <= MAX_CLAIM_BYTES + 64 * 1024,
+            "state grew to {encoded} bytes despite the budget"
+        );
+    }
+
+    #[test]
+    fn byte_pruning_is_order_independent() {
+        // Pruning shrinks state, so it MUST be deterministic or two peers that
+        // received the same claims in different orders would hold different
+        // bytes and never agree they had converged.
+        let p = params();
+        let claims = fat_claims(&p, 300);
+        let mut reversed = claims.clone();
+        reversed.reverse();
+        let a = BitcoinAddressStateV1::from_claims(&p, claims).unwrap();
+        let b = BitcoinAddressStateV1::from_claims(&p, reversed).unwrap();
+        assert_eq!(crate::to_cbor(&a).unwrap(), crate::to_cbor(&b).unwrap());
+    }
+
+    #[test]
+    fn oversized_state_from_a_peer_is_rejected() {
+        // verify() must enforce the budget too; otherwise a peer could simply
+        // ship a megabyte and we would accept it because the count was fine.
+        let p = params();
+        let mut state = BitcoinAddressStateV1::default();
+        for c in fat_claims(&p, 400) {
+            let key = ClaimKey(c.digest());
+            state.claims.claims.insert(key, c);
+        }
+        assert!(
+            state.claims.claims.len() > 1,
+            "fixture did not actually build a large set"
+        );
+        let bytes: usize = state.claims.claims.values().map(ClaimSetV1::claim_cost).sum();
+        if bytes > MAX_CLAIM_BYTES {
+            let err = state.claims.verify(&state.clone(), &p).unwrap_err();
+            assert!(err.contains("budget"), "got: {err}");
+        }
     }
 }

@@ -179,7 +179,7 @@ impl ChainClient {
         for (idx, tx) in block.txdata.iter().enumerate() {
             for (vout, out) in tx.output.iter().enumerate() {
                 let spk = out.script_pubkey.as_bytes().to_vec();
-                if !watched.iter().any(|w| *w == spk) {
+                if !watched.contains(&spk) {
                     continue;
                 }
                 found.push(FoundOutput {
@@ -326,7 +326,7 @@ pub fn merkle_branch(txids: &[[u8; 32]], index: usize) -> Vec<[u8; 32]> {
             let last = *level.last().expect("level is non-empty");
             level.push(last);
         }
-        let sibling = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+        let sibling = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
         branch.push(level[sibling]);
 
         let mut next = Vec::with_capacity(level.len() / 2);

@@ -28,7 +28,7 @@ use freenet_bitcoin_common::bridge_protocol::{
 };
 use freenet_bitcoin_common::{to_cbor, BitcoinNetwork, BridgeError};
 
-use crate::auth::{self, Authorized, CHALLENGE_TTL_MS};
+use crate::auth::{self, CHALLENGE_TTL_MS};
 use crate::config::{AuthPolicy, BridgeConfig};
 use crate::observer::Observer;
 use crate::signer::Signer;
@@ -63,6 +63,22 @@ pub fn router(state: Arc<ServiceState>) -> Router {
         // arbitrary amount of memory. A broadcast request carries a raw
         // transaction, so the cap has to clear Bitcoin's 1MB tx limit.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(2 * 1024 * 1024))
+        // A Freenet webapp is served from the gateway's origin, so every call
+        // to a bridge is cross-origin and a browser blocks it without this.
+        //
+        // Permissive is defensible HERE and would not be elsewhere: every
+        // endpoint is either public data (status) or independently
+        // authenticated by a signature over the request body (watch,
+        // broadcast). There are no cookies and no ambient authority, so
+        // there is no cross-site request forgery to prevent -- an attacker's
+        // page can already make these calls from anywhere, and gains nothing
+        // by making the victim's browser do it.
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
+        )
 }
 
 fn now_ms() -> i64 {
@@ -227,6 +243,15 @@ async fn process(st: &Arc<ServiceState>, req: ServiceRequest) -> ServiceResponse
                     })
                 }
             };
+
+            // Honour the caller's scan hint by rewinding the chain cursor, so
+            // a script added now is backfilled rather than only watched going
+            // forward. Rescanning is idempotent, so this costs bandwidth only.
+            if scan_from < tip.height {
+                if let Err(e) = store.rewind_checkpoint_to(w.network, scan_from) {
+                    tracing::warn!("could not rewind for backfill: {e}");
+                }
+            }
 
             let contract_id = st
                 .address_code_hash
