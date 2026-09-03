@@ -58,6 +58,14 @@ pub struct TipView {
 pub struct AddressView {
     pub address: String,
     pub is_demo: bool,
+    /// The state as received. Derived figures (confirmations, confirmed vs
+    /// pending) are recomputed from this whenever the tip moves, rather than
+    /// frozen at parse time -- the address state routinely arrives BEFORE the
+    /// tip does, and a confirmation count computed against a tip height of
+    /// zero reported every settled payment as pending.
+    pub raw: BitcoinAddressStateV1,
+    pub network: BitcoinNetwork,
+    pub script_pubkey: Vec<u8>,
     /// Why the operator chose to show this one, when it is the example.
     pub demo_note: Option<String>,
     /// None means no bridge has reported on this script at all — which is a
@@ -111,6 +119,24 @@ impl App {
         }
     }
 
+    /// Recompute every address view against the current tip.
+    fn recompute_addresses(&mut self) {
+        let ids: Vec<Vec<u8>> = self.addresses.keys().cloned().collect();
+        for id in ids {
+            let Some(view) = self.addresses.get(&id).cloned() else {
+                continue;
+            };
+            let rebuilt = self.derive_view(
+                &view.address,
+                view.is_demo,
+                view.network,
+                &view.script_pubkey,
+                &view.raw,
+            );
+            self.addresses.insert(id, rebuilt);
+        }
+    }
+
     fn apply_tip(&mut self, tip: &BitcoinTipStateV1) {
         let recent = tip.blocks.recent(8);
         let Some(head) = recent.first() else { return };
@@ -120,9 +146,42 @@ impl App {
             recent,
             attested_by: config::trusted_bridges(self.network),
         });
+        // The tip is what confirmations are measured against, so everything
+        // already on screen is now stale.
+        self.recompute_addresses();
     }
 
     fn apply_address(&mut self, lookup: &Lookup, state: &BitcoinAddressStateV1) {
+        let view = self.derive_view(
+            &lookup.address,
+            lookup.is_demo,
+            lookup.network,
+            &lookup.script_pubkey,
+            state,
+        );
+        if let Ok(id) = keys::address_contract_id(
+            lookup.network,
+            &lookup.script_pubkey,
+            &config::trusted_bridges(lookup.network),
+        ) {
+            self.addresses.insert(id.as_bytes().to_vec(), view);
+        }
+    }
+
+    fn derive_view(
+        &self,
+        address: &str,
+        is_demo: bool,
+        network: BitcoinNetwork,
+        script_pubkey: &[u8],
+        state: &BitcoinAddressStateV1,
+    ) -> AddressView {
+        let lookup = Lookup {
+            address: address.to_string(),
+            script_pubkey: script_pubkey.to_vec(),
+            network,
+            is_demo,
+        };
         let params = keys::address_params(
             lookup.network,
             &lookup.script_pubkey,
@@ -185,27 +244,21 @@ impl App {
         payments.sort_by_key(|p| std::cmp::Reverse(height_of(p)));
 
         let min_conf = lookup.network.default_confirmation_target();
-        self.addresses.insert(
-            keys::address_contract_id(
-                lookup.network,
-                &lookup.script_pubkey,
-                &config::trusted_bridges(lookup.network),
-            )
-            .map(|i| i.as_bytes().to_vec())
-            .unwrap_or_default(),
-            AddressView {
-                address: lookup.address.clone(),
-                is_demo: lookup.is_demo,
-                demo_note: lookup
-                    .is_demo
-                    .then(|| config::demo_address(lookup.network).map(|d| d.why.to_string()))
-                    .flatten(),
-                scanned_to: state.scanned_to(),
-                confirmed_sats: state.claims.confirmed_value_sats(tip_height, min_conf),
-                pending_sats: state.claims.pending_value_sats(tip_height, min_conf),
-                payments,
-            },
-        );
+        AddressView {
+            address: lookup.address.clone(),
+            is_demo: lookup.is_demo,
+            raw: state.clone(),
+            network: lookup.network,
+            script_pubkey: lookup.script_pubkey.clone(),
+            demo_note: lookup
+                .is_demo
+                .then(|| config::demo_address(lookup.network).map(|d| d.why.to_string()))
+                .flatten(),
+            scanned_to: state.scanned_to(),
+            confirmed_sats: state.claims.confirmed_value_sats(tip_height, min_conf),
+            pending_sats: state.claims.pending_value_sats(tip_height, min_conf),
+            payments,
+        }
     }
 }
 
