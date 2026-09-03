@@ -203,6 +203,22 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
     };
     let address_code_hash = publisher.as_ref().map(|p| p.address_code_hash());
 
+    // If the contract WASM changed since last run, every instance has moved to
+    // a new key and the "already published" record refers to contracts nobody
+    // reads. Discard it, or the successor contracts come up empty and stay
+    // that way -- indistinguishable from an address with no activity.
+    if let Some(h) = address_code_hash {
+        match store.set_publish_generation(&h) {
+            Ok(true) => tracing::warn!(
+                code_hash = %hex::encode(h),
+                "contract WASM changed since last run; re-publishing all observations \
+                 to the new contract keys"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::error!("could not record publish generation: {e}"),
+        }
+    }
+
     // Compute each network's tip-contract instance id and publish it via
     // /v1/status.
     //

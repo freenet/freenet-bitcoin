@@ -125,6 +125,23 @@ impl Store {
                 PRIMARY KEY (network, txid, vout)
             );
 
+            -- Which contract code hash the published_claims rows refer to.
+            --
+            -- This exists because a contract's key is
+            -- BLAKE3(BLAKE3(wasm) || params): when the WASM changes, every
+            -- instance moves to a NEW contract, and the old published_claims
+            -- rows describe a contract nobody reads any more. Without this,
+            -- the bridge sees "already published" and skips, leaving the new
+            -- contract permanently EMPTY -- which reads to a client exactly
+            -- like "this address has no activity".
+            --
+            -- Observed for real: a cargo fmt re-keyed the contracts and the
+            -- successor came up with zero claims and stayed that way.
+            CREATE TABLE IF NOT EXISTS publish_generation (
+                id             INTEGER PRIMARY KEY CHECK (id = 1),
+                code_hash      BLOB NOT NULL
+            );
+
             -- Single-use challenges for service authorization. Rows are
             -- deleted on use, which is what makes a captured authorization
             -- non-replayable.
@@ -421,6 +438,41 @@ impl Store {
         Ok(())
     }
 
+    // --- publish generation ------------------------------------------------
+
+    /// Point the publish record at `code_hash`, discarding it if the contract
+    /// WASM has changed since the rows were written.
+    ///
+    /// Returns true if a reset happened, so the caller can say so: a silent
+    /// reset would hide a re-key, and a re-key is exactly the thing an
+    /// operator needs to notice.
+    pub fn set_publish_generation(&self, code_hash: &[u8; 32]) -> anyhow::Result<bool> {
+        let current: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT code_hash FROM publish_generation WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        let changed = match &current {
+            Some(existing) => existing.as_slice() != code_hash.as_slice(),
+            None => false,
+        };
+        if changed {
+            // These rows describe contracts that no longer exist. Keeping them
+            // would suppress republishing to the successor.
+            self.conn.execute("DELETE FROM published_claims", [])?;
+        }
+        self.conn.execute(
+            "INSERT INTO publish_generation (id, code_hash) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET code_hash = ?1",
+            params![code_hash.to_vec()],
+        )?;
+        Ok(changed)
+    }
+
     // --- published claims --------------------------------------------------
 
     /// Record a claim as published. Returns false if it already was.
@@ -650,5 +702,69 @@ mod tests {
         s.prune_blocks(net, 199, 50).unwrap();
         assert!(s.block_at(net, 100).unwrap().is_none());
         assert!(s.block_at(net, 180).unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    /// The bug this guards: published_claims is keyed by script and claim
+    /// digest with no notion of WHICH contract, so after a re-key the bridge
+    /// believed it had already published and skipped, leaving the successor
+    /// contract permanently empty.
+    #[test]
+    fn a_code_hash_change_clears_the_publish_record() {
+        let s = Store::open_in_memory().unwrap();
+        let net = BitcoinNetwork::Signet;
+        let hash_a = [1u8; 32];
+        let hash_b = [2u8; 32];
+
+        assert!(
+            !s.set_publish_generation(&hash_a).unwrap(),
+            "first run is not a change"
+        );
+        assert!(
+            s.mark_published(net, b"spk", &[9; 32]).unwrap(),
+            "claim is new"
+        );
+        assert!(
+            !s.mark_published(net, b"spk", &[9; 32]).unwrap(),
+            "and now known"
+        );
+
+        // Same WASM: the record must survive, or every restart re-publishes
+        // everything.
+        assert!(!s.set_publish_generation(&hash_a).unwrap());
+        assert!(
+            !s.mark_published(net, b"spk", &[9; 32]).unwrap(),
+            "still known"
+        );
+
+        // Changed WASM: the record must be discarded.
+        assert!(
+            s.set_publish_generation(&hash_b).unwrap(),
+            "must report the change"
+        );
+        assert!(
+            s.mark_published(net, b"spk", &[9; 32]).unwrap(),
+            "after a re-key the claim must look new again, or the successor \
+             contract is never populated"
+        );
+    }
+
+    #[test]
+    fn a_restart_with_no_wasm_change_does_not_republish() {
+        let s = Store::open_in_memory().unwrap();
+        let h = [7u8; 32];
+        s.set_publish_generation(&h).unwrap();
+        s.mark_published(BitcoinNetwork::Signet, b"spk", &[1; 32])
+            .unwrap();
+        for _ in 0..3 {
+            assert!(!s.set_publish_generation(&h).unwrap());
+        }
+        assert!(!s
+            .mark_published(BitcoinNetwork::Signet, b"spk", &[1; 32])
+            .unwrap());
     }
 }
