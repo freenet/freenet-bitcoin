@@ -8,6 +8,12 @@ description = "Synchronizes Bitcoin observations into Freenet contracts, with pl
 
 [dependencies]
 freenet-bitcoin-common = { workspace = true, features = ["test-support"] }
+# The client half of the stdlib, for PUT/UPDATE against a local node. Pinned to
+# the same version the contracts are built against so ContractKey and the wire
+# enums are one type, not two.
+freenet-stdlib = { workspace = true, features = ["net"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+futures = "0.3"
 
 # Bitcoin. rust-bitcoin does the consensus-critical parsing and address
 # handling; nothing here re-implements a primitive that these provide.
