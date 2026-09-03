@@ -11,6 +11,7 @@
 //! It is deliberately useful with nothing watched and no credential: the chain
 //! tip, recent blocks and any address you care to look up are all public.
 
+mod address;
 mod app;
 mod config;
 mod keys;

@@ -44,7 +44,7 @@ pub fn tip_contract_id(
     };
     let key = ContractKey::from_params_and_code(
         Parameters::from(to_cbor(&params)?),
-        &ContractCode::from(TIP_CONTRACT_WASM.to_vec()),
+        ContractCode::from(TIP_CONTRACT_WASM.to_vec()),
     );
     Ok(*key.id())
 }
@@ -58,7 +58,7 @@ pub fn address_contract_id(
     let params = address_params(network, script_pubkey, trusted);
     let key = ContractKey::from_params_and_code(
         Parameters::from(to_cbor(&params)?),
-        &ContractCode::from(ADDRESS_CONTRACT_WASM.to_vec()),
+        ContractCode::from(ADDRESS_CONTRACT_WASM.to_vec()),
     );
     Ok(*key.id())
 }
@@ -83,13 +83,6 @@ pub fn address_params(
     }
 }
 
-pub fn tip_params(network: BitcoinNetwork, trusted: &[BridgeId]) -> BitcoinTipParameters {
-    BitcoinTipParameters {
-        network,
-        trusted_bridges: trusted.to_vec(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,7 +99,7 @@ mod tests {
         let tip = tip_contract_id(BitcoinNetwork::Signet, &[bridge()]).unwrap();
         assert_eq!(
             tip.to_string(),
-            "B24HMUFasG3Yd1EJxfzb3qTPos1tLMiKo5gYiKwaihqT",
+            "2Vsa7WuAMgkLF8WGkFKryECxemdc5F4hpXs8k9njoFUN",
             "tip contract id drifted from the deployed contracts; rebuild the \
              embedded WASM and update this vector deliberately"
         );
@@ -115,7 +108,7 @@ mod tests {
         let addr = address_contract_id(BitcoinNetwork::Signet, &script, &[bridge()]).unwrap();
         assert_eq!(
             addr.to_string(),
-            "3Scd7J3ukmszib7qeHUBzSCXZuM4zF1cZqRbexLNs8nf"
+            "BdwHw58qA2YSxnXWdhzUcMoiJDUeamL5mXYh9S4BzhYw"
         );
     }
 

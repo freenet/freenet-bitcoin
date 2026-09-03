@@ -401,8 +401,21 @@ async fn observe_once(
 
     // A scan watermark per watched script, so a reader can tell "nothing
     // received" from "nobody has looked".
+    //
+    // Stamped with how far this round ACTUALLY scanned, never with the chain
+    // tip. Those differ whenever the bridge is catching up, and claiming the
+    // tip would assert coverage the bridge does not have -- turning the one
+    // signal that distinguishes "looked, found nothing" from "has not looked"
+    // into a lie in exactly the case where the distinction matters.
+    let scanned_anchor = match store.checkpoint(obs.network())? {
+        Some(cp) => cp,
+        // No checkpoint yet means nothing has been scanned. Fall back to the
+        // tip only because there is nothing else to say, and the IBD guard
+        // above already prevents publishing during catch-up from a cold start.
+        None => tip,
+    };
     for script in &watched {
-        let wm = obs.scan_watermark(signer, script, &tip)?;
+        let wm = obs.scan_watermark(signer, script, &scanned_anchor)?;
         claims.entry(script.clone()).or_default().push(wm);
     }
 

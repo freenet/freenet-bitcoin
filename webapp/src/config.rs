@@ -26,11 +26,6 @@ pub fn trusted_bridges(network: BitcoinNetwork) -> Vec<BridgeId> {
         .collect()
 }
 
-/// Networks offered in the UI, in display order.
-pub fn networks() -> Vec<BitcoinNetwork> {
-    vec![BitcoinNetwork::Signet, BitcoinNetwork::Bitcoin]
-}
-
 pub fn default_network() -> BitcoinNetwork {
     BitcoinNetwork::Signet
 }
@@ -43,7 +38,6 @@ pub fn default_network() -> BitcoinNetwork {
 /// is the thing working".
 pub struct DemoAddress {
     pub address: &'static str,
-    pub label: &'static str,
     pub why: &'static str,
 }
 
@@ -51,7 +45,6 @@ pub fn demo_address(network: BitcoinNetwork) -> Option<DemoAddress> {
     match network {
         BitcoinNetwork::Signet => Some(DemoAddress {
             address: "tb1qxc9rhgpdjcp42nmhg6lepe7pp5g86tx25vlv8h",
-            label: "A busy signet address",
             why: "Receives a few payments per block, so there is almost always \
                   something recent to look at. Nobody involved has heard of Freenet.",
         }),

@@ -1,11 +1,23 @@
 [application]
 name = "freenet-bitcoin-webapp"
+default_platform = "web"
+out_dir = "dist"
+asset_dir = "assets"
 
 [web.app]
 title = "Bitcoin on Freenet"
 
 [web.watcher]
 reload_html = true
+watch_path = ["src", "assets"]
 
 [web.resource]
-style = ["/style.css"]
+# Vendored, never a CDN link: the gateway's CSP blocks external stylesheets in
+# production while letting them through in dev, so a CDN reference looks fine
+# right up until it is published.
+style = ["style.css"]
+script = []
+include = []
+
+[web.resource.dev]
+script = []

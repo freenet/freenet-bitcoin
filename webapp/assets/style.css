@@ -1,0 +1,105 @@
+/* Bitcoin on Freenet.
+ *
+ * No @import and no external font: the gateway serves webapps under a
+ * same-origin CSP, so a Google Fonts link is silently blocked in production
+ * and the page falls back to system fonts anyway. Harvest shipped that bug for
+ * months. This uses the system stack deliberately. */
+
+:root {
+  --bg: #14161a;
+  --panel: #1c1f25;
+  --panel-2: #22262e;
+  --line: #2c313a;
+  --ink: #e8eaed;
+  --muted: #9aa3af;
+  --accent: #f7931a;      /* the one colour, and it means Bitcoin */
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --bad: #f87171;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --panel-2: #f0f2f5; --line: #dfe3e8;
+    --ink: #1a1d21; --muted: #5b6472;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.page { max-width: 860px; margin: 0 auto; padding: 28px 20px 64px; }
+
+.head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 26px; }
+.head h1 { font-size: 22px; margin: 0 0 6px; letter-spacing: -0.01em; }
+.head h1::before { content: "₿"; color: var(--accent); margin-right: 8px; }
+.sub { margin: 0; color: var(--muted); max-width: 62ch; }
+.sub b { color: var(--ink); font-weight: 600; }
+
+.conn { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+.conn-connected { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+.conn-connecting { color: var(--warn); }
+.conn-no\ node { color: var(--bad); }
+
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin-bottom: 18px; }
+.card h2 { font-size: 15px; margin: 0 0 4px; font-weight: 600; }
+.card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.pill { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; }
+
+.stats { display: flex; flex-wrap: wrap; gap: 22px; margin: 14px 0; }
+.stat { display: flex; flex-direction: column; gap: 2px; }
+.stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.stat-value { font-size: 15px; font-variant-numeric: tabular-nums; }
+
+table.blocks { width: 100%; border-collapse: collapse; margin-top: 8px; }
+table.blocks th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 500; padding: 6px 0; border-bottom: 1px solid var(--line); }
+table.blocks td { padding: 7px 0; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+table.blocks tr:last-child td { border-bottom: none; }
+
+.row { display: flex; gap: 10px; margin-top: 12px; }
+.addr-input { flex: 1; background: var(--panel-2); border: 1px solid var(--line); color: var(--ink); border-radius: 7px; padding: 10px 12px; font-family: var(--mono); font-size: 13px; }
+.addr-input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); outline-offset: -1px; }
+.go { background: var(--accent); color: #14161a; border: 0; border-radius: 7px; padding: 10px 18px; font-weight: 600; cursor: pointer; }
+.go:hover { filter: brightness(1.08); }
+
+.payment { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 13px; margin-top: 11px; }
+.payment-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.amount { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.status { font-size: 12px; }
+.status-ok { color: var(--ok); }
+.status-pending { color: var(--warn); }
+.status-bad { color: var(--bad); }
+
+.mono { font-family: var(--mono); }
+.txid { font-size: 11px; color: var(--muted); margin-top: 4px; word-break: break-all; }
+.addr { font-size: 13px; word-break: break-all; }
+
+.verify { margin-top: 11px; border-top: 1px solid var(--line); padding-top: 10px; }
+.verify-head { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; font-weight: 600; margin-bottom: 7px; }
+.verify-ok .verify-head > span:first-child { color: var(--ok); }
+.verify-bad .verify-head > span:first-child { color: var(--bad); }
+.verify ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 7px; }
+.chk { display: grid; grid-template-columns: 16px 1fr; gap: 8px; font-size: 12.5px; }
+.chk::before { content: "✓"; color: var(--ok); }
+.chk.bad::before { content: "✕"; color: var(--bad); }
+.chk strong { grid-column: 2; font-weight: 600; }
+.chk span { grid-column: 2; }
+
+.muted { color: var(--muted); font-size: 13px; }
+.err { color: var(--bad); font-size: 13px; }
+
+.foot { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+.foot p { margin: 0 0 10px; max-width: 68ch; }
+
+@media (max-width: 560px) {
+  .head { flex-direction: column; }
+  .row { flex-direction: column; }
+  .stats { gap: 16px; }
+}

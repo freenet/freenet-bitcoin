@@ -82,3 +82,31 @@ echo "--- tip contract ---"
   2>&1 | grep -E "^merge check|violation|no enforceable"
 rm -rf "$D"
 '''
+
+[tasks.sync-webapp-contracts]
+description = "Embed the current contract WASM in the webapp"
+dependencies = ["build-contracts"]
+script = '''
+mkdir -p webapp/contracts
+cp target/${CONTRACT_TARGET}/release/bitcoin_address_contract.wasm webapp/contracts/
+cp target/${CONTRACT_TARGET}/release/bitcoin_tip_contract.wasm webapp/contracts/
+echo "embedded contracts:"
+b3sum --no-names webapp/contracts/bitcoin_address_contract.wasm
+b3sum --no-names webapp/contracts/bitcoin_tip_contract.wasm
+'''
+
+[tasks.build-webapp]
+description = "Build the standalone Bitcoin webapp"
+dependencies = ["sync-webapp-contracts"]
+script = '''
+set -e
+cd webapp && dx build --release
+cd ..
+OUT=target/dx/freenet-bitcoin-webapp/release/web/public
+# dx references style.css from index.html but does not copy it -- the same gap
+# Harvest works around. Copy it here so a published bundle is never missing the
+# stylesheet it asks for.
+cp webapp/assets/style.css "$OUT/style.css"
+echo "webapp built at $OUT"
+ls -la "$OUT"
+'''
