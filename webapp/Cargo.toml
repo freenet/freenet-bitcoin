@@ -1,0 +1,27 @@
+[package]
+name = "freenet-bitcoin-webapp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A verifiable Bitcoin address viewer served from Freenet"
+
+[dependencies]
+freenet-bitcoin-common = { workspace = true }
+# `net` brings WebApi, the client half used to talk to the local node.
+freenet-stdlib = { workspace = true, features = ["net"] }
+
+dioxus = { version = "=0.7.3", features = ["web"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window", "Document", "Location", "Storage",
+    "WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "ErrorEvent",
+] }
+futures = "0.3"
+serde = { workspace = true }
+ciborium = { workspace = true }
+bs58 = { workspace = true }
+hex = { workspace = true }
+bech32 = "0.11"

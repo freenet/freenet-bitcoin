@@ -4,6 +4,7 @@ members = [
     "contracts/bitcoin-address-contract",
     "contracts/bitcoin-tip-contract",
     "bridge",
+    "webapp",
 ]
 resolver = "2"
 
@@ -16,7 +17,10 @@ repository = "https://github.com/freenet/freenet-bitcoin"
 [workspace.dependencies]
 freenet-bitcoin-common = { path = "common" }
 
-freenet-stdlib = "0.6"
+# 0.8.5 is what freenet-core and River are on. The bump is not cosmetic: it is
+# required for freenet-migrate's runtime half, because freenet-stdlib's
+# __frnt_set_id is unconditionally #[no_mangle] and two versions cannot link.
+freenet-stdlib = "0.8.5"
 freenet-scaffold = "0.2.2"
 freenet-scaffold-macro = "0.2.2"
 

@@ -1,0 +1,11 @@
+[application]
+name = "freenet-bitcoin-webapp"
+
+[web.app]
+title = "Bitcoin on Freenet"
+
+[web.watcher]
+reload_html = true
+
+[web.resource]
+style = ["/style.css"]

@@ -415,6 +415,35 @@ async fn observe_once(
 
     for (script, script_claims) in claims {
         let params = obs.address_params(&script, signer.bridge_id());
+
+        // Recover a predecessor generation BEFORE this instance is first
+        // written to in this run. Doing it after the first publish would mean
+        // probing state we had just written ourselves, and the recovery would
+        // never find anything -- silently, and looking healthy.
+        let code_hash = publisher.address_code_hash();
+        let instance_key = script.clone();
+        let already = store
+            .migration_done(&instance_key, &code_hash)
+            .unwrap_or(false);
+        if !already {
+            let local = freenet_bitcoin_common::address_state::BitcoinAddressStateV1::default();
+            let (merged, note) = publisher.migrate_address_forward(&params, local).await;
+            let definitive = note.starts_with("recovered") || note.starts_with("every predecessor");
+            if !merged.claims.claims.is_empty() {
+                match publisher.publish_state(&params, &merged).await {
+                    Ok(_) => tracing::info!(script = %hex::encode(&script), "{note}"),
+                    Err(e) => tracing::error!("forward PUT after migration failed: {e}"),
+                }
+            } else {
+                tracing::debug!(script = %hex::encode(&script), "{note}");
+            }
+            // Only a definitive answer may be recorded. An indeterminate walk
+            // leaves no marker so the next run probes again.
+            if definitive {
+                let _ = store.set_migration_done(&instance_key, &code_hash, &note);
+            }
+        }
+
         // Skip claims we have already published. Re-publishing is harmless --
         // the contract's state is a digest-keyed set -- but it is wasted
         // bandwidth on every round.

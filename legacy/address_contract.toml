@@ -1,0 +1,37 @@
+# Superseded generations of bitcoin-address-contract.
+#
+# A contract's key is BLAKE3(BLAKE3(wasm) || params), so every entry here names
+# a DIFFERENT live contract instance per watched script. The migration probe
+# walks these newest-first, folds what it finds into the current generation,
+# and PUTs the result forward.
+#
+# Folding is exact rather than best-effort here: the state is a CRDT whose
+# merge is associative, commutative and idempotent (asserted on exact bytes in
+# freenet-bitcoin-common, and by `fdev verify-merge`). So FoldAll across
+# generations is the same operation the network performs between peers, and
+# recovering an old generation cannot lose a newer observation.
+#
+# List ONLY superseded hashes. The current generation is derived from the WASM
+# this build ships, never written down.
+#
+# PROCEDURE: append the outgoing hash BEFORE rebuilding the contract, then
+# commit the entry and the rebuilt WASM together. `cargo make code-hashes`
+# prints the current hash to compare against.
+
+[[entry]]
+version = "A1"
+description = "First deployment on signet"
+date = "2026-09-02"
+code_hash = "17119f570ec1ab254116e481dea4b6827c0aee021696e7f685ad15863f55a02a"
+
+[[entry]]
+version = "A2"
+description = "Superseded by a cargo fmt reformat -- release binaries embed panic locations as file:line, so formatting alone re-keys a contract"
+date = "2026-09-03"
+code_hash = "35e72f46a82b22567f319e921ba3c8a9955c2441a2e5c889e3d5e707811ebe1c"
+
+[[entry]]
+version = "A3"
+description = "Superseded by the freenet-stdlib 0.6 -> 0.8.5 bump, taken so freenet-migrate's runtime half could be adopted at all (0.6 and 0.8 cannot co-link)"
+date = "2026-09-03"
+code_hash = "3b5f1df28497b1cfb365798cb86fc87a7e45480d47c79e22f09b9f801e95463f"

@@ -1,0 +1,21 @@
+# Superseded generations of bitcoin-tip-contract. See address_contract.toml
+# for the rationale; the same folding argument applies, since the tip state is
+# likewise a CRDT (a bounded, pruned map merged by height).
+
+[[entry]]
+version = "T1"
+description = "First deployment on signet"
+date = "2026-09-02"
+code_hash = "2b7245e10c702c79a068059b600e727e7cadf7ffd80315903bc3d6fdbf6d71ab"
+
+[[entry]]
+version = "T2"
+description = "Superseded by a cargo fmt reformat"
+date = "2026-09-03"
+code_hash = "5f6ed304e66fbeca4c5e4f94d4578be81f2d34e379e08a77c909472815d422cb"
+
+[[entry]]
+version = "T3"
+description = "Superseded by the freenet-stdlib 0.6 -> 0.8.5 bump"
+date = "2026-09-03"
+code_hash = "9439a7c7bafc6b14a5c35256bf07ed77b5645d1b96d4b5977b481fe2ddf086fd"

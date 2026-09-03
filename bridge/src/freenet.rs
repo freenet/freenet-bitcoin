@@ -79,6 +79,87 @@ impl FreenetPublisher {
         out
     }
 
+    /// Recover a predecessor generation's observations, if any, BEFORE this
+    /// instance is first written to.
+    ///
+    /// Ordering is the whole point. The bridge is the only writer, so if it
+    /// published first there would be nothing to distinguish a fresh contract
+    /// from a migrated one, and a probe run afterwards would be reading state
+    /// it had just written itself.
+    ///
+    /// Returns the state to publish forward: either the fold of every
+    /// predecessor generation with `local`, or `local` unchanged.
+    pub async fn migrate_address_forward(
+        &self,
+        params: &BitcoinAddressParameters,
+        local: freenet_bitcoin_common::address_state::BitcoinAddressStateV1,
+    ) -> (
+        freenet_bitcoin_common::address_state::BitcoinAddressStateV1,
+        String,
+    ) {
+        use crate::migrate::{address_lineage, address_policy, describe, AddressOps};
+        use freenet_migrate::{migrate_contract, Outcome};
+
+        let param_bytes = match to_cbor(params) {
+            Ok(b) => b,
+            Err(e) => return (local, format!("cannot encode params: {e}")),
+        };
+        let params_wrapped = Parameters::from(param_bytes);
+        let ops = AddressOps {
+            params: params.clone(),
+        };
+        let mut io = FreenetProbe { publisher: self };
+
+        match migrate_contract(
+            ops,
+            &mut io,
+            local.clone(),
+            &params_wrapped,
+            address_lineage(),
+            address_policy(),
+        )
+        .await
+        {
+            Ok(o @ Outcome::Recovered { .. }) => {
+                let note = describe(&o);
+                match o {
+                    Outcome::Recovered { merged, .. } => (merged, note),
+                    _ => unreachable!("matched Recovered above"),
+                }
+            }
+            Ok(o @ Outcome::SeedLocal { .. }) => (local, describe(&o)),
+            // Adopt nothing, seal nothing, retry. Publishing `local` here is
+            // safe precisely because nothing is sealed: the next run probes
+            // the same predecessors again.
+            Ok(o) => (local, describe(&o)),
+            Err(e) => (local, format!("probe aborted: {e:?}")),
+        }
+    }
+
+    /// PUT an already-built address state forward under the current key.
+    ///
+    /// Split out from `publish_claims` because the migration path already
+    /// holds a merged state and must not re-verify it claim-by-claim: it was
+    /// produced by the contract's own merge, which verified as it went.
+    pub async fn publish_state(
+        &self,
+        params: &BitcoinAddressParameters,
+        state: &freenet_bitcoin_common::address_state::BitcoinAddressStateV1,
+    ) -> Result<ContractKey> {
+        let param_bytes = to_cbor(params).map_err(|e| anyhow!(e))?;
+        let state_bytes = to_cbor(state).map_err(|e| anyhow!(e))?;
+        let key = ContractKey::from_params_and_code(
+            Parameters::from(param_bytes.clone()),
+            self.address_code.as_ref(),
+        );
+        let container = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
+            self.address_code.clone(),
+            Parameters::from(param_bytes),
+        )));
+        self.put_or_update(key, container, state_bytes).await?;
+        Ok(key)
+    }
+
     /// Ensure an address contract exists and carries these claims.
     ///
     /// PUTs the contract with the claims as its initial state. If it already
@@ -258,4 +339,112 @@ pub fn address_instance_id(
     h.update(code_hash);
     h.update(&param_bytes);
     Ok(ContractInstanceId::new(*h.finalize().as_bytes()))
+}
+
+/// Probe adapter: answers the migration driver's GETs over this connection.
+///
+/// # The mapping that matters
+///
+/// `ProbeAnswer` is three-way on purpose, and collapsing it to two loses data
+/// permanently (freenet-migrate#19). The rule:
+///
+/// * `NotFound` -> `Absent`. The network answered, positively, that there is
+///   nothing there.
+/// * a timeout, a transport fault, an unexpected response -> `Unknown`. We did
+///   not hear back. That is NOT the same fact, and treating it as absence
+///   makes the driver conclude a predecessor was empty when it may hold
+///   everything.
+///
+/// Only `Absent` may be typed for an answer actually received.
+pub struct FreenetProbe<'a> {
+    pub publisher: &'a FreenetPublisher,
+}
+
+impl freenet_migrate::ProbeIo for FreenetProbe<'_> {
+    type Error = std::convert::Infallible;
+
+    async fn get(
+        &mut self,
+        id: ContractInstanceId,
+    ) -> Result<freenet_migrate::ProbeAnswer, Self::Error> {
+        // Every recoverable condition is mapped to a per-candidate non-answer
+        // rather than an abort: an abort drops the driver and the local
+        // snapshot with it.
+        Ok(self.publisher.probe_get(id).await)
+    }
+}
+
+impl FreenetPublisher {
+    /// One probe GET, classified three ways.
+    pub async fn probe_get(&self, id: ContractInstanceId) -> freenet_migrate::ProbeAnswer {
+        use freenet_migrate::ProbeAnswer;
+
+        let mut api = self.api.lock().await;
+        let req = ContractRequest::Get {
+            key: id,
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        };
+        if api.send(ClientRequest::ContractOp(req)).await.is_err() {
+            return ProbeAnswer::Unknown;
+        }
+
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(freenet_migrate::RECOMMENDED_PROBE_TIMEOUT_MS),
+            api.recv(),
+        )
+        .await
+        {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                state, ..
+            }))) => ProbeAnswer::State(state.as_ref().to_vec()),
+            // The one case that is genuinely an answer.
+            Ok(Err(e)) if is_not_found(&e.to_string()) => ProbeAnswer::Absent,
+            // A reply we did not expect tells us nothing about the contract.
+            Ok(Ok(_)) => ProbeAnswer::Unknown,
+            Ok(Err(_)) => ProbeAnswer::Unknown,
+            // Silence. Never absence.
+            Err(_) => ProbeAnswer::Unknown,
+        }
+    }
+}
+
+/// Whether a client error is the network positively reporting no such state.
+///
+/// Deliberately narrow. Anything not recognised here is `Unknown`, because the
+/// cost of a false `Absent` is permanent data loss and the cost of a false
+/// `Unknown` is one retry.
+fn is_not_found(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("not found") || m.contains("notfound")
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::is_not_found;
+
+    #[test]
+    fn only_an_explicit_not_found_counts_as_absence() {
+        assert!(is_not_found("ContractResponse: contract NotFound"));
+        assert!(is_not_found("contract not found"));
+    }
+
+    /// The property that keeps a migration from sealing over live data.
+    #[test]
+    fn nothing_ambiguous_is_treated_as_absence() {
+        for msg in [
+            "timed out waiting for response",
+            "connection reset",
+            "websocket closed",
+            "operation aborted",
+            "no route to peer",
+            "",
+        ] {
+            assert!(
+                !is_not_found(msg),
+                "{msg:?} must classify as Unknown, never Absent"
+            );
+        }
+    }
 }

@@ -142,6 +142,20 @@ impl Store {
                 code_hash      BLOB NOT NULL
             );
 
+            -- Migration outcomes, recorded per (contract instance, generation).
+            --
+            -- Written ONLY for a DEFINITIVE outcome -- a recovery, or a walk in
+            -- which every predecessor positively answered. An indeterminate
+            -- walk (some predecessor never replied) writes nothing and is
+            -- retried on the next run, because a marker saying "predecessor had
+            -- nothing" is permanent and can never be taken back.
+            CREATE TABLE IF NOT EXISTS migration_done (
+                instance_id BLOB NOT NULL,
+                generation  BLOB NOT NULL,
+                outcome     TEXT NOT NULL,
+                PRIMARY KEY (instance_id, generation)
+            );
+
             -- Single-use challenges for service authorization. Rows are
             -- deleted on use, which is what makes a captured authorization
             -- non-replayable.
@@ -434,6 +448,44 @@ impl Store {
             "UPDATE observed_outputs SET deep_published = 1
              WHERE network = ?1 AND txid = ?2 AND vout = ?3",
             params![net.as_str(), txid.to_vec(), vout as i64],
+        )?;
+        Ok(())
+    }
+
+    // --- migration bookkeeping ----------------------------------------------
+
+    /// Whether this instance has already been migrated under this code hash.
+    pub fn migration_done(
+        &self,
+        instance_id: &[u8],
+        generation: &[u8; 32],
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM migration_done WHERE instance_id = ?1 AND generation = ?2",
+                params![instance_id, generation.to_vec()],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// Record a DEFINITIVE migration outcome.
+    ///
+    /// Never call this for an indeterminate walk. The marker is permanent, so
+    /// recording "nothing to recover" over a predecessor that merely failed to
+    /// answer would make its data unreachable for good.
+    pub fn set_migration_done(
+        &self,
+        instance_id: &[u8],
+        generation: &[u8; 32],
+        outcome: &str,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO migration_done (instance_id, generation, outcome)
+             VALUES (?1, ?2, ?3)",
+            params![instance_id, generation.to_vec(), outcome],
         )?;
         Ok(())
     }
@@ -766,5 +818,40 @@ mod generation_tests {
         assert!(!s
             .mark_published(BitcoinNetwork::Signet, b"spk", &[1; 32])
             .unwrap());
+    }
+}
+
+#[cfg(test)]
+mod migration_marker_tests {
+    use super::*;
+
+    /// The asymmetry that makes markers dangerous: they are permanent. So an
+    /// indeterminate walk must leave no trace, and only a definitive outcome
+    /// may be recorded.
+    #[test]
+    fn a_marker_is_written_only_when_asked_and_is_scoped_to_a_generation() {
+        let s = Store::open_in_memory().unwrap();
+        let inst = b"instance-1";
+        let gen_a = [1u8; 32];
+        let gen_b = [2u8; 32];
+
+        assert!(!s.migration_done(inst, &gen_a).unwrap());
+        s.set_migration_done(inst, &gen_a, "recovered").unwrap();
+        assert!(s.migration_done(inst, &gen_a).unwrap());
+
+        // A NEW generation is a different contract and must be migrated again;
+        // otherwise the first re-key after a successful migration is skipped.
+        assert!(
+            !s.migration_done(inst, &gen_b).unwrap(),
+            "a marker must not carry across a re-key"
+        );
+    }
+
+    #[test]
+    fn markers_are_per_instance() {
+        let s = Store::open_in_memory().unwrap();
+        let gen = [7u8; 32];
+        s.set_migration_done(b"a", &gen, "seed_local").unwrap();
+        assert!(!s.migration_done(b"b", &gen).unwrap());
     }
 }
