@@ -36,7 +36,14 @@ jobs:
       # convergence on exact serialized bytes, which is how peers actually
       # decide they agree.
       - name: Test
-        run: cargo test -p freenet-bitcoin-common -p bitcoin-freenet-bridge
+        run: cargo test -p freenet-bitcoin-common -p bitcoin-freenet-bridge -p freenet-bitcoin-webapp
+
+      # The webapp ships as wasm, so lint the target that actually ships --
+      # native-only dead-code findings there are noise, and wasm-only ones
+      # would otherwise never be seen.
+      - name: Clippy (wasm target)
+        run: cargo clippy -p freenet-bitcoin-webapp
+             --target wasm32-unknown-unknown --all-targets -- -D warnings
 
       - name: Build contracts for wasm32
         run: cargo build --target wasm32-unknown-unknown

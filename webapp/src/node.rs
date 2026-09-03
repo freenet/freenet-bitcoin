@@ -8,10 +8,15 @@ use dioxus::prelude::*;
 use freenet_stdlib::client_api::WebApi;
 use futures::channel::mpsc;
 
+// Only ever touched from wasm: the native build exists so `cargo test` and
+// clippy can run the pure logic (address parsing, formatting, key derivation)
+// without a browser, and it never opens a connection.
+#[allow(dead_code)]
 pub static WEB_API: GlobalSignal<Option<WebApi>> = GlobalSignal::new(|| None);
 pub static CONNECTION: GlobalSignal<Connection> = GlobalSignal::new(|| Connection::Connecting);
 
 #[derive(Clone, PartialEq, Debug)]
+#[allow(dead_code)] // `Connected` is constructed only on the wasm path.
 pub enum Connection {
     Connecting,
     Connected,
