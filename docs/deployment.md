@@ -59,6 +59,50 @@ CPUQuota=200%
 Priority alone was not considered sufficient — the memory and CPU ceilings
 bound the worst case rather than merely deprioritising it.
 
+### A TEMPORARY faster profile is currently applied to mainnet — REVERT IT
+
+Mainnet's initial block download is running under a deliberately looser
+profile, because the conservative numbers above were throttling it hard: the
+unit sat pinned at its 2 GB `MemoryHigh` with `dbcache=450`, while the host had
+82 GB free and 16 cores at 18% load. `dbcache` dominates IBD — it is the
+in-memory UTXO cache, and at 450 MB the node flushes to disk constantly.
+
+Currently applied to **mainnet only**:
+
+```ini
+dbcache=4000          # was 450
+par=6                 # was 2
+MemoryHigh=6G         # was 2G
+MemoryMax=8G          # was 3G
+CPUQuota=600%         # was 200%
+IOSchedulingClass=best-effort   # was idle
+IOSchedulingPriority=6
+```
+
+`idle` was the worst of these: it means the process gets disk only when nothing
+else wants any, which on a shared box is close to starvation. `best-effort` at
+priority 6 still yields to the gateways without being starved. `Nice=10` is
+unchanged, so it stays deprioritised for CPU.
+
+**Revert once `initialblockdownload` is false.** Steady-state observation needs
+none of this, and the conservative numbers are the right ones for a box shared
+with the Freenet gateways:
+
+```bash
+sudo sed -i 's/^dbcache=4000$/dbcache=450/;s/^par=6$/par=2/' /etc/bitcoind/mainnet.conf
+sudo sed -i 's/^MemoryHigh=6G$/MemoryHigh=2G/;s/^MemoryMax=8G$/MemoryMax=3G/;\
+s/^CPUQuota=600%$/CPUQuota=200%/;s/^IOSchedulingClass=best-effort$/IOSchedulingClass=idle/;\
+/^IOSchedulingPriority=6$/d' /etc/systemd/system/bitcoind-mainnet.service
+sudo systemctl daemon-reload && sudo systemctl restart bitcoind-mainnet
+```
+
+Check it is safe to revert with:
+
+```bash
+sudo -u bitcoin bitcoin-cli -conf=/etc/bitcoind/mainnet.conf \
+  -datadir=/var/lib/bitcoind/mainnet getblockchaininfo | grep initialblockdownload
+```
+
 Two systemd details worth recording because both cost time:
 
 - **`Type=forking` with `-daemonwait`, not `Type=notify`.** The official release
