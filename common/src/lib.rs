@@ -106,6 +106,34 @@ impl BitcoinNetwork {
         }
     }
 
+    /// A conservative minimum proof-of-work for headers on this network.
+    ///
+    /// A standalone block header does not say what the difficulty at its
+    /// height was supposed to be, so without a floor an attacker could mine a
+    /// run of trivially-easy headers on a laptop and satisfy every other SPV
+    /// check. The floor need only be a LOWER bound, and difficulty rising over
+    /// time makes a fixed floor more conservative rather than less, so this
+    /// does not go stale in the dangerous direction.
+    ///
+    /// `0x1900ffff` is roughly 4e9 times the genesis difficulty: about five
+    /// orders of magnitude below mainnet's real difficulty, so it never
+    /// rejects a genuine block, while putting a forged header chain far beyond
+    /// any casual attacker.
+    ///
+    /// The test networks get no floor. Signet's difficulty is trivial by
+    /// design (blocks are authorized by the signet challenge key, not by
+    /// work), testnet4 permits minimum-difficulty blocks, and regtest has no
+    /// work at all. This is precisely why a signet demo shows the mechanism
+    /// working but says nothing about mainnet-grade security.
+    pub const fn default_pow_floor(self) -> crate::spv::PowFloor {
+        match self {
+            BitcoinNetwork::Bitcoin => crate::spv::PowFloor(0x1900_ffff),
+            BitcoinNetwork::Testnet4 | BitcoinNetwork::Signet | BitcoinNetwork::Regtest => {
+                crate::spv::PowFloor::NONE
+            }
+        }
+    }
+
     /// How many confirmations this network's applications should treat as
     /// final by default. Mainnet's 6 is the conventional figure; the test
     /// networks use fewer purely so demos do not take an hour.

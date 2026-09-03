@@ -1,0 +1,43 @@
+[package]
+name = "bitcoin-freenet-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Synchronizes Bitcoin observations into Freenet contracts, with pluggable service authorization"
+
+[dependencies]
+freenet-bitcoin-common = { workspace = true, features = ["test-support"] }
+
+# Bitcoin. rust-bitcoin does the consensus-critical parsing and address
+# handling; nothing here re-implements a primitive that these provide.
+bitcoin = { version = "0.32", features = ["serde"] }
+bitcoincore-rpc = "0.19"
+
+# Ghost key verification, for the Freenet.org service-authorization policy.
+# Note this is only ONE ServiceAuth variant -- the bridge runs fine without it.
+ghostkey_lib = "0.2"
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["trace", "limit"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+serde = { workspace = true }
+serde_json = "1"
+ciborium = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["rand_core", "pkcs8", "pem"] }
+rand = "0.8"
+blake3 = { workspace = true }
+bs58 = { workspace = true }
+hex = { workspace = true }
+
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

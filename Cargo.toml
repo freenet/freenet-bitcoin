@@ -3,6 +3,7 @@ members = [
     "common",
     "contracts/bitcoin-address-contract",
     "contracts/bitcoin-tip-contract",
+    "bridge",
 ]
 resolver = "2"
 
