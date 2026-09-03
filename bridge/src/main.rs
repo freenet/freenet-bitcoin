@@ -652,7 +652,7 @@ async fn verify_address(
                     .confirmed_value_sats(tip_h, required_confirmations);
                 println!("NO -- not settled.");
                 println!(
-                    "only {confirmed} sats are confirmed to {required_confirmations}                      confirmations; {want_sats} required."
+                    "only {confirmed} sats are confirmed to {required_confirmations} confirmations; {want_sats} required."
                 );
             }
         }
