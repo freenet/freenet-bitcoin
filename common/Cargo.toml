@@ -15,7 +15,13 @@ ed25519-dalek = { workspace = true }
 blake3 = { workspace = true }
 bs58 = { workspace = true }
 hex = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 rand = "0.8"
+
+[features]
+# Exposes spv::testing so downstream crates can build genuine SPV fixtures
+# rather than stubbing out verification in their own tests.
+test-support = []

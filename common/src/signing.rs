@@ -111,6 +111,29 @@ impl SignedClaim {
         if body.script_id != params.script_id() {
             return Err("claim script_id does not match this contract instance".to_string());
         }
+
+        // A valid signature only establishes that the bridge said this. For a
+        // confirmed payment we go further and check the Bitcoin evidence
+        // itself, so that a compromised bridge key cannot mint payments that
+        // never happened.
+        if let crate::Claim::ConfirmedOutput {
+            outpoint,
+            value_sats,
+            anchor,
+            spv,
+        } = &body.claim
+        {
+            crate::spv::verify_spv_proof(
+                spv,
+                &outpoint.txid,
+                outpoint.vout,
+                &params.script_pubkey,
+                *value_sats,
+                &anchor.hash,
+                params.pow_floor,
+            )
+            .map_err(|e| format!("bitcoin evidence rejected: {e}"))?;
+        }
         Ok(body)
     }
 
@@ -206,10 +229,13 @@ mod tests {
             network: BitcoinNetwork::Signet,
             script_pubkey: vec![0x00, 0x14, 0xaa, 0xbb],
             trusted_bridges: bridges,
+            pow_floor: crate::PowFloor::NONE,
         }
     }
 
     fn body_for(p: &BitcoinAddressParameters) -> ClaimBody {
+        let (spv, txid, block) =
+            crate::spv::testing::payment_proof(&p.script_pubkey, 50_000, 1, [3; 32]);
         ClaimBody {
             script_id: p.script_id(),
             network: p.network,
@@ -218,15 +244,13 @@ mod tests {
                 hash: BlockHash([3; 32]),
             },
             claim: Claim::ConfirmedOutput {
-                outpoint: OutPoint {
-                    txid: Txid([9; 32]),
-                    vout: 1,
-                },
+                outpoint: OutPoint { txid, vout: 0 },
                 value_sats: 50_000,
                 anchor: BlockAnchor {
                     height: 499,
-                    hash: BlockHash([2; 32]),
+                    hash: block,
                 },
+                spv,
             },
         }
     }
@@ -301,6 +325,61 @@ mod tests {
             bridge: bid,
         };
         assert!(wrong.verify(&p).is_err());
+    }
+
+    /// The property the whole SPV layer exists for: a bridge whose key is
+    /// TRUSTED and whose signature is VALID still cannot assert a payment that
+    /// did not happen. Everything about the signature checks out here; only
+    /// the Bitcoin evidence does not.
+    #[test]
+    fn a_trusted_bridge_cannot_mint_a_payment_that_never_happened() {
+        let k = key(1);
+        let p = params(vec![BridgeId(k.verifying_key().to_bytes())]);
+
+        // Real proof, but for a transaction paying 1 sat.
+        let (spv, txid, block) =
+            crate::spv::testing::payment_proof(&p.script_pubkey, 1, 1, [3; 32]);
+
+        // The bridge claims it was 50,000.
+        let lie = ClaimBody {
+            script_id: p.script_id(),
+            network: p.network,
+            as_of: BlockAnchor { height: 500, hash: BlockHash([3; 32]) },
+            claim: Claim::ConfirmedOutput {
+                outpoint: OutPoint { txid, vout: 0 },
+                value_sats: 50_000,
+                anchor: BlockAnchor { height: 499, hash: block },
+                spv,
+            },
+        };
+        let signed = SignedClaim::sign(&k, &lie).unwrap();
+        let err = signed.verify(&p).unwrap_err();
+        assert!(err.contains("bitcoin evidence rejected"), "got: {err}");
+    }
+
+    /// Likewise it cannot redirect somebody else's payment to this address.
+    #[test]
+    fn a_trusted_bridge_cannot_repoint_another_addresss_payment_here() {
+        let k = key(1);
+        let p = params(vec![BridgeId(k.verifying_key().to_bytes())]);
+
+        // A genuine payment -- to a DIFFERENT script.
+        let (spv, txid, block) =
+            crate::spv::testing::payment_proof(&[0x00, 0x14, 0x99, 0x88], 50_000, 1, [4; 32]);
+
+        let lie = ClaimBody {
+            script_id: p.script_id(),
+            network: p.network,
+            as_of: BlockAnchor { height: 500, hash: BlockHash([3; 32]) },
+            claim: Claim::ConfirmedOutput {
+                outpoint: OutPoint { txid, vout: 0 },
+                value_sats: 50_000,
+                anchor: BlockAnchor { height: 499, hash: block },
+                spv,
+            },
+        };
+        let signed = SignedClaim::sign(&k, &lie).unwrap();
+        assert!(signed.verify(&p).is_err());
     }
 
     #[test]

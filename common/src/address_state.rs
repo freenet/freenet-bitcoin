@@ -418,6 +418,7 @@ pub fn scanned_to_body(
 mod tests {
     use super::*;
     use freenet_scaffold::ComposableState;
+    use crate::spv::testing as spv_testing;
     use crate::{BitcoinNetwork, BlockHash, Txid};
     use ed25519_dalek::SigningKey;
 
@@ -430,6 +431,7 @@ mod tests {
             network: BitcoinNetwork::Signet,
             script_pubkey: vec![0x00, 0x14, 0xaa, 0xbb],
             trusted_bridges: vec![BridgeId(key(1).verifying_key().to_bytes())],
+            pow_floor: crate::PowFloor::NONE,
         }
     }
 
@@ -449,7 +451,13 @@ mod tests {
         }
     }
 
+    /// Build a confirmed-payment claim carrying a REAL SPV proof: a mined
+    /// header, a real txid, a real Merkle position. Nothing here bypasses
+    /// verification, so these tests exercise the same path production does.
     fn confirmed(p: &BitcoinAddressParameters, n: u8, sats: u64, at: u32, as_of: u32) -> SignedClaim {
+        let (spv, txid, block) =
+            spv_testing::payment_proof(&p.script_pubkey, sats, 1, [n; 32]);
+        let _ = at;
         SignedClaim::sign(
             &key(1),
             &ClaimBody {
@@ -457,16 +465,22 @@ mod tests {
                 network: p.network,
                 as_of: anchor(as_of),
                 claim: Claim::ConfirmedOutput {
-                    outpoint: outpoint(n),
+                    outpoint: OutPoint { txid, vout: 0 },
                     value_sats: sats,
-                    anchor: anchor(at),
+                    anchor: BlockAnchor { height: at, hash: block },
+                    spv,
                 },
             },
         )
         .unwrap()
     }
 
-    fn retracted(p: &BitcoinAddressParameters, n: u8, as_of: u32) -> SignedClaim {
+    /// Retract the outpoint that `confirmed(.., n, sats, ..)` created. The
+    /// txid is derived the same way, so the two refer to the same outpoint --
+    /// otherwise the fold would see two unrelated outpoints and the reorg
+    /// tests would pass for the wrong reason.
+    fn retracted_for(p: &BitcoinAddressParameters, n: u8, sats: u64, as_of: u32) -> SignedClaim {
+        let (_, txid, _) = spv_testing::payment_proof(&p.script_pubkey, sats, 1, [n; 32]);
         SignedClaim::sign(
             &key(1),
             &ClaimBody {
@@ -474,7 +488,7 @@ mod tests {
                 network: p.network,
                 as_of: anchor(as_of),
                 claim: Claim::Retracted {
-                    outpoint: outpoint(n),
+                    outpoint: OutPoint { txid, vout: 0 },
                 },
             },
         )
@@ -527,7 +541,7 @@ mod tests {
         let p = params();
         let a = BitcoinAddressStateV1::from_claims(&p, [confirmed(&p, 1, 1, 10, 11)]).unwrap();
         let b = BitcoinAddressStateV1::from_claims(&p, [confirmed(&p, 2, 2, 12, 13)]).unwrap();
-        let c = BitcoinAddressStateV1::from_claims(&p, [retracted(&p, 1, 20)]).unwrap();
+        let c = BitcoinAddressStateV1::from_claims(&p, [retracted_for(&p, 1, 1, 20)]).unwrap();
         let left = merged(&p, &merged(&p, &a, &b), &c);
         let right = merged(&p, &a, &merged(&p, &b, &c));
         assert_eq!(bytes(&left), bytes(&right));
@@ -614,6 +628,8 @@ mod tests {
     #[test]
     fn a_claim_from_an_untrusted_bridge_is_rejected() {
         let p = params();
+        let (spv, txid, block) =
+            spv_testing::payment_proof(&p.script_pubkey, 21_000_000_00000000, 1, [1; 32]);
         let rogue = SignedClaim::sign(
             &key(9), // not in trusted_bridges
             &ClaimBody {
@@ -621,9 +637,10 @@ mod tests {
                 network: p.network,
                 as_of: anchor(1),
                 claim: Claim::ConfirmedOutput {
-                    outpoint: outpoint(1),
+                    outpoint: OutPoint { txid, vout: 0 },
                     value_sats: 21_000_000_00000000,
-                    anchor: anchor(1),
+                    anchor: BlockAnchor { height: 1, hash: block },
+                    spv,
                 },
             },
         )
@@ -646,6 +663,7 @@ mod tests {
     fn a_delta_carrying_a_forged_claim_is_rejected() {
         let p = params();
         let mut s = BitcoinAddressStateV1::default();
+        let (spv, txid, block) = spv_testing::payment_proof(&p.script_pubkey, 999, 1, [1; 32]);
         let forged = SignedClaim::sign(
             &key(9),
             &ClaimBody {
@@ -653,9 +671,10 @@ mod tests {
                 network: p.network,
                 as_of: anchor(1),
                 claim: Claim::ConfirmedOutput {
-                    outpoint: outpoint(1),
+                    outpoint: OutPoint { txid, vout: 0 },
                     value_sats: 999,
-                    anchor: anchor(1),
+                    anchor: BlockAnchor { height: 1, hash: block },
+                    spv,
                 },
             },
         )
@@ -691,7 +710,7 @@ mod tests {
             &p,
             [
                 confirmed(&p, 1, 50_000, 100, 100),
-                retracted(&p, 1, 105),
+                retracted_for(&p, 1, 50_000, 105),
             ],
         )
         .unwrap();
@@ -712,7 +731,7 @@ mod tests {
             &p,
             [
                 confirmed(&p, 1, 50_000, 100, 100),
-                retracted(&p, 1, 105),
+                retracted_for(&p, 1, 50_000, 105),
                 confirmed(&p, 1, 50_000, 106, 107),
             ],
         )
@@ -736,6 +755,9 @@ mod tests {
     fn claim_cap_is_enforced_deterministically() {
         let p = params();
         // Build more claims than the cap by varying the vout.
+        // Distinct claims via distinct as_of heights over one shared proof;
+        // mining a fresh header per claim would make this test take minutes.
+        let (spv, txid, block) = spv_testing::payment_proof(&p.script_pubkey, 1, 1, [5; 32]);
         let claims: Vec<SignedClaim> = (0..(MAX_CLAIMS as u32 + 50))
             .map(|i| {
                 SignedClaim::sign(
@@ -745,12 +767,10 @@ mod tests {
                         network: p.network,
                         as_of: anchor(1000 + i),
                         claim: Claim::ConfirmedOutput {
-                            outpoint: OutPoint {
-                                txid: Txid([5; 32]),
-                                vout: i,
-                            },
+                            outpoint: OutPoint { txid, vout: 0 },
                             value_sats: 1,
-                            anchor: anchor(1000 + i),
+                            anchor: BlockAnchor { height: 1, hash: block },
+                            spv: spv.clone(),
                         },
                     },
                 )

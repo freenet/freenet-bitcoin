@@ -479,6 +479,7 @@ dependencies = [
  "hex",
  "rand",
  "serde",
+ "sha2",
 ]
 
 [[package]]

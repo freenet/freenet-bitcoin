@@ -38,6 +38,7 @@ pub mod bridge_protocol;
 pub mod bytes32;
 pub mod digest;
 pub mod signing;
+pub mod spv;
 pub mod tip_state;
 
 pub use bridge_protocol::{
@@ -46,6 +47,7 @@ pub use bridge_protocol::{
 };
 pub use address_state::{BitcoinAddressStateV1, ClaimSetV1};
 pub use signing::{SignedClaim, SignedTipEntry};
+pub use spv::{PowFloor, SpvError, SpvProof, SpvVerified};
 pub use tip_state::BitcoinTipStateV1;
 
 /// Serialize a value to canonical CBOR bytes.
@@ -274,6 +276,19 @@ pub struct BitcoinAddressParameters {
     /// itself simply instantiates the contract with different keys. No part of
     /// the format privileges any particular operator.
     pub trusted_bridges: Vec<BridgeId>,
+    /// Minimum proof-of-work a block header must claim.
+    ///
+    /// A standalone header does not say what the difficulty at its height was
+    /// supposed to be, so without a floor an attacker could mine a chain of
+    /// trivially-easy headers that passes every other SPV check. Set this to a
+    /// value at or below the network's real recent difficulty. `PowFloor::NONE`
+    /// is correct for signet and regtest, where difficulty means nothing.
+    #[serde(default = "default_pow_floor")]
+    pub pow_floor: PowFloor,
+}
+
+fn default_pow_floor() -> PowFloor {
+    PowFloor::NONE
 }
 
 impl BitcoinAddressParameters {
@@ -332,10 +347,20 @@ pub enum Claim {
     },
     /// An output paying this script is included in the block named by `anchor`,
     /// and that block is on the bridge's best chain as of `as_of`.
+    ///
+    /// Carries [`SpvProof`], which is **not optional**. A confirmed payment
+    /// that a reader can only take on the bridge's word is precisely what this
+    /// design is trying not to produce: with the proof, the bridge cannot
+    /// invent a payment, inflate an amount, redirect one to another script, or
+    /// overstate how deeply it is buried. It can still omit things, and it is
+    /// still trusted to pick the best chain — bounded by proof-of-work rather
+    /// than by its signature. See `spv.rs` for the full statement of what
+    /// remains trusted.
     ConfirmedOutput {
         outpoint: OutPoint,
         value_sats: u64,
         anchor: BlockAnchor,
+        spv: SpvProof,
     },
     /// The bridge previously asserted this outpoint but, as of `as_of`, no
     /// longer sees it on its best chain — a reorg, or a mempool eviction.
@@ -510,6 +535,15 @@ mod tests {
         }
     }
 
+    /// One real SPV proof, reused across the fold tests.
+    ///
+    /// These tests are about the FOLD, not about SPV, but a confirmed claim
+    /// cannot be constructed without evidence -- which is the intended shape.
+    /// Mining at the easiest target costs microseconds.
+    fn any_spv() -> spv::SpvProof {
+        spv::testing::payment_proof(&[0x51], 1, 1, [0xaa; 32]).0
+    }
+
     #[test]
     fn script_id_separates_networks() {
         let script = [0x00, 0x14, 0xab, 0xcd];
@@ -529,6 +563,7 @@ mod tests {
                 outpoint: op(),
                 value_sats: 50_000,
                 anchor: anchor(99, 9),
+                spv: any_spv(),
             },
         );
         let gone = claim(105, Claim::Retracted { outpoint: op() });
@@ -553,6 +588,7 @@ mod tests {
                 outpoint: op(),
                 value_sats: 1,
                 anchor: anchor(101, 3),
+                spv: any_spv(),
             },
         );
         let c = claim(102, Claim::Retracted { outpoint: op() });
@@ -574,6 +610,7 @@ mod tests {
                 outpoint: op(),
                 value_sats: 50_000,
                 anchor: anchor(100, 1),
+                spv: any_spv(),
             },
         );
         let retracted = claim(101, Claim::Retracted { outpoint: op() });
@@ -583,6 +620,7 @@ mod tests {
                 outpoint: op(),
                 value_sats: 50_000,
                 anchor: anchor(101, 2),
+                spv: any_spv(),
             },
         );
         assert_eq!(
@@ -608,6 +646,7 @@ mod tests {
                     outpoint: op(),
                     value_sats: 7,
                     anchor: anchor(100, 9),
+                    spv: any_spv(),
                 },
             )
         };

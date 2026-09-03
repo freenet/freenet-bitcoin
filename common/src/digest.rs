@@ -17,7 +17,7 @@
 //! no-op — the state is a set keyed by claim digest. Verify that property
 //! before copying this pattern anywhere else.
 
-use serde::{Deserialize, Serialize};
+
 
 /// Number of summary buckets. 16 buckets × 8 bytes = 128 bytes of digest,
 /// which is the whole cost of the claim half of an address summary.
