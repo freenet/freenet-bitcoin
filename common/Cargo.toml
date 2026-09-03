@@ -1,0 +1,21 @@
+[package]
+name = "freenet-bitcoin-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared wire types for exposing Bitcoin observations to Freenet applications."
+
+[dependencies]
+freenet-scaffold = { workspace = true }
+freenet-scaffold-macro = { workspace = true }
+serde = { workspace = true }
+ciborium = { workspace = true }
+ed25519-dalek = { workspace = true }
+blake3 = { workspace = true }
+bs58 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand = "0.8"

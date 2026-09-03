@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "common",
+    "contracts/bitcoin-address-contract",
+    "contracts/bitcoin-tip-contract",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/freenet/freenet-bitcoin"
+
+[workspace.dependencies]
+freenet-bitcoin-common = { path = "common" }
+
+freenet-stdlib = "0.6"
+freenet-scaffold = "0.2.2"
+freenet-scaffold-macro = "0.2.2"
+
+serde = { version = "1.0", features = ["derive"] }
+ciborium = "0.2"
+ed25519-dalek = { version = "2.1", default-features = false, features = ["alloc", "serde"] }
+blake3 = { version = "1", default-features = false }
+bs58 = "0.5"
+hex = "0.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

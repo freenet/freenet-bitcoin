@@ -1,0 +1,22 @@
+[package]
+name = "bitcoin-address-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generic Freenet contract holding bridge-signed Bitcoin observations for one output script"
+
+[dependencies]
+freenet-bitcoin-common = { workspace = true }
+freenet-stdlib = { workspace = true }
+freenet-scaffold = { workspace = true }
+ciborium = { workspace = true }
+serde = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["freenet-main-contract"]
+contract = ["freenet-stdlib/contract"]
+freenet-main-contract = []
