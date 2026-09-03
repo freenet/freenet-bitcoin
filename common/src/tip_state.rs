@@ -27,7 +27,10 @@ use std::collections::BTreeMap;
 use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
 
-use crate::{digest::BucketDigest, BitcoinTipParameters, BlockAnchor, SignedTipEntry, TipEntryBody, TIP_RETAIN};
+use crate::{
+    digest::BucketDigest, BitcoinTipParameters, BlockAnchor, SignedTipEntry, TipEntryBody,
+    TIP_RETAIN,
+};
 
 /// Recent per-block summaries for one network.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -198,8 +201,10 @@ impl freenet_scaffold::ComposableState for BlockSummariesV1 {
                     // peer merged first, and the pair would never agree on
                     // bytes even though they agree on the chain.
                     let keep_new = match existing.body() {
-                        Ok(e) => (body.anchor.hash.0, entry.digest())
-                            > (e.anchor.hash.0, existing.digest()),
+                        Ok(e) => {
+                            (body.anchor.hash.0, entry.digest())
+                                > (e.anchor.hash.0, existing.digest())
+                        }
                         Err(_) => true,
                     };
                     if keep_new {
@@ -245,9 +250,9 @@ impl BitcoinTipStateV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freenet_scaffold::ComposableState;
     use crate::{BitcoinNetwork, BlockHash, BridgeId};
     use ed25519_dalek::SigningKey;
+    use freenet_scaffold::ComposableState;
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
@@ -321,8 +326,9 @@ mod tests {
     #[test]
     fn retention_is_bounded() {
         let p = params();
-        let s = BitcoinTipStateV1::from_entries(&p, (0..(TIP_RETAIN as u32 + 40)).map(|h| entry(h, 1)))
-            .unwrap();
+        let s =
+            BitcoinTipStateV1::from_entries(&p, (0..(TIP_RETAIN as u32 + 40)).map(|h| entry(h, 1)))
+                .unwrap();
         assert_eq!(s.blocks.blocks.len(), TIP_RETAIN);
         assert_eq!(s.tip_height(), Some(TIP_RETAIN as u32 + 39));
     }
@@ -333,9 +339,11 @@ mod tests {
     fn pruned_entries_are_never_re_offered() {
         let p = params();
         // `ahead` has pruned everything below its horizon.
-        let ahead =
-            BitcoinTipStateV1::from_entries(&p, (100..(100 + TIP_RETAIN as u32)).map(|h| entry(h, 1)))
-                .unwrap();
+        let ahead = BitcoinTipStateV1::from_entries(
+            &p,
+            (100..(100 + TIP_RETAIN as u32)).map(|h| entry(h, 1)),
+        )
+        .unwrap();
         // `behind` still holds much older blocks.
         let behind = BitcoinTipStateV1::from_entries(&p, (0..20).map(|h| entry(h, 1))).unwrap();
 
@@ -431,6 +439,9 @@ mod tests {
         let sum = crate::to_cbor(&s.blocks.summarize(&s, &p)).unwrap().len();
         let state = bytes(&s).len();
         assert!(sum < 500, "tip summary was {sum} bytes");
-        assert!(sum * 10 < state, "summary {sum} not much smaller than state {state}");
+        assert!(
+            sum * 10 < state,
+            "summary {sum} not much smaller than state {state}"
+        );
     }
 }

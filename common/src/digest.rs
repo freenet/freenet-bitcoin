@@ -17,8 +17,6 @@
 //! no-op — the state is a set keyed by claim digest. Verify that property
 //! before copying this pattern anywhere else.
 
-
-
 /// Number of summary buckets. 16 buckets × 8 bytes = 128 bytes of digest,
 /// which is the whole cost of the claim half of an address summary.
 ///
@@ -186,7 +184,11 @@ mod tests {
         let a = crate::to_cbor(&empty).unwrap();
         let b = crate::to_cbor(&full).unwrap();
         assert_eq!(a.len(), b.len());
-        assert_eq!(a.len(), BUCKETS * 8 + 2, "expected a fixed-width byte string");
+        assert_eq!(
+            a.len(),
+            BUCKETS * 8 + 2,
+            "expected a fixed-width byte string"
+        );
         assert_eq!(crate::from_cbor::<BucketDigest>(&b).unwrap(), full);
     }
 
@@ -206,6 +208,9 @@ mod tests {
         let b = crate::to_cbor(&big).unwrap().len();
         assert_eq!(a, b, "bucketed digest must not grow with the set");
         // And it must actually be small.
-        assert!(b < 300, "digest encoded to {b} bytes, expected well under 300");
+        assert!(
+            b < 300,
+            "digest encoded to {b} bytes, expected well under 300"
+        );
     }
 }

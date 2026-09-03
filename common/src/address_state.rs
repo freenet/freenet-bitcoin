@@ -113,10 +113,7 @@ impl ClaimSetV1 {
                     // Strictly-greater keeps the merge idempotent: re-applying
                     // an equal watermark must not report a change.
                     Some(existing) => {
-                        let existing_h = existing
-                            .body()
-                            .map(|b| b.as_of.height)
-                            .unwrap_or(0);
+                        let existing_h = existing.body().map(|b| b.as_of.height).unwrap_or(0);
                         if body.as_of.height > existing_h {
                             self.scanned.insert(bridge, signed);
                             true
@@ -151,7 +148,10 @@ impl ClaimSetV1 {
     /// wrong is a bound that does not bind.
     fn claim_cost(signed: &SignedClaim) -> usize {
         // 34 bytes for the ClaimKey as a CBOR byte string, which is the map key.
-        crate::to_cbor(signed).map(|b| b.len()).unwrap_or(usize::MAX) + 34
+        crate::to_cbor(signed)
+            .map(|b| b.len())
+            .unwrap_or(usize::MAX)
+            + 34
     }
 
     /// Prune to BOTH the count cap and the byte budget.
@@ -217,9 +217,7 @@ impl ClaimSetV1 {
         }
         by_outpoint
             .into_iter()
-            .filter_map(|(op, bodies)| {
-                crate::fold_outpoint_status(bodies.iter()).map(|s| (op, s))
-            })
+            .filter_map(|(op, bodies)| crate::fold_outpoint_status(bodies.iter()).map(|s| (op, s)))
             .collect()
     }
 
@@ -313,11 +311,7 @@ impl freenet_scaffold::ComposableState for ClaimSetV1 {
     type Delta = ClaimSetDelta;
     type Parameters = BitcoinAddressParameters;
 
-    fn verify(
-        &self,
-        _parent: &Self::ParentState,
-        params: &Self::Parameters,
-    ) -> Result<(), String> {
+    fn verify(&self, _parent: &Self::ParentState, params: &Self::Parameters) -> Result<(), String> {
         if self.claims.len() > MAX_CLAIMS {
             return Err(format!(
                 "claim set holds {} entries, cap is {MAX_CLAIMS}",
@@ -456,10 +450,7 @@ impl BitcoinAddressStateV1 {
 }
 
 /// Convenience: build the `ScannedTo` watermark body for a bridge.
-pub fn scanned_to_body(
-    params: &BitcoinAddressParameters,
-    as_of: BlockAnchor,
-) -> ClaimBody {
+pub fn scanned_to_body(params: &BitcoinAddressParameters, as_of: BlockAnchor) -> ClaimBody {
     ClaimBody {
         script_id: params.script_id(),
         network: params.network,
@@ -471,10 +462,10 @@ pub fn scanned_to_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freenet_scaffold::ComposableState;
     use crate::spv::testing as spv_testing;
     use crate::{BitcoinNetwork, BlockHash, Txid};
     use ed25519_dalek::SigningKey;
+    use freenet_scaffold::ComposableState;
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
@@ -508,9 +499,14 @@ mod tests {
     /// Build a confirmed-payment claim carrying a REAL SPV proof: a mined
     /// header, a real txid, a real Merkle position. Nothing here bypasses
     /// verification, so these tests exercise the same path production does.
-    fn confirmed(p: &BitcoinAddressParameters, n: u8, sats: u64, at: u32, as_of: u32) -> SignedClaim {
-        let (spv, txid, block) =
-            spv_testing::payment_proof(&p.script_pubkey, sats, 1, [n; 32]);
+    fn confirmed(
+        p: &BitcoinAddressParameters,
+        n: u8,
+        sats: u64,
+        at: u32,
+        as_of: u32,
+    ) -> SignedClaim {
+        let (spv, txid, block) = spv_testing::payment_proof(&p.script_pubkey, sats, 1, [n; 32]);
         let _ = at;
         SignedClaim::sign(
             &key(1),
@@ -521,7 +517,10 @@ mod tests {
                 claim: Claim::ConfirmedOutput {
                     outpoint: OutPoint { txid, vout: 0 },
                     value_sats: sats,
-                    anchor: BlockAnchor { height: at, hash: block },
+                    anchor: BlockAnchor {
+                        height: at,
+                        hash: block,
+                    },
                     spv,
                 },
             },
@@ -575,10 +574,15 @@ mod tests {
     #[test]
     fn merge_is_idempotent() {
         let p = params();
-        let a = BitcoinAddressStateV1::from_claims(&p, [confirmed(&p, 1, 50_000, 99, 100)]).unwrap();
+        let a =
+            BitcoinAddressStateV1::from_claims(&p, [confirmed(&p, 1, 50_000, 99, 100)]).unwrap();
         let once = merged(&p, &a, &a);
         let twice = merged(&p, &once, &a);
-        assert_eq!(bytes(&once), bytes(&twice), "re-merging must not change bytes");
+        assert_eq!(
+            bytes(&once),
+            bytes(&twice),
+            "re-merging must not change bytes"
+        );
         assert_eq!(bytes(&a), bytes(&once));
     }
 
@@ -607,7 +611,11 @@ mod tests {
         let a = BitcoinAddressStateV1::from_claims(&p, [scanned(&p, 100)]).unwrap();
         let b = BitcoinAddressStateV1::from_claims(&p, [scanned(&p, 200)]).unwrap();
         let m = merged(&p, &a, &b);
-        assert_eq!(m.claims.scanned.len(), 1, "one watermark per bridge, not one per block");
+        assert_eq!(
+            m.claims.scanned.len(),
+            1,
+            "one watermark per bridge, not one per block"
+        );
         assert_eq!(m.scanned_to(), Some(200));
         // And the other direction gives the same answer.
         assert_eq!(bytes(&m), bytes(&merged(&p, &b, &a)));
@@ -641,18 +649,27 @@ mod tests {
     #[test]
     fn summary_is_small_and_does_not_grow_with_the_claim_set() {
         let p = params();
-        let small =
-            BitcoinAddressStateV1::from_claims(&p, [confirmed(&p, 1, 1, 10, 11)]).unwrap();
+        let small = BitcoinAddressStateV1::from_claims(&p, [confirmed(&p, 1, 1, 10, 11)]).unwrap();
         let big = BitcoinAddressStateV1::from_claims(
             &p,
             (1..200u8).map(|n| confirmed(&p, n, 1000, 10, 11)),
         )
         .unwrap();
 
-        let s1 = crate::to_cbor(&small.claims.summarize(&small, &p)).unwrap().len();
-        let s2 = crate::to_cbor(&big.claims.summarize(&big, &p)).unwrap().len();
-        assert_eq!(s1, s2, "summary size must not depend on how many claims exist");
-        assert!(s2 < 400, "summary encoded to {s2} bytes; expected well under 400");
+        let s1 = crate::to_cbor(&small.claims.summarize(&small, &p))
+            .unwrap()
+            .len();
+        let s2 = crate::to_cbor(&big.claims.summarize(&big, &p))
+            .unwrap()
+            .len();
+        assert_eq!(
+            s1, s2,
+            "summary size must not depend on how many claims exist"
+        );
+        assert!(
+            s2 < 400,
+            "summary encoded to {s2} bytes; expected well under 400"
+        );
 
         // And it must be far smaller than the state it describes.
         let state_len = crate::to_cbor(&big).unwrap().len();
@@ -693,7 +710,10 @@ mod tests {
                 claim: Claim::ConfirmedOutput {
                     outpoint: OutPoint { txid, vout: 0 },
                     value_sats: 21_000_000_00000000,
-                    anchor: BlockAnchor { height: 1, hash: block },
+                    anchor: BlockAnchor {
+                        height: 1,
+                        hash: block,
+                    },
                     spv,
                 },
             },
@@ -727,7 +747,10 @@ mod tests {
                 claim: Claim::ConfirmedOutput {
                     outpoint: OutPoint { txid, vout: 0 },
                     value_sats: 999,
-                    anchor: BlockAnchor { height: 1, hash: block },
+                    anchor: BlockAnchor {
+                        height: 1,
+                        hash: block,
+                    },
                     spv,
                 },
             },
@@ -791,7 +814,11 @@ mod tests {
         )
         .unwrap();
         let proof = s.claims.payment_evidence(50_000, 110, 2).unwrap();
-        assert_eq!(proof.len(), 3, "proof must carry the whole history for that outpoint");
+        assert_eq!(
+            proof.len(),
+            3,
+            "proof must carry the whole history for that outpoint"
+        );
     }
 
     #[test]
@@ -823,7 +850,10 @@ mod tests {
                         claim: Claim::ConfirmedOutput {
                             outpoint: OutPoint { txid, vout: 0 },
                             value_sats: 1,
-                            anchor: BlockAnchor { height: 1, hash: block },
+                            anchor: BlockAnchor {
+                                height: 1,
+                                hash: block,
+                            },
                             spv: spv.clone(),
                         },
                     },
@@ -858,7 +888,10 @@ mod tests {
             .map(|b| b.as_of.height)
             .min()
             .unwrap();
-        assert!(min_kept > 1000, "pruning kept stale claims instead of recent ones");
+        assert!(
+            min_kept > 1000,
+            "pruning kept stale claims instead of recent ones"
+        );
     }
 }
 
@@ -902,7 +935,10 @@ mod size_tests {
                         claim: Claim::ConfirmedOutput {
                             outpoint: OutPoint { txid, vout: 0 },
                             value_sats: 1000,
-                            anchor: BlockAnchor { height: 999, hash: block },
+                            anchor: BlockAnchor {
+                                height: 999,
+                                hash: block,
+                            },
                             spv: spv.clone(),
                         },
                     },
@@ -954,7 +990,12 @@ mod size_tests {
             state.claims.claims.len() > 1,
             "fixture did not actually build a large set"
         );
-        let bytes: usize = state.claims.claims.values().map(ClaimSetV1::claim_cost).sum();
+        let bytes: usize = state
+            .claims
+            .claims
+            .values()
+            .map(ClaimSetV1::claim_cost)
+            .sum();
         if bytes > MAX_CLAIM_BYTES {
             let err = state.claims.verify(&state.clone(), &p).unwrap_err();
             assert!(err.contains("budget"), "got: {err}");

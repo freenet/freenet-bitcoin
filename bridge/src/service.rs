@@ -62,7 +62,9 @@ pub fn router(state: Arc<ServiceState>) -> Router {
         // Bound the body so a hostile caller cannot make the bridge buffer an
         // arbitrary amount of memory. A broadcast request carries a raw
         // transaction, so the cap has to clear Bitcoin's 1MB tx limit.
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(2 * 1024 * 1024))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            2 * 1024 * 1024,
+        ))
         // A Freenet webapp is served from the gateway's origin, so every call
         // to a bridge is cross-origin and a browser blocks it without this.
         //

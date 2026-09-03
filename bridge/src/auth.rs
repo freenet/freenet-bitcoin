@@ -93,7 +93,13 @@ pub fn authorize(
                     detail: "this bridge serves Ghost Key holders".to_string(),
                 });
             };
-            verify_ghost_key(gk, master_verifying_key_b64.as_deref(), request_body_cbor, store, now_ms)
+            verify_ghost_key(
+                gk,
+                master_verifying_key_b64.as_deref(),
+                request_body_cbor,
+                store,
+                now_ms,
+            )
         }
     }
 }
@@ -111,7 +117,9 @@ fn verify_ghost_key(
     // were not atomic, two concurrent requests could both spend one challenge.
     if !store
         .consume_challenge(&gk.challenge, now_ms, CHALLENGE_TTL_MS)
-        .map_err(|e| BridgeError::Internal { detail: e.to_string() })?
+        .map_err(|e| BridgeError::Internal {
+            detail: e.to_string(),
+        })?
     {
         return Err(BridgeError::StaleChallenge);
     }
@@ -123,7 +131,8 @@ fn verify_ghost_key(
         detail: "a valid Ghost Key is required for this bridge's service".to_string(),
     };
 
-    let cert = GhostkeyCertificateV1::from_armored_string(&gk.certificate_pem).map_err(|_| deny())?;
+    let cert =
+        GhostkeyCertificateV1::from_armored_string(&gk.certificate_pem).map_err(|_| deny())?;
 
     let master = match master_b64 {
         Some(b64) => Some(VerifyingKey::from_base64(b64).map_err(|_| deny())?),
@@ -217,7 +226,13 @@ mod tests {
             challenge: b"c1".to_vec(),
             signature: vec![0u8; 64],
         };
-        let first = authorize(&policy, &ServiceAuth::GhostKey(gk.clone()), &body(), &store, 0);
+        let first = authorize(
+            &policy,
+            &ServiceAuth::GhostKey(gk.clone()),
+            &body(),
+            &store,
+            0,
+        );
         assert!(matches!(first, Err(BridgeError::NotAuthorized { .. })));
         let second = authorize(&policy, &ServiceAuth::GhostKey(gk), &body(), &store, 0);
         assert_eq!(

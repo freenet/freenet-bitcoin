@@ -215,9 +215,7 @@ impl SignedTipEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        BitcoinNetwork, BlockAnchor, BlockHash, Claim, OutPoint, ScriptId, Txid,
-    };
+    use crate::{BitcoinNetwork, BlockAnchor, BlockHash, Claim, OutPoint, ScriptId, Txid};
     use ed25519_dalek::SigningKey;
 
     fn key(seed: u8) -> SigningKey {
@@ -344,11 +342,17 @@ mod tests {
         let lie = ClaimBody {
             script_id: p.script_id(),
             network: p.network,
-            as_of: BlockAnchor { height: 500, hash: BlockHash([3; 32]) },
+            as_of: BlockAnchor {
+                height: 500,
+                hash: BlockHash([3; 32]),
+            },
             claim: Claim::ConfirmedOutput {
                 outpoint: OutPoint { txid, vout: 0 },
                 value_sats: 50_000,
-                anchor: BlockAnchor { height: 499, hash: block },
+                anchor: BlockAnchor {
+                    height: 499,
+                    hash: block,
+                },
                 spv,
             },
         };
@@ -370,11 +374,17 @@ mod tests {
         let lie = ClaimBody {
             script_id: p.script_id(),
             network: p.network,
-            as_of: BlockAnchor { height: 500, hash: BlockHash([3; 32]) },
+            as_of: BlockAnchor {
+                height: 500,
+                hash: BlockHash([3; 32]),
+            },
             claim: Claim::ConfirmedOutput {
                 outpoint: OutPoint { txid, vout: 0 },
                 value_sats: 50_000,
-                anchor: BlockAnchor { height: 499, hash: block },
+                anchor: BlockAnchor {
+                    height: 499,
+                    hash: block,
+                },
                 spv,
             },
         };

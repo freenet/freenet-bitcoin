@@ -176,11 +176,17 @@ pub enum ServiceResponse {
     },
     Unwatched,
     /// Bitcoin Core accepted the transaction, or already had it.
-    Broadcast { txid: Txid, already_known: bool },
+    Broadcast {
+        txid: Txid,
+        already_known: bool,
+    },
     Status(BridgeStatus),
     /// A challenge the client must sign to authenticate. Returned when a
     /// request needs authorization and did not carry a fresh one.
-    Challenge { challenge: Vec<u8>, expires_in_s: u32 },
+    Challenge {
+        challenge: Vec<u8>,
+        expires_in_s: u32,
+    },
     Error(BridgeError),
 }
 
@@ -190,19 +196,29 @@ pub enum BridgeError {
     /// deliberately generic and identical whether the certificate was absent,
     /// malformed, expired or revoked: a precise error is an oracle for probing
     /// which certificates exist.
-    NotAuthorized { detail: String },
+    NotAuthorized {
+        detail: String,
+    },
     /// The challenge was unknown, already used, or expired.
     StaleChallenge,
     /// The bridge is up but cannot answer usefully yet.
-    NotSynced { tip_height: u32 },
+    NotSynced {
+        tip_height: u32,
+    },
     /// Bitcoin Core rejected the transaction. `reason` is passed through
     /// verbatim because a payer genuinely needs it.
-    RejectedByNode { reason: String },
+    RejectedByNode {
+        reason: String,
+    },
     /// This operator does not serve that network.
     UnsupportedNetwork,
     /// Too many requests. Applies per-credential and per-source.
-    RateLimited { retry_after_s: u32 },
-    Internal { detail: String },
+    RateLimited {
+        retry_after_s: u32,
+    },
+    Internal {
+        detail: String,
+    },
 }
 
 impl core::fmt::Display for BridgeError {

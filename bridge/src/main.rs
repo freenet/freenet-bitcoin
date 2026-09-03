@@ -81,8 +81,10 @@ fn main() -> Result<()> {
     }
 
     if let Some(address) = cli.verify.clone() {
-        let network: BitcoinNetwork =
-            cli.network.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+        let network: BitcoinNetwork = cli
+            .network
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!(e))?;
         return tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -164,8 +166,8 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
                 cfg.contract_dir.display()
             )
         })?;
-    let tip_wasm = std::fs::read(cfg.contract_dir.join("bitcoin_tip_contract.wasm"))
-        .with_context(|| {
+    let tip_wasm =
+        std::fs::read(cfg.contract_dir.join("bitcoin_tip_contract.wasm")).with_context(|| {
             format!(
                 "reading bitcoin_tip_contract.wasm from {}",
                 cfg.contract_dir.display()
@@ -442,8 +444,11 @@ mod tests {
     #[test]
     fn addresses_parse_to_canonical_script_bytes() {
         // A well-known mainnet P2PKH address (Bitcoin's genesis coinbase).
-        let spk = parse_address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", BitcoinNetwork::Bitcoin)
-            .unwrap();
+        let spk = parse_address(
+            "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+            BitcoinNetwork::Bitcoin,
+        )
+        .unwrap();
         // OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
         assert_eq!(spk.len(), 25);
         assert_eq!(spk[0], 0x76);
@@ -455,11 +460,9 @@ mod tests {
     fn an_address_from_the_wrong_network_is_rejected() {
         // Accepting one would make the bridge watch a script that can never be
         // paid on the network it is actually following.
-        assert!(parse_address(
-            "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
-            BitcoinNetwork::Signet
-        )
-        .is_err());
+        assert!(
+            parse_address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", BitcoinNetwork::Signet).is_err()
+        );
     }
 
     #[test]
@@ -535,7 +538,9 @@ async fn verify_address(cfg: BridgeConfig, network: BitcoinNetwork, address: &st
     };
     let tip_height = match publisher.tip_key(&tip_params) {
         Ok(tk) => match publisher.get_state(tk).await {
-            Ok(b) => from_cbor::<BitcoinTipStateV1>(&b).ok().and_then(|t| t.tip_height()),
+            Ok(b) => from_cbor::<BitcoinTipStateV1>(&b)
+                .ok()
+                .and_then(|t| t.tip_height()),
             Err(_) => None,
         },
         Err(_) => None,
@@ -563,7 +568,11 @@ async fn verify_address(cfg: BridgeConfig, network: BitcoinNetwork, address: &st
                 }
                 OutpointStatus::Retracted => "reorganized off the chain".to_string(),
             };
-            println!("           {}:{}  {line}", op.txid.to_display_string(), op.vout);
+            println!(
+                "           {}:{}  {line}",
+                op.txid.to_display_string(),
+                op.vout
+            );
         }
         if let Some(t) = tip_height {
             println!(

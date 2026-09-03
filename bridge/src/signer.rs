@@ -106,6 +106,10 @@ mod tests {
         let p = dir.path().join("key");
         Signer::load_or_create(&p).unwrap();
         let mode = std::fs::metadata(&p).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "signing key must not be group/world readable");
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "signing key must not be group/world readable"
+        );
     }
 }

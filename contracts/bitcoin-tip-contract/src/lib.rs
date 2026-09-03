@@ -10,11 +10,14 @@ use ciborium::{de::from_reader, ser::into_writer};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::*;
 
-use freenet_bitcoin_common::tip_state::{BitcoinTipStateV1, BitcoinTipStateV1Delta, BitcoinTipStateV1Summary};
+use freenet_bitcoin_common::tip_state::{
+    BitcoinTipStateV1, BitcoinTipStateV1Delta, BitcoinTipStateV1Summary,
+};
 use freenet_bitcoin_common::BitcoinTipParameters;
 
 fn decode_params(p: &Parameters<'static>) -> Result<BitcoinTipParameters, ContractError> {
-    from_reader::<BitcoinTipParameters, &[u8]>(p.as_ref()).map_err(|e| ContractError::Deser(e.to_string()))
+    from_reader::<BitcoinTipParameters, &[u8]>(p.as_ref())
+        .map_err(|e| ContractError::Deser(e.to_string()))
 }
 
 #[allow(dead_code)]
@@ -59,7 +62,9 @@ impl ContractInterface for Contract {
                     let incoming = from_reader::<BitcoinTipStateV1, &[u8]>(new_state.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     st.merge(&st.clone(), &params, &incoming).map_err(|e| {
-                        ContractError::InvalidUpdateWithInfo { reason: e.to_string() }
+                        ContractError::InvalidUpdateWithInfo {
+                            reason: e.to_string(),
+                        }
                     })?;
                 }
                 UpdateData::Delta(d) => {
@@ -68,22 +73,26 @@ impl ContractInterface for Contract {
                     }
                     let delta = from_reader::<BitcoinTipStateV1Delta, &[u8]>(d.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    st.apply_delta(&st.clone(), &params, &Some(delta)).map_err(|e| {
-                        ContractError::InvalidUpdateWithInfo { reason: e.to_string() }
-                    })?;
+                    st.apply_delta(&st.clone(), &params, &Some(delta))
+                        .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                            reason: e.to_string(),
+                        })?;
                 }
                 UpdateData::StateAndDelta { state: s, delta: d } => {
                     let incoming = from_reader::<BitcoinTipStateV1, &[u8]>(s.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     st.merge(&st.clone(), &params, &incoming).map_err(|e| {
-                        ContractError::InvalidUpdateWithInfo { reason: e.to_string() }
+                        ContractError::InvalidUpdateWithInfo {
+                            reason: e.to_string(),
+                        }
                     })?;
                     if !d.as_ref().is_empty() {
                         let delta = from_reader::<BitcoinTipStateV1Delta, &[u8]>(d.as_ref())
                             .map_err(|e| ContractError::Deser(e.to_string()))?;
-                        st.apply_delta(&st.clone(), &params, &Some(delta)).map_err(|e| {
-                            ContractError::InvalidUpdateWithInfo { reason: e.to_string() }
-                        })?;
+                        st.apply_delta(&st.clone(), &params, &Some(delta))
+                            .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                                reason: e.to_string(),
+                            })?;
                     }
                 }
                 _ => return Err(ContractError::InvalidUpdate),
@@ -135,8 +144,7 @@ impl ContractInterface for Contract {
         match st.delta(&st, &params, &old) {
             Some(delta) => {
                 let mut out = vec![];
-                into_writer(&delta, &mut out)
-                    .map_err(|e| ContractError::Deser(e.to_string()))?;
+                into_writer(&delta, &mut out).map_err(|e| ContractError::Deser(e.to_string()))?;
                 Ok(StateDelta::from(out))
             }
             // Zero bytes, not an encoded empty struct: reconciling with an

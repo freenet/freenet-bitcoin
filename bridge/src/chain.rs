@@ -199,12 +199,7 @@ impl ChainClient {
                 height: info.height as u32,
                 hash: *hash,
             },
-            prev_hash: BlockHash(
-                block
-                    .header
-                    .prev_blockhash
-                    .to_byte_array(),
-            ),
+            prev_hash: BlockHash(block.header.prev_blockhash.to_byte_array()),
             header,
             time: block.header.time,
             median_time: info.median_time.unwrap_or(block.header.time as usize) as u32,
@@ -326,7 +321,11 @@ pub fn merkle_branch(txids: &[[u8; 32]], index: usize) -> Vec<[u8; 32]> {
             let last = *level.last().expect("level is non-empty");
             level.push(last);
         }
-        let sibling = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
+        let sibling = if idx.is_multiple_of(2) {
+            idx + 1
+        } else {
+            idx - 1
+        };
         branch.push(level[sibling]);
 
         let mut next = Vec::with_capacity(level.len() / 2);
@@ -388,8 +387,7 @@ mod tests {
             let root = merkle_root(&txids);
             for i in 0..n {
                 let branch = merkle_branch(&txids, i);
-                let folded =
-                    merkle_root_from_branch(&Txid(txids[i]), &branch, i as u32).unwrap();
+                let folded = merkle_root_from_branch(&Txid(txids[i]), &branch, i as u32).unwrap();
                 assert_eq!(
                     folded, root,
                     "tree of {n} txids, position {i}: branch did not fold to the root"
@@ -419,7 +417,9 @@ mod tests {
     #[test]
     fn stripping_witness_data_preserves_the_txid() {
         // The whole SPV chain rests on this: sha256d(stripped) == txid.
-        use bitcoin::{absolute::LockTime, transaction::Version, Amount, ScriptBuf, Transaction, TxIn, TxOut};
+        use bitcoin::{
+            absolute::LockTime, transaction::Version, Amount, ScriptBuf, Transaction, TxIn, TxOut,
+        };
         let tx = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,

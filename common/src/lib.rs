@@ -41,11 +41,11 @@ pub mod signing;
 pub mod spv;
 pub mod tip_state;
 
-pub use bridge_protocol::{
-    BridgeStatus, GhostKeyAuth, RequestBody, ServiceAuth,
-    BridgeError, BroadcastRequest, ServiceRequest, ServiceResponse, WatchRequest,
-};
 pub use address_state::{BitcoinAddressStateV1, ClaimSetV1};
+pub use bridge_protocol::{
+    BridgeError, BridgeStatus, BroadcastRequest, GhostKeyAuth, RequestBody, ServiceAuth,
+    ServiceRequest, ServiceResponse, WatchRequest,
+};
 pub use signing::{SignedClaim, SignedTipEntry};
 pub use spv::{PowFloor, SpvError, SpvProof, SpvVerified};
 pub use tip_state::BitcoinTipStateV1;
@@ -180,10 +180,9 @@ impl Txid {
 
     /// Parse from the reversed display order used by explorers and RPC.
     pub fn from_display_string(s: &str) -> Result<Self, String> {
-        let mut b = <[u8; 32]>::try_from(
-            hex::decode(s.trim()).map_err(|e| format!("txid not hex: {e}"))?,
-        )
-        .map_err(|_| "txid must be 32 bytes".to_string())?;
+        let mut b =
+            <[u8; 32]>::try_from(hex::decode(s.trim()).map_err(|e| format!("txid not hex: {e}"))?)
+                .map_err(|_| "txid must be 32 bytes".to_string())?;
         b.reverse();
         Ok(Txid(b))
     }
@@ -216,14 +215,18 @@ impl BlockHash {
 /// Carrying the hash as well as the height is what makes reorgs detectable at
 /// all. Two assertions can name height 900_001 and mean different blocks; only
 /// the hash distinguishes them.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default,
+)]
 pub struct BlockAnchor {
     pub height: u32,
     pub hash: BlockHash,
 }
 
 /// A Bitcoin outpoint: which output of which transaction.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default,
+)]
 pub struct OutPoint {
     pub txid: Txid,
     pub vout: u32,
@@ -369,10 +372,7 @@ pub struct ClaimBody {
 pub enum Claim {
     /// An output paying this script exists in a transaction the bridge has
     /// seen in the mempool but not in any block.
-    MempoolOutput {
-        outpoint: OutPoint,
-        value_sats: u64,
-    },
+    MempoolOutput { outpoint: OutPoint, value_sats: u64 },
     /// An output paying this script is included in the block named by `anchor`,
     /// and that block is on the bridge's best chain as of `as_of`.
     ///
@@ -419,8 +419,9 @@ impl Claim {
 
     pub fn value_sats(&self) -> Option<u64> {
         match self {
-            Claim::MempoolOutput { value_sats, .. }
-            | Claim::ConfirmedOutput { value_sats, .. } => Some(*value_sats),
+            Claim::MempoolOutput { value_sats, .. } | Claim::ConfirmedOutput { value_sats, .. } => {
+                Some(*value_sats)
+            }
             Claim::Retracted { .. } | Claim::ScannedTo => None,
         }
     }

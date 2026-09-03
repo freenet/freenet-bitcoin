@@ -561,10 +561,24 @@ mod tests {
     fn a_reorg_unconfirms_exactly_the_orphaned_outputs() {
         let s = store();
         let net = BitcoinNetwork::Signet;
-        s.record_output(net, b"spk", &[1; 32], 0, 1000, Some((100, BlockHash([9; 32]))))
-            .unwrap();
-        s.record_output(net, b"spk", &[2; 32], 0, 2000, Some((105, BlockHash([8; 32]))))
-            .unwrap();
+        s.record_output(
+            net,
+            b"spk",
+            &[1; 32],
+            0,
+            1000,
+            Some((100, BlockHash([9; 32]))),
+        )
+        .unwrap();
+        s.record_output(
+            net,
+            b"spk",
+            &[2; 32],
+            0,
+            2000,
+            Some((105, BlockHash([8; 32]))),
+        )
+        .unwrap();
 
         let orphaned = s.outputs_above(net, 102).unwrap();
         assert_eq!(orphaned.len(), 1);
@@ -580,17 +594,29 @@ mod tests {
     fn deep_claims_are_offered_once_and_only_when_buried_enough() {
         let s = store();
         let net = BitcoinNetwork::Signet;
-        s.record_output(net, b"spk", &[1; 32], 0, 1000, Some((100, BlockHash([9; 32]))))
-            .unwrap();
+        s.record_output(
+            net,
+            b"spk",
+            &[1; 32],
+            0,
+            1000,
+            Some((100, BlockHash([9; 32]))),
+        )
+        .unwrap();
 
         // At tip 104 the output is only 5 deep; a depth-6 requirement is unmet.
-        assert!(s.outputs_needing_deep_claim(net, 104, 6).unwrap().is_empty());
+        assert!(s
+            .outputs_needing_deep_claim(net, 104, 6)
+            .unwrap()
+            .is_empty());
         // At tip 105 it is 6 deep.
         assert_eq!(s.outputs_needing_deep_claim(net, 105, 6).unwrap().len(), 1);
 
         s.mark_deep_published(net, &[1; 32], 0).unwrap();
         assert!(
-            s.outputs_needing_deep_claim(net, 200, 6).unwrap().is_empty(),
+            s.outputs_needing_deep_claim(net, 200, 6)
+                .unwrap()
+                .is_empty(),
             "a deep claim must not be published twice"
         );
     }

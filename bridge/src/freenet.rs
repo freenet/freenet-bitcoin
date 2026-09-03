@@ -38,11 +38,7 @@ pub struct FreenetPublisher {
 }
 
 impl FreenetPublisher {
-    pub async fn connect(
-        ws_url: &str,
-        address_wasm: Vec<u8>,
-        tip_wasm: Vec<u8>,
-    ) -> Result<Self> {
+    pub async fn connect(ws_url: &str, address_wasm: Vec<u8>, tip_wasm: Vec<u8>) -> Result<Self> {
         let (stream, _) = tokio_tungstenite::connect_async(ws_url)
             .await
             .with_context(|| format!("connecting to the Freenet node at {ws_url}"))?;
@@ -168,9 +164,9 @@ impl FreenetPublisher {
         )
         .await
         {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
-                ..
-            }))) => return Ok(()),
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse { .. }))) => {
+                return Ok(())
+            }
             Ok(Ok(_other)) => {
                 // Anything else -- most often "contract not found" -- means the
                 // instance does not exist yet, so fall through to PUT.

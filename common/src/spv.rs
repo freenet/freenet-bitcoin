@@ -158,12 +158,18 @@ pub enum SpvError {
     TxTooLarge(usize),
     MalformedTx(&'static str),
     /// The transaction does not hash to the txid the claim names.
-    TxidMismatch { computed: Txid, claimed: Txid },
+    TxidMismatch {
+        computed: Txid,
+        claimed: Txid,
+    },
     NoSuchOutput(u32),
     /// The output exists but pays a different script.
     ScriptMismatch,
     /// The output exists but for a different amount.
-    ValueMismatch { in_tx: u64, claimed: u64 },
+    ValueMismatch {
+        in_tx: u64,
+        claimed: u64,
+    },
     MerkleTooDeep(usize),
     /// The Merkle fold did not reach the header's root.
     MerkleMismatch,
@@ -177,13 +183,18 @@ pub enum SpvError {
     BrokenChain(usize),
     TooManyHeaders(usize),
     /// The proof carries fewer headers than the required depth.
-    InsufficientDepth { have: u32, need: u32 },
+    InsufficientDepth {
+        have: u32,
+        need: u32,
+    },
 }
 
 impl core::fmt::Display for SpvError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            SpvError::TxTooLarge(n) => write!(f, "raw transaction is {n} bytes, cap is {MAX_RAW_TX}"),
+            SpvError::TxTooLarge(n) => {
+                write!(f, "raw transaction is {n} bytes, cap is {MAX_RAW_TX}")
+            }
             SpvError::MalformedTx(w) => write!(f, "malformed transaction: {w}"),
             SpvError::TxidMismatch { computed, claimed } => write!(
                 f,
@@ -196,13 +207,19 @@ impl core::fmt::Display for SpvError {
             SpvError::ValueMismatch { in_tx, claimed } => {
                 write!(f, "output pays {in_tx} sats, claim says {claimed}")
             }
-            SpvError::MerkleTooDeep(d) => write!(f, "merkle branch depth {d} exceeds {MAX_MERKLE_DEPTH}"),
+            SpvError::MerkleTooDeep(d) => {
+                write!(f, "merkle branch depth {d} exceeds {MAX_MERKLE_DEPTH}")
+            }
             SpvError::MerkleMismatch => write!(f, "merkle branch does not reach the block's root"),
             SpvError::BlockHashMismatch => write!(f, "header does not hash to the claimed block"),
             SpvError::InsufficientWork => write!(f, "block header does not meet its own target"),
             SpvError::BelowPowFloor => write!(f, "block header claims less work than permitted"),
-            SpvError::BrokenChain(i) => write!(f, "following header {i} does not build on its predecessor"),
-            SpvError::TooManyHeaders(n) => write!(f, "{n} following headers, cap is {MAX_FOLLOWING_HEADERS}"),
+            SpvError::BrokenChain(i) => {
+                write!(f, "following header {i} does not build on its predecessor")
+            }
+            SpvError::TooManyHeaders(n) => {
+                write!(f, "{n} following headers, cap is {MAX_FOLLOWING_HEADERS}")
+            }
             SpvError::InsufficientDepth { have, need } => {
                 write!(f, "proof establishes {have} confirmations, {need} required")
             }
@@ -810,7 +827,10 @@ mod tests {
             read_varint(&[0xfe, 0x78, 0x56, 0x34, 0x12], 0).unwrap(),
             (0x1234_5678, 5)
         );
-        assert!(read_varint(&[0xfd, 0x00], 0).is_err(), "truncated must error");
+        assert!(
+            read_varint(&[0xfd, 0x00], 0).is_err(),
+            "truncated must error"
+        );
     }
 }
 

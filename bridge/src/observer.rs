@@ -64,11 +64,7 @@ impl Observer {
         self.cfg.network
     }
 
-    pub fn address_params(
-        &self,
-        script: &[u8],
-        bridge: BridgeId,
-    ) -> BitcoinAddressParameters {
+    pub fn address_params(&self, script: &[u8], bridge: BridgeId) -> BitcoinAddressParameters {
         BitcoinAddressParameters {
             network: self.cfg.network,
             script_pubkey: script.to_vec(),
@@ -117,11 +113,11 @@ impl Observer {
             return Ok(checkpoint.height + 1);
         }
 
-        let fork = self.chain.find_fork_point(
-            checkpoint.height,
-            self.cfg.max_reorg_depth,
-            |h| store.block_at(self.cfg.network, h).ok().flatten(),
-        )?;
+        let fork =
+            self.chain
+                .find_fork_point(checkpoint.height, self.cfg.max_reorg_depth, |h| {
+                    store.block_at(self.cfg.network, h).ok().flatten()
+                })?;
         tracing::warn!(
             network = ?self.cfg.network,
             from = checkpoint.height,
@@ -240,10 +236,15 @@ impl Observer {
             // transaction and Merkle branch again. A pruned node may have
             // discarded it, in which case we simply skip: the shallow claim
             // stands and the payment is still provable, just not to this depth.
-            let scanned = match self.chain.scan_block(&block_hash, std::slice::from_ref(&script)) {
+            let scanned = match self
+                .chain
+                .scan_block(&block_hash, std::slice::from_ref(&script))
+            {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::debug!("block {height} no longer available ({e}); skipping deep claim");
+                    tracing::debug!(
+                        "block {height} no longer available ({e}); skipping deep claim"
+                    );
                     continue;
                 }
             };
