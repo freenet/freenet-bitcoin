@@ -158,17 +158,34 @@ related-contract mechanism: `validate_state` returns
 `ValidateResult::RequestRelated(ids)` and the host re-invokes with
 `RelatedContracts` populated.
 
-Verified limits as of freenet-stdlib 0.6/0.8 (the `ValidateResult` API is
-byte-identical between them):
+Verified limits, checked against the **published** 0.6.1 and 0.8.5 crates and
+against freenet-core `origin/main` (not a local worktree — the local `main`
+checkout was 71 commits stale, and reading it produced a wrong answer once
+already):
 
+- **`ValidateResult` is byte-identical in 0.6.1 and 0.8.5**, and carries no
+  `#[non_exhaustive]`. Harvest's 0.6 pin does not constrain this API at all.
 - **One round only.** A `RequestRelated` is fetched and retried exactly once; a
-  second is an error. No chained dependencies.
-- **At most 10 contract ids** per request.
-- Honored on both the PUT and UPDATE paths.
-- Related state resolved during *validation* is not captured by the conformance
-  system (freenet-core#5376), so a contract depending on that path cannot be
-  judged by it — and an unjudgeable contract reads exactly like a clean one.
-- A related fetch that times out can wedge an UPDATE merge (freenet-core#4077).
+  second is a hard error on every path (PUT/UPDATE, network/local). Declare
+  every related contract you need in the first call.
+- **At most 10 contract ids** per request
+  (`MAX_RELATED_CONTRACTS_PER_REQUEST`, `runtime.rs:19`), with a 10-second
+  fetch budget. Empty lists and self-references are rejected before the fetch.
+- Honored on both the PUT and UPDATE paths, network and local
+  (`fetch_related_for_validation` / `fetch_related_for_validation_network`).
+- **All six `UpdateData` variants are legal** on a client-originated
+  `ContractRequest::Update`, including the `Related*` ones; only a variant from
+  a stdlib newer than the host build is rejected.
+- A related fetch that times out could once wedge an UPDATE merge
+  (freenet-core#4077); the parallel-fetch fix (#4080) is merged, though the
+  issue is still open.
+- Conformance capture of validation-resolved related state (freenet-core#5376)
+  **is fixed on `origin/main`** — the capture hook is present in both fetch
+  paths (`contract_ops.rs:846`). It was genuinely absent before #5393/#5402
+  merged on 2026-08-23, which would have made a contract like this one
+  unjudgeable, and an unjudgeable contract reads exactly like a clean one. The
+  field re-verification on the live capture peer is still pending, so treat the
+  fix as merged-but-unconfirmed rather than proven.
 
 **The important part is not whether it works, but what may be read.** Harvest's
 cross-check against related state is **strictly additive**: no path through it
