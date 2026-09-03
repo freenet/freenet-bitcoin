@@ -57,6 +57,17 @@ struct Cli {
     /// Network for --verify.
     #[arg(long, default_value = "signet")]
     network: String,
+    /// With --verify: ask whether the observations in Freenet would satisfy an
+    /// invoice for this many sats at this many confirmations.
+    ///
+    /// This is the join between the two halves. --verify alone shows Bitcoin
+    /// data reached Freenet; this shows that data DECIDING something, using
+    /// exactly the function an application contract calls.
+    #[arg(long, value_name = "SATS")]
+    prove_payment_of: Option<u64>,
+    /// Confirmations required by --prove-payment-of.
+    #[arg(long, default_value_t = 2)]
+    confirmations: u32,
 }
 
 fn main() -> Result<()> {
@@ -88,7 +99,13 @@ fn main() -> Result<()> {
         return tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(verify_address(cfg, network, &address));
+            .block_on(verify_address(
+                cfg,
+                network,
+                &address,
+                cli.prove_payment_of,
+                cli.confirmations,
+            ));
     }
 
     tokio::runtime::Builder::new_multi_thread()
@@ -489,7 +506,13 @@ mod tests {
 /// Deliberately re-verifies every claim from scratch rather than trusting the
 /// bridge's own record, so the output describes what a third party could
 /// independently establish.
-async fn verify_address(cfg: BridgeConfig, network: BitcoinNetwork, address: &str) -> Result<()> {
+async fn verify_address(
+    cfg: BridgeConfig,
+    network: BitcoinNetwork,
+    address: &str,
+    prove_payment_of: Option<u64>,
+    required_confirmations: u32,
+) -> Result<()> {
     use freenet_bitcoin_common::address_state::BitcoinAddressStateV1;
     use freenet_bitcoin_common::tip_state::BitcoinTipStateV1;
     use freenet_bitcoin_common::{
@@ -586,5 +609,53 @@ async fn verify_address(cfg: BridgeConfig, network: BitcoinNetwork, address: &st
     println!("Every claim above was re-verified against its own Bitcoin evidence");
     println!("(raw transaction, Merkle branch, and block-header proof-of-work),");
     println!("not merely against the bridge's signature.");
+
+    // The join: would this data settle an invoice? `payment_evidence` is the
+    // same function an application contract calls, so this is not a
+    // reimplementation of the decision -- it IS the decision.
+    if let Some(want_sats) = prove_payment_of {
+        let Some(tip_h) = tip_height else {
+            println!("\ncannot judge payment: no chain tip available");
+            return Ok(());
+        };
+        println!();
+        println!(
+            "--- would this settle an invoice for {want_sats} sats at {required_confirmations} conf? ---"
+        );
+        match state
+            .claims
+            .payment_evidence(want_sats, tip_h, required_confirmations)
+        {
+            Some(proof) => {
+                // Re-verify the returned evidence from scratch, the way a
+                // consuming contract would, rather than trusting the fold that
+                // produced it.
+                for c in &proof {
+                    c.verify(&params).map_err(|e| {
+                        anyhow::anyhow!("evidence returned by the fold does not verify: {e}")
+                    })?;
+                }
+                println!("YES -- settled.");
+                println!(
+                    "{} signed claim(s) constitute the proof; an order carrying them",
+                    proof.len()
+                );
+                println!("would transition AwaitingPayment -> Paid, and any peer could check it.");
+                let confirmed = state
+                    .claims
+                    .confirmed_value_sats(tip_h, required_confirmations);
+                println!("confirmed value at that depth: {confirmed} sats");
+            }
+            None => {
+                let confirmed = state
+                    .claims
+                    .confirmed_value_sats(tip_h, required_confirmations);
+                println!("NO -- not settled.");
+                println!(
+                    "only {confirmed} sats are confirmed to {required_confirmations}                      confirmations; {want_sats} required."
+                );
+            }
+        }
+    }
     Ok(())
 }
