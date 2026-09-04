@@ -59,7 +59,7 @@ CPUQuota=200%
 Priority alone was not considered sufficient — the memory and CPU ceilings
 bound the worst case rather than merely deprioritising it.
 
-### A TEMPORARY faster profile is currently applied to mainnet — REVERT IT
+### The temporary IBD profile (applied 2026-09-04, REVERTED the same day)
 
 Mainnet's initial block download is running under a deliberately looser
 profile, because the conservative numbers above were throttling it hard: the
@@ -67,7 +67,8 @@ unit sat pinned at its 2 GB `MemoryHigh` with `dbcache=450`, while the host had
 82 GB free and 16 cores at 18% load. `dbcache` dominates IBD — it is the
 in-memory UTXO cache, and at 450 MB the node flushes to disk constantly.
 
-Currently applied to **mainnet only**:
+Applied to **mainnet only**, and **already reverted** — this section is kept as
+the record of what the numbers bought, not as a live instruction:
 
 ```ini
 dbcache=4000          # was 450
@@ -188,3 +189,27 @@ that has **not** been taken, and it needs three things first:
 
 Leaving an open-auth service exposed would let anyone consume the operator's
 disk and CPU. It is a decision for the operator, not a default.
+
+#### What it bought, measured
+
+Worth recording because the first diagnosis was wrong. The unit was pinned at
+its `MemoryHigh` with `dbcache=4000` — the two settings were mutually
+incompatible, and the kernel was throttling the process into continuous direct
+reclaim: **27.8 million `memory.events high` and 4.19 billion `pgscan_direct`**,
+against 1,178 scans for ordinary background reclaim. It was spending its time
+fighting a ceiling rather than verifying blocks.
+
+Raising the ceiling to match the cache took sync from **0.0145 to 0.044
+progress/hour** (about 3x), and the run finished the same evening rather than
+the following day. Anon memory settled at 5.2 GB with the file cache elastic
+above it — so the working set genuinely needed the room, and the earlier 6 GB
+limit was cutting into it rather than into cache.
+
+**The lesson worth keeping:** `dbcache` and `MemoryHigh` have to be set as a
+pair. Raising one without the other is worse than leaving both alone, because a
+cache the process is not allowed to hold turns into reclaim pressure instead of
+throughput.
+
+Reverted 2026-09-04 once `initialblockdownload` went false. Steady-state
+observation sits at about 1.4 GB, well inside the 2 GB `MemoryHigh`, so the
+conservative numbers are the right ones for a box shared with the gateways.
