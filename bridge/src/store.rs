@@ -27,9 +27,13 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// `(script_pubkey, txid, vout)` for an output a reorg has orphaned.
 pub type OrphanedOutput = (Vec<u8>, [u8; 32], u32);
 
-/// `(script_pubkey, txid, vout, value_sats, block_height)` for an output that
-/// is now buried deeply enough to warrant a headers-carrying claim.
-pub type PendingDeepClaim = (Vec<u8>, [u8; 32], u32, u64, u32);
+/// `(script_pubkey, txid, vout, value_sats, block_height, published_depth)`
+/// for a confirmed output that may be due another headers-carrying claim.
+///
+/// `published_depth` is the highest depth already asserted for it, so the
+/// caller can decide which rung of the depth ladder is next — see
+/// `Observer::deep_claims`.
+pub type PendingDeepClaim = (Vec<u8>, [u8; 32], u32, u64, u32, u32);
 
 pub struct Store {
     conn: Connection,
@@ -121,6 +125,14 @@ impl Store {
                 value_sats    INTEGER NOT NULL,
                 block_height  INTEGER,
                 block_hash    BLOB,
+                -- Highest confirmation depth already asserted for this
+                -- output, or 0 for none. NOT a boolean: an application's
+                -- required depth is bounded by what the bridge has actually
+                -- signed (see `OutpointStatus::confirmations_at`), so the
+                -- bridge re-asserts as the payment is buried and this records
+                -- how far it has got. Rows written by an older build hold 1,
+                -- which reads as "rung 1 done" and simply costs one extra
+                -- round of re-assertion after an upgrade.
                 deep_published INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (network, txid, vout)
             );
@@ -404,50 +416,67 @@ impl Store {
         Ok(())
     }
 
-    /// Confirmed outputs that have not yet had a deep (headers-carrying)
-    /// claim published, and are now buried at least `depth` blocks.
+    /// Confirmed outputs whose asserted depth is behind the chain, and by how
+    /// far: every output at least two blocks deep whose `deep_published` has
+    /// not yet reached `max_depth`.
+    ///
+    /// Deliberately generous — it returns candidates, and the caller picks the
+    /// ladder rung. Rungs are a policy question and belong next to the code
+    /// that builds the proof, not in SQL.
     pub fn outputs_needing_deep_claim(
         &self,
         net: BitcoinNetwork,
         tip_height: u32,
-        depth: u32,
+        max_depth: u32,
     ) -> anyhow::Result<Vec<PendingDeepClaim>> {
-        let max_height = tip_height.saturating_sub(depth.saturating_sub(1));
+        // Two deep, because depth 1 is already covered by the first-sight
+        // claim the bridge published when it scanned the block.
+        let max_height = tip_height.saturating_sub(1);
         let mut stmt = self.conn.prepare(
-            "SELECT script_pubkey, txid, vout, value_sats, block_height
+            "SELECT script_pubkey, txid, vout, value_sats, block_height, deep_published
              FROM observed_outputs
-             WHERE network = ?1 AND deep_published = 0
+             WHERE network = ?1 AND deep_published < ?3
                AND block_height IS NOT NULL AND block_height <= ?2",
         )?;
         let rows = stmt
-            .query_map(params![net.as_str(), max_height as i64], |r| {
-                Ok((
-                    r.get::<_, Vec<u8>>(0)?,
-                    r.get::<_, Vec<u8>>(1)?,
-                    r.get::<_, i64>(2)? as u32,
-                    r.get::<_, i64>(3)? as u64,
-                    r.get::<_, i64>(4)? as u32,
-                ))
-            })?
+            .query_map(
+                params![net.as_str(), max_height as i64, max_depth as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, i64>(2)? as u32,
+                        r.get::<_, i64>(3)? as u64,
+                        r.get::<_, i64>(4)? as u32,
+                        r.get::<_, i64>(5)? as u32,
+                    ))
+                },
+            )?
             .filter_map(|row| {
-                row.ok().and_then(|(s, t, v, val, h)| {
-                    <[u8; 32]>::try_from(t).ok().map(|t| (s, t, v, val, h))
+                row.ok().and_then(|(s, t, v, val, h, d)| {
+                    <[u8; 32]>::try_from(t).ok().map(|t| (s, t, v, val, h, d))
                 })
             })
             .collect();
         Ok(rows)
     }
 
+    /// Record the highest depth asserted for an output.
+    ///
+    /// Monotonic within a generation of the chain: `unconfirm_above` resets it
+    /// to 0 when a reorg orphans the block, because nothing is asserted about
+    /// a block that is no longer there.
     pub fn mark_deep_published(
         &self,
         net: BitcoinNetwork,
         txid: &[u8; 32],
         vout: u32,
+        depth: u32,
     ) -> anyhow::Result<()> {
         self.conn.execute(
-            "UPDATE observed_outputs SET deep_published = 1
+            "UPDATE observed_outputs SET deep_published = MAX(deep_published, ?4)
              WHERE network = ?1 AND txid = ?2 AND vout = ?3",
-            params![net.as_str(), txid.to_vec(), vout as i64],
+            params![net.as_str(), txid.to_vec(), vout as i64, depth as i64],
         )?;
         Ok(())
     }
@@ -695,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn deep_claims_are_offered_once_and_only_when_buried_enough() {
+    fn deep_claims_are_offered_as_the_chain_buries_them_and_stop_at_the_ceiling() {
         let s = store();
         let net = BitcoinNetwork::Signet;
         s.record_output(
@@ -708,21 +737,70 @@ mod tests {
         )
         .unwrap();
 
-        // At tip 104 the output is only 5 deep; a depth-6 requirement is unmet.
+        // At tip 100 the output is one deep, which the first-sight claim
+        // already asserts, so there is nothing to re-publish.
         assert!(s
-            .outputs_needing_deep_claim(net, 104, 6)
+            .outputs_needing_deep_claim(net, 100, 6)
             .unwrap()
             .is_empty());
-        // At tip 105 it is 6 deep.
-        assert_eq!(s.outputs_needing_deep_claim(net, 105, 6).unwrap().len(), 1);
 
-        s.mark_deep_published(net, &[1; 32], 0).unwrap();
+        // From two deep it is a candidate, carrying how far it has been
+        // asserted so the caller can pick the next ladder rung.
+        let due = s.outputs_needing_deep_claim(net, 101, 6).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].5, 0, "nothing asserted beyond first sight yet");
+
+        // Asserting rung 2 retires it until the chain passes rung 4.
+        s.mark_deep_published(net, &[1; 32], 0, 2).unwrap();
+        assert_eq!(s.outputs_needing_deep_claim(net, 103, 6).unwrap()[0].5, 2);
+
+        // Once the ceiling is asserted the output drops out for good: nothing
+        // deeper than `deep_confirmations` is ever published.
+        s.mark_deep_published(net, &[1; 32], 0, 6).unwrap();
         assert!(
-            s.outputs_needing_deep_claim(net, 200, 6)
+            s.outputs_needing_deep_claim(net, 10_000, 6)
                 .unwrap()
                 .is_empty(),
-            "a deep claim must not be published twice"
+            "the ceiling must terminate the ladder"
         );
+
+        // And the record only ever moves forward, so a late round cannot
+        // rewind it and re-publish a rung already asserted.
+        s.mark_deep_published(net, &[1; 32], 0, 2).unwrap();
+        assert!(s
+            .outputs_needing_deep_claim(net, 10_000, 6)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_reorg_resets_the_asserted_depth() {
+        // Depth is asserted about a block. When the block is orphaned nothing
+        // is asserted any more, so the ladder must start over rather than
+        // resume from a rung that described a chain that no longer exists.
+        let s = store();
+        let net = BitcoinNetwork::Signet;
+        s.record_output(
+            net,
+            b"spk",
+            &[1; 32],
+            0,
+            1000,
+            Some((100, BlockHash([9; 32]))),
+        )
+        .unwrap();
+        s.mark_deep_published(net, &[1; 32], 0, 4).unwrap();
+        s.unconfirm_above(net, 99).unwrap();
+        s.record_output(
+            net,
+            b"spk",
+            &[1; 32],
+            0,
+            1000,
+            Some((100, BlockHash([7; 32]))),
+        )
+        .unwrap();
+        assert_eq!(s.outputs_needing_deep_claim(net, 110, 6).unwrap()[0].5, 0);
     }
 
     #[test]

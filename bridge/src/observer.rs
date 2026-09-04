@@ -209,14 +209,44 @@ impl Observer {
         Ok(())
     }
 
-    /// Re-publish payments that have now reached the configured depth, this
-    /// time carrying the headers that prove that depth.
+    /// The next depth at which a confirmed payment is worth re-asserting.
     ///
-    /// Without this second claim a reader could only ever see depth 1 from the
-    /// evidence, and would have to take the bridge's word for how deeply the
-    /// payment is buried — exactly the trust we are trying to remove. It fires
-    /// once per output; the claim set is a set, so a duplicate would be
-    /// harmless anyway.
+    /// A claim proves only the depth its own `as_of` asserts, so an
+    /// application requiring `n` confirmations cannot settle until the bridge
+    /// has signed the payment at depth `n` or more — see
+    /// `OutpointStatus::confirmations_at`. One claim at `max` would strand
+    /// every application wanting less than that until `max` arrives, and one
+    /// per block would put `max` claims per output into a byte-budgeted
+    /// contract.
+    ///
+    /// So the rungs double — 2, 4, 8, … — and then `max` itself. That is
+    /// `log2(max)` claims per output, and an application waits at most twice
+    /// the depth it asked for.
+    fn ladder_rung(reached: u32, max: u32) -> u32 {
+        let capped = reached.min(max);
+        if capped >= max {
+            return max;
+        }
+        if capped < 2 {
+            // Depth 0 or 1 is already covered by the first-sight claim, and
+            // `leading_zeros` on 0 would underflow the shift below.
+            return capped;
+        }
+        // Largest power of two at or below `capped`.
+        1u32 << (u32::BITS - 1 - capped.leading_zeros())
+    }
+
+    /// Re-publish payments the chain has buried further than the bridge has so
+    /// far asserted, carrying the headers that exhibit that depth.
+    ///
+    /// Two things depend on this. A reader could otherwise only ever see depth
+    /// 1 from the evidence and would have to take the bridge's word for how
+    /// deeply a payment is buried. And a verifier bounds confirmations by the
+    /// depth the bridge signed, precisely so a submitter cannot pair a stale
+    /// claim with a fresh tip — which means an application's required depth is
+    /// only reachable if the bridge has asserted it. `deep_confirmations` is
+    /// therefore a ceiling on what any application using this bridge can
+    /// prove, not merely a publishing detail.
     pub fn deep_claims(
         &self,
         store: &Store,
@@ -224,10 +254,18 @@ impl Observer {
         tip: &BlockAnchor,
         claims: &mut ClaimsByScript,
     ) -> Result<()> {
-        let depth = self.cfg.deep_confirmations;
-        for (script, txid, vout, value_sats, height) in
-            store.outputs_needing_deep_claim(self.cfg.network, tip.height, depth)?
+        let max_depth = self.cfg.deep_confirmations;
+        for (script, txid, vout, value_sats, height, published) in
+            store.outputs_needing_deep_claim(self.cfg.network, tip.height, max_depth)?
         {
+            let reached = tip.height.saturating_sub(height).saturating_add(1);
+            let rung = Self::ladder_rung(reached, max_depth);
+            // `published` may be 1 from an older build, whose column was a
+            // boolean; treating it as "rung 1 done" costs one extra round of
+            // re-assertion after an upgrade and nothing else.
+            if rung <= published.max(1) {
+                continue;
+            }
             let block_hash = match self.chain.block_hash_at(height) {
                 Ok(h) => h,
                 Err(e) => {
@@ -258,9 +296,15 @@ impl Observer {
             else {
                 continue;
             };
+            // Headers are capped separately: `SpvProof` accepts at most
+            // `MAX_FOLLOWING_HEADERS`, so a rung beyond that carries the
+            // longest run it may and states the rest through `as_of`. Building
+            // a longer run would produce a claim every verifier rejects.
+            let header_depth =
+                rung.min(freenet_bitcoin_common::spv::MAX_FOLLOWING_HEADERS as u32 + 1);
             let Some(spv) = self
                 .chain
-                .build_spv_proof(found, height, depth, tip.height)?
+                .build_spv_proof(found, height, header_depth, tip.height)?
             else {
                 continue;
             };
@@ -282,7 +326,7 @@ impl Observer {
             let signed = SignedClaim::sign(signer.key(), &body)
                 .map_err(|e| anyhow::anyhow!("signing deep observation: {e}"))?;
             claims.entry(script.clone()).or_default().push(signed);
-            store.mark_deep_published(self.cfg.network, &txid, vout)?;
+            store.mark_deep_published(self.cfg.network, &txid, vout, rung)?;
         }
         Ok(())
     }
@@ -322,5 +366,56 @@ impl Observer {
         };
         SignedTipEntry::sign(signer.key(), &body)
             .map_err(|e| anyhow::anyhow!("signing tip entry: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_ladder_doubles_and_then_lands_exactly_on_the_ceiling() {
+        // Rungs for the default ceiling of 6: 2, 4, 6. An application asking
+        // for 3 confirmations settles at 4, one asking for 5 settles at 6.
+        let rungs: Vec<u32> = (1..=10).map(|d| Observer::ladder_rung(d, 6)).collect();
+        assert_eq!(rungs, vec![1, 2, 2, 4, 4, 6, 6, 6, 6, 6]);
+    }
+
+    #[test]
+    fn every_required_depth_up_to_the_ceiling_is_eventually_reachable() {
+        // The property that matters: for any depth an application may ask
+        // for, some rung asserts at least that much. Without it the depth
+        // bound in `OutpointStatus::confirmations_at` would strand orders
+        // that can never be proved.
+        for max in [2u32, 6, 12, 25, 100] {
+            for required in 1..=max {
+                let reached_needed = (1..=max * 2)
+                    .find(|d| Observer::ladder_rung(*d, max) >= required)
+                    .expect("some depth must assert at least `required`");
+                assert!(
+                    reached_needed <= required * 2,
+                    "ceiling {max}: {required} confirmations waited until depth {reached_needed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_ladder_is_monotonic_so_a_rung_is_never_revisited() {
+        for max in [2u32, 6, 25] {
+            let mut last = 0;
+            for d in 1..=(max + 5) {
+                let r = Observer::ladder_rung(d, max);
+                assert!(r >= last, "ceiling {max} went backwards at depth {d}");
+                last = r;
+            }
+        }
+    }
+
+    #[test]
+    fn a_degenerate_ceiling_asks_for_nothing_rather_than_panicking() {
+        assert_eq!(Observer::ladder_rung(0, 0), 0);
+        assert_eq!(Observer::ladder_rung(5, 0), 0);
+        assert_eq!(Observer::ladder_rung(5, 1), 1);
     }
 }

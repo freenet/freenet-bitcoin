@@ -38,8 +38,19 @@ pub struct NetworkConfig {
     pub rpc_cookie_path: Option<PathBuf>,
     pub rpc_user: Option<String>,
     pub rpc_password: Option<String>,
-    /// Confirmation depth at which the bridge re-publishes a payment claim
-    /// carrying enough headers to prove that depth on its own.
+    /// The deepest confirmation any application using this bridge can prove.
+    ///
+    /// A verifier bounds a payment's depth by what the signing bridge asserted
+    /// inside the claim, precisely so a submitter cannot pair a stale claim
+    /// with a fresh chain tip (see `OutpointStatus::confirmations_at`). So the
+    /// bridge re-publishes a confirmed payment as the chain buries it, on a
+    /// doubling ladder up to this value, and an application asking for more
+    /// confirmations than this will wait forever.
+    ///
+    /// 6 is the conventional mainnet figure and the conventional application
+    /// default. Raise it if applications pointed at this bridge ask for more;
+    /// the cost is `log2` extra claims per output, which the address
+    /// contract's byte budget absorbs comfortably.
     #[serde(default = "default_deep_confirmations")]
     pub deep_confirmations: u32,
     /// How far back to walk when looking for a reorg fork point.
