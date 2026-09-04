@@ -21,6 +21,14 @@ particular script and network, a bridge therefore **cannot misreport what a
 real transaction paid, or to whom**. That is defence in depth against a lying
 bridge, not a substitute for trusting it.
 
+**A submitter is a third party, trusted for nothing.** A payment proof is
+verified as a pure function of its own bytes, so the claims it contains are
+whichever ones the submitter chose to include, and no such function can tell a
+complete set from a curated one. That is why confirmation depth is taken from
+inside the winning claim's signature — `as_of.height - anchor.height + 1`, via
+`OutpointStatus::confirmations_at` — rather than from a tip supplied alongside
+it. See "Withholding a retraction" below.
+
 ## Harvest store contract
 
 **Holds (public):** marketplace state, orders, payment requirements, payment
@@ -33,9 +41,10 @@ private keys.
 chain state. Order terms carry the seller's ghostkey signature, and the `Paid`
 transition carries bridge-signed Bitcoin evidence that any peer re-verifies for
 itself. That re-verification checks the evidence is self-consistent and pays
-this order's script; it does not establish that the block is on Bitcoin, and
-the confirmation count is arithmetic over the claim's block height and a
-bridge-signed tip.
+this order's script; it does not establish that the block is on Bitcoin. The
+confirmation count is bounded by what the signing bridge asserted inside the
+claim, so it cannot be inflated by the party who assembled the proof — but it
+is still a bridge assertion, not an independent measurement.
 
 **Cannot do:** invalidate previously-valid state. A reorg produces a forward
 `PaymentReversed` transition, never a retroactive rejection, because state
@@ -81,8 +90,14 @@ transaction, and the broadcast path relays bytes it did not create.
 
 **Trusted for:** availability, and for chain state — which blocks are on
 Bitcoin, what height each is at, and where the tip is. Those assertions are not
-checked against anything, and a payment's confirmation depth is derived from
-two of them.
+checked against anything, and a payment's confirmation depth is one of them:
+the depth a verifier will act on is the one the bridge stamped into the claim
+via `as_of`, capped by the reader's own tip view.
+
+**Consequence for operators:** `deep_confirmations` is the deepest confirmation
+any application using this bridge can prove. The bridge re-asserts a confirmed
+payment on a doubling ladder up to that ceiling; an application asking for more
+confirmations than the ceiling will never see its order settle.
 
 **Not trusted for:** what a real transaction paid, or to whom. The SPV evidence
 fixes the amount and destination out of the bytes the txid commits to, and the
@@ -140,7 +155,7 @@ Keys. They receive an address and an amount and pay it with any wallet.
 | Use the bridge as a signature-verification oracle | Challenge consumed atomically *before* certificate verification |
 | Probe which certificates exist via error messages | Every denial returns an identical generic message |
 | Headers carrying trivially little work | `PowFloor` rejects them — a sanity check only; see below |
-| Withhold a retraction to keep an order looking paid | Partially: the verifier re-runs the same fold, but only over the claims the submitter supplied. Open gap, written up on Harvest's `OnChainPaymentProof` |
+| Withhold a retraction to keep an order looking paid | Depth is capped by the claim's own `as_of`, so a withheld retraction leaves a confirmation worth only the depth the bridge had actually seen. Succeeds only against a reorg at least as deep as the required confirmations — see "Withholding a retraction" |
 | Seller marks their own order paid without payment | Requires bridge-signed evidence any peer re-verifies; a bare seller signature is not accepted |
 | Flood one address contract to exhaust state | `MAX_CLAIMS` cap, pruned deterministically, keeping the most recent evidence |
 | Enumerate who watches what | No registry exists to enumerate |
@@ -150,6 +165,42 @@ chain state that is not Bitcoin's. No check anchors a header to the real chain,
 so the value of `PowFloor` is not a forgery cost — it is chosen so it never
 rejects a genuine block, which puts it well below mainnet's difficulty and
 makes it `NONE` on the test networks. Confirmation depth rests on the same
-trust: it is arithmetic over the claim's asserted block height and a
-bridge-signed tip. Choosing `trusted_bridges` is the control that matters, and
-naming more than one is how an application reduces its exposure.
+trust: it is the difference between two heights the bridge itself asserted.
+Choosing `trusted_bridges` is the control that matters, and naming more than
+one is how an application reduces its exposure.
+
+## Withholding a retraction
+
+A verifier is handed a set of claims and must decide from those bytes alone. It
+cannot fetch the address contract to check for more: a contract's verdict has
+to be a pure function of its own inputs, or two replicas holding identical
+state reach different answers depending on what else has replicated to them.
+
+So a submitter across a reorg can present the bridge's pre-reorg
+`ConfirmedOutput` and drop the `Retracted` that superseded it. Every remaining
+check passes. The signature is genuine, the claim names this script, the block
+is self-consistent, and the fold has nothing left to fold it against.
+
+Omission alone was not what made this a forgery. What finished it was measuring
+depth as `supplied_tip − anchor + 1`: that number grows with the chain, so an
+assertion the bridge made at depth 1 and has since retracted read as
+arbitrarily deep against a current tip.
+
+Depth therefore comes out of the claim. `OutpointStatus::confirmations_at`
+returns the lesser of the reader's own tip view and `as_of.height −
+anchor.height + 1`, both of the latter inside the bridge's signature. A stale
+confirmation is worth stale depth however fresh a tip accompanies it.
+
+**What remains.** To reach depth *d* with a block that was reorged out, the
+bridge must have signed that block as *d* deep before it went — which is a
+reorg at least *d* blocks deep. A recipient waiting *d* confirmations is
+already accepting exactly that risk, so the residual is Bitcoin's own
+assumption rather than a property of this design.
+
+**What this does not do.** It bounds a lying *submitter*, not a lying bridge. A
+holder of a trusted bridge key can stamp any `as_of` it likes, and that trust
+is the headline at the top of this document.
+
+**What it costs.** An application cannot prove more confirmations than its
+bridges have asserted, which is why the bridge re-asserts on a ladder and why
+`deep_confirmations` is a ceiling rather than a publishing detail.

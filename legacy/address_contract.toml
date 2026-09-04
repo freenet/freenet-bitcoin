@@ -35,3 +35,39 @@ version = "A3"
 description = "Superseded by the freenet-stdlib 0.6 -> 0.8.5 bump, taken so freenet-migrate's runtime half could be adopted at all (0.6 and 0.8 cannot co-link)"
 date = "2026-09-03"
 code_hash = "3b5f1df28497b1cfb365798cb86fc87a7e45480d47c79e22f09b9f801e95463f"
+
+# Several generations are recorded here rather than one, because it is not
+# determinable from the repository which of them signet is running.
+#
+# `webapp/contracts/*.wasm` is gitignored build output, and the copy in the
+# working tree hashed to A4 while the committed source built to A5 -- and
+# NEITHER is what that source builds from a clean `target/`, which is A6. A
+# stale target directory changes the contract's identity: `cargo clean -p` of
+# the workspace crates still reuses dependency artifacts, and under fat LTO
+# those yield a different module. So whatever was published came from one of
+# these builds and the repository cannot say which.
+#
+# Listing a generation that was never published costs one wasted probe;
+# omitting one that was orphans its state. Hence all three.
+#
+# PROCEDURE ADDENDUM: build from a clean `target/` before reading a hash. Two
+# fresh clones at different paths agree; a long-lived working tree may not
+# agree with either.
+
+[[entry]]
+version = "A4"
+description = "Embedded in the working tree's webapp bundle and matching the contract-id vector formerly pinned in webapp/src/keys.rs, so plausibly the generation published on signet. Built from a stale target directory; not reproducible from source"
+date = "2026-09-04"
+code_hash = "216631a7b4086e5785e593779361f724945897178b554322e094117d4f515c78"
+
+[[entry]]
+version = "A5"
+description = "What the pre-change source built to in the same stale working tree; likewise not reproducible from a clean target"
+date = "2026-09-04"
+code_hash = "82a9493e93fbe67de6fe109609e7e08300b02aeade5314469bfefbceb2f9ae38"
+
+[[entry]]
+version = "A6"
+description = "The pre-change source built from a CLEAN target -- the reproducible identity of commit 2ee1c35, superseded by the confirmation-depth bound in freenet-bitcoin-common"
+date = "2026-09-04"
+code_hash = "0756e6e263530651eb734fc02db604d7cc5703610cea3b7f9d68ead484f038ba"

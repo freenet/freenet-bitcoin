@@ -19,3 +19,19 @@ version = "T3"
 description = "Superseded by the freenet-stdlib 0.6 -> 0.8.5 bump"
 date = "2026-09-03"
 code_hash = "9439a7c7bafc6b14a5c35256bf07ed77b5645d1b96d4b5977b481fe2ddf086fd"
+
+# T4 and T5 for the same reason A4-A6 are all listed: the working tree's build
+# and a clean build of the same source disagree, because a stale target
+# directory changes the module under fat LTO. See address_contract.toml.
+
+[[entry]]
+version = "T4"
+description = "The tip contract as built in the stale working tree, matching the contract-id vector formerly pinned in webapp/src/keys.rs"
+date = "2026-09-04"
+code_hash = "112952c776099ef97422f138d77ef2bfd95b200f85b459217bf4b518044b32b9"
+
+[[entry]]
+version = "T5"
+description = "The pre-change source built from a CLEAN target. Superseded alongside the address contract by the confirmation-depth bound in freenet-bitcoin-common; the tip contract's own logic is unchanged, but release binaries embed panic locations as file:line so a common/ edit re-keys it too"
+date = "2026-09-04"
+code_hash = "af162dfebf16b195af36379680eee4706b094cf76b2296bc0230352db0625dc6"

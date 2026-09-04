@@ -91,24 +91,40 @@ mod tests {
         BridgeId::from_bs58("4MZnDAQWccEWXBUb1wt4iTEkDi6Z2MCcZ9WQN1umRsVL").unwrap()
     }
 
-    /// Pinned against ids the deployed bridge independently reports. If a
-    /// contract rebuild changes these, the assertion fires here rather than
-    /// showing users an empty address forever.
+    /// Pinned so a re-key is visible here rather than as an address that
+    /// silently reads empty forever.
+    ///
+    /// The vectors are recomputed deliberately when the contracts re-key, and
+    /// the outgoing code hash goes into `legacy/` at the same time so the
+    /// migration walk can still reach the state left behind. They track what
+    /// THIS bundle derives; whether a bridge has published that generation yet
+    /// is a separate question this test cannot see.
+    ///
+    /// Last moved on 2026-09-04 by the confirmation-depth bound in
+    /// `freenet-bitcoin-common`, which re-keyed both contracts.
+    ///
+    /// Recompute these from a **clean** `target/`. A stale one silently
+    /// changes the answer: a `cargo clean -p` of the workspace crates still
+    /// reuses dependency artifacts, and under fat LTO those produce a
+    /// different module. Two fresh clones of this commit at different paths
+    /// agree with each other and disagreed with a long-lived working tree,
+    /// which is how that was found.
     #[test]
-    fn derivation_matches_the_deployed_bridge() {
+    fn derivation_matches_the_embedded_contracts() {
         let tip = tip_contract_id(BitcoinNetwork::Signet, &[bridge()]).unwrap();
         assert_eq!(
             tip.to_string(),
-            "2Vsa7WuAMgkLF8WGkFKryECxemdc5F4hpXs8k9njoFUN",
-            "tip contract id drifted from the deployed contracts; rebuild the \
-             embedded WASM and update this vector deliberately"
+            "ESNzqEXi1MnNeojZRtE7ZJkDyaNninNtcmRriKBtmubt",
+            "tip contract id drifted; rebuild the embedded WASM, record the \
+             outgoing hash in legacy/, and update this vector deliberately"
         );
 
         let script = hex::decode("0014360a3ba02d9603554f7746bf90e7c10d107d2cca").unwrap();
         let addr = address_contract_id(BitcoinNetwork::Signet, &script, &[bridge()]).unwrap();
         assert_eq!(
             addr.to_string(),
-            "BdwHw58qA2YSxnXWdhzUcMoiJDUeamL5mXYh9S4BzhYw"
+            "GXGFupaJwFmE2BvsMXcTsNNDhad6vDPWpLB38Grt3am9",
+            "address contract id drifted; same procedure as above"
         );
     }
 

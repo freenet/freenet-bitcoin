@@ -27,8 +27,26 @@ for f in target/${CONTRACT_TARGET}/release/bitcoin_*_contract.wasm; do
   echo "$(b3sum --no-names "$f")  $(basename "$f")"
 done
 echo
-echo "If either differs from the 'current = true' entry in legacy_contracts.toml,"
-echo "the contracts have re-keyed. Record the outgoing hash there before publishing."
+echo "These are only meaningful from a CLEAN target directory. A 'cargo clean -p'"
+echo "of the workspace crates is NOT enough: dependency artifacts are reused, and"
+echo "under fat LTO they yield a different module and therefore a different"
+echo "contract. Run 'cargo make code-hashes-clean' before recording anything."
+echo
+echo "If either differs from the newest entry in legacy/, the contracts have"
+echo "re-keyed. Record the outgoing hash there before publishing."
+'''
+
+[tasks.code-hashes-clean]
+description = "Contract code hashes from a pristine build -- the only ones worth recording"
+script = '''
+set -e
+D=$(mktemp -d)
+cargo build --target ${CONTRACT_TARGET} -p bitcoin-address-contract \
+  -p bitcoin-tip-contract --features contract --release --target-dir "$D"
+for f in "$D"/${CONTRACT_TARGET}/release/bitcoin_*_contract.wasm; do
+  echo "$(b3sum --no-names "$f")  $(basename "$f")"
+done
+rm -rf "$D"
 '''
 
 [tasks.build-bridge]
