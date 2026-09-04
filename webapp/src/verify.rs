@@ -1,10 +1,15 @@
 //! Turning a claim's evidence into something a person can read.
 //!
-//! This is the module that makes the app worth using instead of a block
-//! explorer. An explorer asks you to trust it. Here, every confirmed payment
-//! arrived with the transaction, a Merkle branch and a run of block headers,
-//! and the browser re-checks all of it. What is shown is the result of that
-//! check — not a restatement of what the bridge asserted.
+//! Every confirmed payment arrives with the transaction, a Merkle branch and a
+//! run of block headers, and the browser re-checks all of it. What is shown is
+//! the result of that check — not a restatement of what the bridge asserted.
+//!
+//! Be careful what that is worth. The check establishes that the evidence is
+//! internally consistent and that the named output really pays this script
+//! this amount, so a bridge cannot misreport what a real transaction paid.
+//! It does **not** establish that the block is on Bitcoin: nothing here
+//! anchors a header to the real chain, so that stays the bridge's word. The
+//! checks below are phrased to claim only what they check.
 
 use freenet_bitcoin_common::spv::{verify_spv_proof, SpvProof};
 use freenet_bitcoin_common::{BitcoinAddressParameters, Claim, ClaimBody, OutPoint, Txid};
@@ -24,8 +29,9 @@ pub struct Verification {
     pub value_sats: u64,
     pub block_height: u32,
     pub checks: Vec<Check>,
-    /// Confirmations the evidence proves ON ITS OWN, from the headers it
-    /// carries — not derived from the chain tip, which is a separate claim.
+    /// Length of the header run the evidence carries, checked for
+    /// self-consistency — not a confirmation count against Bitcoin, since
+    /// nothing places that run on the real chain.
     pub proven_depth: u32,
 }
 
@@ -41,6 +47,9 @@ impl Verification {
 /// the txid is recomputed from the transaction bytes, the script and amount
 /// are read out of the parsed output, and the headers are hashed. A claim that
 /// merely *says* it paid you is not evidence of anything.
+///
+/// What comes back is a self-consistency result. Which blocks are on Bitcoin
+/// is not checked here and cannot be — see the module docs.
 pub fn verify_claim(params: &BitcoinAddressParameters, body: &ClaimBody) -> Option<Verification> {
     let Claim::ConfirmedOutput {
         outpoint,
@@ -86,10 +95,11 @@ pub fn verify_claim(params: &BitcoinAddressParameters, body: &ClaimBody) -> Opti
             },
             Check {
                 ok: true,
-                headline: "That block is real proof-of-work",
+                headline: "Each block header carries the work it claims",
                 detail: format!(
                     "{} block header{} hashed and checked against the difficulty each \
-                     one claims, chained by parent hash.",
+                     one claims, chained by parent hash. This does not show the blocks \
+                     are on Bitcoin \u{2014} that is the bridge's word.",
                     v.depth,
                     if v.depth == 1 { "" } else { "s" }
                 ),

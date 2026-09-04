@@ -79,11 +79,18 @@ how far they have scanned. The bridge deliberately refuses to publish a
 watermark while Bitcoin Core is still in initial block download: during IBD an
 absence of payments means nothing, so the claim would be actively misleading.
 
-## Verifying a payment without trusting the bridge
+## Checking a payment against its own evidence
 
-A bridge signature proves only that a bridge *said* something. That would make
-every reader a client of the bridge's honesty, so confirmed-payment claims
-additionally carry **SPV evidence**, and it is required rather than optional.
+**The bridge is trusted for chain state.** It asserts which blocks are on
+Bitcoin, what height each one is at, and where the tip is, and nothing in this
+system checks any of that independently. A holder of a trusted bridge key can
+assert a payment that never happened. Start from that, because the SPV
+machinery below is defence in depth against a lying bridge and is easy to
+mistake for a replacement for trusting one.
+
+A bridge signature proves only that a bridge *said* something, so
+confirmed-payment claims additionally carry **SPV evidence**, and it is
+required rather than optional.
 
 Any reader checks, from the bytes alone:
 
@@ -91,22 +98,39 @@ Any reader checks, from the bytes alone:
    cannot be chosen independently of the txid;
 2. output *N* really pays this script this many sats;
 3. a Merkle branch folds to the block header's merkle root;
-4. the header hashes below its own difficulty target;
+4. the header hashes below the difficulty target it names, and below the
+   configured `PowFloor`;
 5. each following header chains by `prev_hash` and carries its own work.
 
-This collapses what a bridge is trusted for: from *"trusted to report payments
-truthfully"* down to *"trusted for availability, and for which fork is the best
-chain"* — and the second is bounded by proof-of-work rather than by a signature.
+The claim is separately bound to this contract instance's script and network,
+so it cannot be replayed onto a different destination or a different network.
 
-**What is still trusted, stated plainly:**
+**What that buys.** A bridge cannot misreport what a real transaction paid, or
+to whom: the amount and destination are read out of the bytes the txid commits
+to, not taken from the bridge's word. It is a genuine and useful narrowing —
+the bridge cannot invent an amount, redirect a payment, or point at somebody
+else's transaction.
 
+**What it does not buy, stated plainly:**
+
+- **That the block is on Bitcoin.** Nothing anchors the containing header to
+  the real chain: no checkpoint, no path to genesis, no comparison of
+  accumulated work against anything. Every check above is self-referential — a
+  header is judged only against the difficulty it itself claims. Which blocks
+  are on Bitcoin is the bridge's assertion, and it is the load-bearing one.
+- **Confirmation depth.** The evidence can carry a run of chained headers, but
+  nothing places that run on the real chain. In practice an application derives
+  depth arithmetically from two further bridge assertions: the claim's
+  `anchor.height` and a bridge-signed chain tip. A header does not carry its
+  own height, so `anchor.height` is unverifiable in principle here.
+- **The `PowFloor` is a sanity check, not an economic boundary.** It rejects
+  trivially-fabricated headers, which is worth doing, and that is all. It is
+  chosen so it never rejects a genuine block, which puts it well below
+  mainnet's real difficulty — around four orders of magnitude below — and it is
+  `NONE` on the test networks. It does not bound what forgery costs.
 - **Completeness.** A bridge can *omit* a payment or a reorg. Omission is a
   liveness failure, not a forgery, and it is why an application should be able
   to name more than one bridge.
-- **Chain selection.** Bounded by work: fabricating six valid mainnet headers is
-  not economically reachable. A `PowFloor` parameter rejects headers claiming
-  implausibly easy work, which is otherwise unbounded because a standalone
-  header does not say what the difficulty at its height should have been.
 - **Signet is not mainnet.** Signet's difficulty is trivial and its blocks are
   authorized by the signet challenge key, not by work. A green signet
   demonstration shows the mechanism working; it says nothing about mainnet-grade
@@ -114,15 +138,21 @@ chain"* — and the second is bounded by proof-of-work rather than by a signatur
 
 ## Why a payment is published twice
 
-At first sight, a payment can only be proven to depth 1 — no following blocks
-exist yet. So the bridge publishes a payment **twice**: once when it appears, and
-again once the chain has actually buried it, the second claim carrying the
-headers that prove the depth.
+When a payment is first seen, its evidence can only exhibit a one-block header
+run — no following blocks exist yet. So the bridge publishes a payment
+**twice**: once when it appears, and again once the chain has actually buried
+it, the second claim carrying the headers that show the depth.
 
-Without the second claim, a reader could only ever see depth 1 from the evidence
-and would have to take the bridge's word for how deep the payment is, which is
-exactly the trust being removed. The fold takes the higher `as_of`, so the deeper
-claim wins, and the set semantics make a duplicate harmless anyway.
+Without the second claim, the evidence itself could only ever exhibit a
+one-block run. The fold takes the higher `as_of`, so the deeper claim wins, and
+the set semantics make a duplicate harmless anyway.
+
+This does not make depth trustless. The header run is self-consistent but
+unanchored, and the confirmation count an application acts on is computed from
+the claim's block height and a bridge-signed tip rather than from the run —
+both bridge assertions. What the second claim buys is that the evidence and the
+asserted depth agree, so an inflated depth is at least accompanied by headers
+somebody had to produce.
 
 ## Contract state and summaries
 

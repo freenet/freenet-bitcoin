@@ -271,7 +271,7 @@ fn VerificationBlock(v: Verification) -> Element {
         div { class: if v.all_ok() { "verify verify-ok" } else { "verify verify-bad" },
             div { class: "verify-head",
                 if v.all_ok() {
-                    span { "Verified in your browser" }
+                    span { "Evidence checked in your browser" }
                 } else {
                     span { "This evidence did not check out" }
                 }
@@ -294,10 +294,12 @@ fn Footer() -> Element {
     rsx! {
         footer { class: "foot",
             p {
-                "The bridge is trusted only for availability and for which fork is the best \
-                 chain — bounded by proof-of-work, not by its signature. It cannot invent a \
-                 payment, change an amount, or redirect one, because the transaction commits \
-                 to all three. Anyone can run one."
+                "Every claim carries its transaction and block headers, and this page \
+                 re-checks them, so a bridge cannot change an amount or redirect a payment \
+                 \u{2014} the transaction commits to both. The bridge is still trusted for \
+                 which blocks are on Bitcoin, and for how deep a payment is buried; nothing \
+                 here checks either against the network. Anyone can run one, and an \
+                 application can name more than one."
             }
             p { class: "muted",
                 "Signet is a Bitcoin test network. Its coins have no value and its blocks are \

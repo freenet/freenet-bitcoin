@@ -136,8 +136,10 @@ curl -s http://127.0.0.1:8431/v1/status
 `--verify` is the honest end-to-end check and worth preferring over reading the
 logs. "The PUT returned Ok" only says the local node accepted a write; `--verify`
 fetches the contract back from the network, re-verifies every claim against its
-own Bitcoin evidence, and prints what a third party could independently
-establish.
+own Bitcoin evidence, and prints what a third party reading that contract would
+conclude. It confirms the round trip and the evidence's self-consistency; it
+does not confirm the blocks are on Bitcoin, which stays this bridge's assertion
+(see [trust-boundaries.md](trust-boundaries.md)).
 
 ### Recovery
 
@@ -170,7 +172,7 @@ enabling `txindex`.
 ## Current deployment status
 
 - **Signet: fully working.** Real third-party payments are being observed,
-  published, retrieved and independently verified.
+  published, retrieved and re-checked against their own evidence.
 - **Mainnet: syncing.** Initial block download takes many hours. The bridge
   refuses to publish scan watermarks while a node is in IBD, because during IBD
   an absence of payments means nothing and the claim would be misleading.

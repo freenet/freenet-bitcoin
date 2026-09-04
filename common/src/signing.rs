@@ -113,9 +113,15 @@ impl SignedClaim {
         }
 
         // A valid signature only establishes that the bridge said this. For a
-        // confirmed payment we go further and check the Bitcoin evidence
-        // itself, so that a compromised bridge key cannot mint payments that
-        // never happened.
+        // confirmed payment we also check the Bitcoin evidence, which ties the
+        // claim to a self-consistent transaction and block: the amount and
+        // destination are read out of the bytes the txid commits to, so the
+        // bridge cannot misreport what a real transaction paid or to whom.
+        //
+        // It does NOT make the bridge untrusted. Nothing here anchors the
+        // header to Bitcoin, so which blocks are on the chain -- and therefore
+        // whether the payment happened at all -- remains a bridge assertion.
+        // See `crate::spv` for the boundary in full.
         if let crate::Claim::ConfirmedOutput {
             outpoint,
             value_sats,
@@ -325,10 +331,15 @@ mod tests {
         assert!(wrong.verify(&p).is_err());
     }
 
-    /// The property the whole SPV layer exists for: a bridge whose key is
-    /// TRUSTED and whose signature is VALID still cannot assert a payment that
-    /// did not happen. Everything about the signature checks out here; only
-    /// the Bitcoin evidence does not.
+    /// The property the SPV layer buys: a bridge whose key is TRUSTED and
+    /// whose signature is VALID still cannot misreport what a real transaction
+    /// paid. Everything about the signature checks out here; the amount does
+    /// not match the transaction the txid commits to, so the claim is refused.
+    ///
+    /// Note the scope, which is narrower than the test's name suggests. This
+    /// is not a demonstration that a trusted bridge cannot assert a payment
+    /// that never happened -- nothing checks that the block is on Bitcoin, so
+    /// it can. See `crate::spv`.
     #[test]
     fn a_trusted_bridge_cannot_mint_a_payment_that_never_happened() {
         let k = key(1);

@@ -7,9 +7,15 @@
 //! * a **request service**, where clients ask this operator to synchronize a
 //!   script (subject to whatever authorization policy the operator runs).
 //!
-//! Those are separate on purpose. The observations are public, generic and
-//! self-verifying; who is allowed to ask for them is one operator's business
-//! and never touches the Freenet wire.
+//! Those are separate on purpose. The observations are public and generic, and
+//! carry the evidence a reader needs to check what they say about a
+//! transaction; who is allowed to ask for them is one operator's business and
+//! never touches the Freenet wire.
+//!
+//! An observation is not self-validating, though. A reader who checks the
+//! evidence learns that a real transaction paid that script that amount; which
+//! blocks are on Bitcoin is this bridge's assertion, and readers trust it for
+//! that. See `freenet_bitcoin_common::spv`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -512,11 +518,13 @@ fn parse_address(s: &str, network: BitcoinNetwork) -> Result<Vec<u8>> {
     Ok(addr.script_pubkey().as_bytes().to_vec())
 }
 
-/// Read an address contract back out of Freenet and report what it proves.
+/// Read an address contract back out of Freenet and report what its claims
+/// check out to.
 ///
 /// Deliberately re-verifies every claim from scratch rather than trusting the
-/// bridge's own record, so the output describes what a third party could
-/// independently establish.
+/// bridge's own record, so the output describes what a third party reading the
+/// contract would conclude -- given the same trust in this bridge's chain
+/// state, which the check does not remove.
 async fn verify_address(
     cfg: BridgeConfig,
     network: BitcoinNetwork,

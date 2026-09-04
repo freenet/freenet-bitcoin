@@ -14,6 +14,20 @@
 //! work is a third, entirely separate question that lives in the bridge's own
 //! service-authorization layer and never appears on the wire here.
 //!
+//! # What a bridge is trusted for
+//!
+//! **Chain state.** A bridge asserts which blocks are on Bitcoin, what height
+//! each one is at, and where the tip is, and nothing in this crate checks any
+//! of that against the real network. A holder of a trusted bridge key can
+//! therefore assert a payment that never happened, which is why
+//! `trusted_bridges` is a deliberate, per-instance choice.
+//!
+//! Confirmed-payment claims additionally carry SPV evidence, and it is
+//! load-bearing: it binds a claim to a self-consistent transaction and block,
+//! so a bridge cannot misreport what a real transaction paid or to whom. It is
+//! defence in depth against a lying bridge, not a way to stop trusting one.
+//! [`spv`] sets out exactly which properties survive and which do not.
+//!
 //! # The reorg model, in one paragraph
 //!
 //! Bitcoin's canonical chain is not monotonic — blocks get reorganized — but
@@ -109,19 +123,23 @@ impl BitcoinNetwork {
     /// A conservative minimum proof-of-work for headers on this network.
     ///
     /// A standalone block header does not say what the difficulty at its
-    /// height was supposed to be, so without a floor an attacker could mine a
-    /// run of trivially-easy headers on a laptop and satisfy every other SPV
-    /// check. The floor need only be a LOWER bound, and difficulty rising over
-    /// time makes a fixed floor more conservative rather than less, so this
-    /// does not go stale in the dangerous direction.
+    /// height was supposed to be, so without a floor a run of trivially-easy
+    /// headers mined on a laptop would satisfy every other SPV check. The
+    /// floor need only be a LOWER bound, and difficulty rising over time makes
+    /// a fixed floor more conservative rather than less, so this does not go
+    /// stale in the dangerous direction.
     ///
-    /// `0x1900ffff` is roughly 4e9 times the genesis difficulty: about five
-    /// orders of magnitude below mainnet's real difficulty, so it never
-    /// rejects a genuine block, while putting a forged header chain far beyond
-    /// any casual attacker.
+    /// **It is a sanity check, not an economic security boundary.** The value
+    /// is chosen so it never rejects a genuine block, and that is the whole of
+    /// what it buys. `0x1900ffff` corresponds to roughly 4e9 times the genesis
+    /// difficulty, which is still of order 10^4 BELOW mainnet's recent
+    /// difficulty; do not read it as bounding what a forged header chain
+    /// costs. And clearing the floor says nothing about whether a header is on
+    /// Bitcoin: no checkpoint, genesis path, or accumulated-work comparison
+    /// exists anywhere in this crate. That remains a bridge assertion.
     ///
-    /// The test networks get no floor. Signet's difficulty is trivial by
-    /// design (blocks are authorized by the signet challenge key, not by
+    /// The test networks get no floor at all. Signet's difficulty is trivial
+    /// by design (blocks are authorized by the signet challenge key, not by
     /// work), testnet4 permits minimum-difficulty blocks, and regtest has no
     /// work at all. This is precisely why a signet demo shows the mechanism
     /// working but says nothing about mainnet-grade security.
@@ -310,10 +328,13 @@ pub struct BitcoinAddressParameters {
     /// Minimum proof-of-work a block header must claim.
     ///
     /// A standalone header does not say what the difficulty at its height was
-    /// supposed to be, so without a floor an attacker could mine a chain of
-    /// trivially-easy headers that passes every other SPV check. Set this to a
-    /// value at or below the network's real recent difficulty. `PowFloor::NONE`
-    /// is correct for signet and regtest, where difficulty means nothing.
+    /// supposed to be, so without a floor a chain of trivially-easy headers
+    /// would pass every other SPV check. Set this to a value at or below the
+    /// network's real recent difficulty. `PowFloor::NONE` is correct for
+    /// signet and regtest, where difficulty means nothing.
+    ///
+    /// A sanity check, not an economic bound: clearing the floor does not
+    /// place a header on Bitcoin. See [`PowFloor`] and the [`spv`] module.
     #[serde(default = "default_pow_floor")]
     pub pow_floor: PowFloor,
 }

@@ -171,10 +171,13 @@ impl Observer {
                 Some((block.anchor.height, block.anchor.hash)),
             )?;
 
-            // A first-sight claim proves inclusion at depth 1. A deeper claim
-            // carrying following headers is published later, once the chain
-            // has actually buried it -- see `deep_claims`. Publishing both is
-            // what lets a reader establish depth without trusting us for it.
+            // A first-sight claim carries a one-block header run. A deeper
+            // claim carrying following headers is published later, once the
+            // chain has actually buried it -- see `deep_claims`. Publishing
+            // both makes the evidence exhibit the depth being asserted; it
+            // does not make depth trustless, since nothing anchors the run to
+            // Bitcoin and readers derive confirmations from our asserted
+            // block height and tip anyway.
             let spv = freenet_bitcoin_common::spv::SpvProof {
                 raw_tx: found.raw_tx.clone(),
                 merkle_branch: found.merkle_branch.clone(),

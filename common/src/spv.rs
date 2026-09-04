@@ -1,50 +1,70 @@
-//! Verifying a Bitcoin payment from the transaction itself, without trusting
-//! the bridge that reported it.
+//! Checking a claimed Bitcoin payment against the transaction and block it
+//! names.
 //!
-//! # What the bridge signature alone would prove
+//! # The trust boundary, first
 //!
-//! Only that a particular bridge asserted something. That makes every reader a
-//! client of the bridge's honesty, which is a poor foundation for a
-//! marketplace: a compromised bridge key could mint payments that never
-//! happened.
+//! **The bridge is trusted for chain state.** It asserts which blocks are on
+//! Bitcoin, what height each one is at, and where the tip is. Nothing in this
+//! module — or anywhere else in this crate — checks any of that against the
+//! real Bitcoin network, so a holder of a trusted bridge key can assert a
+//! payment that never happened. Read what follows as defence in depth against
+//! a lying bridge, not as a substitute for trusting one.
 //!
-//! Most of the claim is checkable from first principles, so this module checks
-//! it. Given the raw transaction, a Merkle branch and a run of block headers,
-//! a verifier confirms:
+//! # What this module does establish
 //!
-//! 1. **The txid is what it claims.** A txid *is* `SHA256d` of the transaction
-//!    (witness data stripped), so it cannot be chosen independently of the
-//!    transaction's contents.
-//! 2. **The output really pays this script this much.** Read straight out of
-//!    the parsed transaction.
-//! 3. **The transaction is in the block.** Fold the txid up the Merkle branch
-//!    and compare with the header's merkle root.
-//! 4. **The block is real work.** Hash the 80-byte header and check it against
-//!    the target encoded in its own `nBits`.
-//! 5. **It is buried this deep.** Each following header must chain by
+//! Given the raw transaction, a Merkle branch and a run of block headers, a
+//! verifier confirms, from the supplied bytes alone:
+//!
+//! 1. **The txid is not a free parameter.** A txid *is* `SHA256d` of the
+//!    transaction (witness data stripped), so it cannot be chosen
+//!    independently of the transaction's contents.
+//! 2. **The named output really pays this script this much.** Read straight
+//!    out of the parsed transaction.
+//! 3. **The transaction is committed to by that header.** Fold the txid up
+//!    the Merkle branch and compare with the header's merkle root.
+//! 4. **Each header meets the target it names.** Hash the 80-byte header and
+//!    check it against the target encoded in its own `nBits`, and against the
+//!    configured [`PowFloor`].
+//! 5. **The following headers chain.** Each must build on its predecessor by
 //!    `prev_hash` and meet its own target.
 //!
-//! # What is still trusted, stated plainly
+//! Callers pass the script and network they expect (they are folded into the
+//! claim's `ScriptId`, which the contract checks separately), so a proof
+//! cannot be replayed onto a different destination or a different network.
 //!
-//! * **Which fork is the best chain.** Proof-of-work bounds this rather than
-//!   eliminating it: on mainnet, fabricating even one valid header at current
-//!   difficulty is wildly uneconomic, and six is out of reach. On **signet**
-//!   the difficulty is trivial and blocks are authorized by the signet
-//!   challenge key, so signet SPV is a structural demonstration, not a
-//!   security guarantee. Do not read a green signet demo as proof of mainnet
-//!   security.
-//! * **`nBits` being the *correct* difficulty** for that height. Verifying
+//! Together that means a bridge **cannot misreport what a real transaction
+//! paid, or to whom**: the amount and destination are read out of the bytes
+//! the txid commits to, not taken from the bridge's word for them. That is
+//! the property the SPV layer buys, and it is worth having.
+//!
+//! # What this module does NOT establish
+//!
+//! * **That the block is on Bitcoin at all.** Nothing anchors the containing
+//!   header to the real chain: there is no checkpoint, no path to genesis, and
+//!   no comparison of accumulated work against anything. Every check here is
+//!   self-referential — a header is judged only against the difficulty it
+//!   itself claims, and [`PowFloor`] is a sanity floor rather than a link to
+//!   the real chain. Which blocks are on Bitcoin is a bridge assertion.
+//! * **Confirmation depth.** [`SpvVerified::depth`] reports how many chained
+//!   headers the evidence carried, but it says nothing about where that run
+//!   sits, and callers in this workspace do not gate on it: depth is computed
+//!   as arithmetic over two further bridge assertions — the claim's
+//!   `anchor.height` and a signed chain tip's height. A block header does not
+//!   carry its own height, so `anchor.height` is unverifiable here in
+//!   principle, not merely unverified.
+//! * **`nBits` being the *correct* difficulty for that height.** Verifying
 //!   that needs the retarget history, which a contract cannot afford to hold.
-//!   Instead, parameters carry a `min_pow_bits` floor and a header claiming
-//!   easier work than the floor is rejected — see [`PowFloor`]. That bounds
-//!   the "low-difficulty fork" attack without a full header chain.
+//!   [`PowFloor`] rejects headers claiming easier work than a fixed floor,
+//!   which throws out trivially-fabricated headers; it does not establish
+//!   what the difficulty at that height was supposed to be.
 //! * **Completeness.** Nothing here stops a bridge *omitting* a payment or a
 //!   reorg. Omission is a liveness failure, not a forgery, and it is why an
 //!   application should be able to point at more than one bridge.
 //!
-//! So the bridge is trusted for availability and chain selection; it is *not*
-//! trusted to be truthful about whether a given transaction exists, what it
-//! paid, or how deeply it is buried.
+//! On **signet** the floor is `PowFloor::NONE` by design — difficulty is
+//! trivial and blocks are authorized by the signet challenge key rather than
+//! by work — so a green signet demonstration shows the mechanism working and
+//! says nothing about mainnet-grade security.
 
 use serde::{Deserialize, Serialize};
 
@@ -120,9 +140,17 @@ impl<'de> serde::Deserialize<'de> for BlockHeader {
 /// A minimum-work floor, as a compact `nBits` value.
 ///
 /// A header whose target is *easier* than this is rejected. Without such a
-/// floor an attacker could mine a chain of trivially-easy headers and satisfy
+/// floor, a chain of trivially-easy headers mined on a laptop would satisfy
 /// every other check, because nothing in a standalone header says what the
 /// difficulty at that height was supposed to be.
+///
+/// This is a **sanity check, not an economic security boundary**. It throws
+/// out obviously-fabricated headers and nothing more: it does not anchor a
+/// header to Bitcoin, and it does not bound the cost of forging one against
+/// the real network — the practical floors are several orders of magnitude
+/// below mainnet's difficulty, and [`PowFloor::NONE`] on the test networks.
+/// Which blocks are on Bitcoin remains a bridge assertion; see the module
+/// docs.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PowFloor(pub u32);
 
@@ -132,8 +160,12 @@ impl PowFloor {
     pub const NONE: PowFloor = PowFloor(0x207fffff);
 }
 
-/// Self-contained evidence that a transaction paying a script is buried in the
-/// chain, checkable without trusting whoever supplied it.
+/// Evidence tying a claimed payment to a self-consistent transaction and
+/// block: the transaction bytes, the Merkle branch committing them to a
+/// header, and the headers built on top of it.
+///
+/// Self-consistency is checkable without trusting whoever supplied it. Whether
+/// the block is on Bitcoin is not — see the module docs.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct SpvProof {
     /// The transaction, serialized **without** witness data.
@@ -454,13 +486,22 @@ pub fn merkle_root_from_branch(
     Ok(acc)
 }
 
-/// What a verified SPV proof establishes.
+/// What a verified SPV proof establishes: this transaction, paying this much,
+/// is committed to by this header, and this many headers chain onto it.
+///
+/// It does not establish that any of those blocks are on Bitcoin.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SpvVerified {
     pub txid: Txid,
     pub block_hash: BlockHash,
     pub value_sats: u64,
-    /// Confirmations proven by the headers supplied: 1 + following headers.
+    /// Length of the self-consistent header run the evidence carried:
+    /// 1 + following headers.
+    ///
+    /// Not a confirmation count against Bitcoin. Nothing places this run on
+    /// the real chain, and no caller in this workspace gates on it — an
+    /// application's confirmation depth comes from the claim's `anchor.height`
+    /// and a bridge-signed tip, both of which are bridge assertions.
     pub depth: u32,
 }
 
@@ -470,6 +511,10 @@ pub struct SpvVerified {
 /// network, a clock, or a bridge. `expected_*` come from the claim being
 /// checked, so a proof for some other transaction, output, script or amount is
 /// rejected rather than silently accepted.
+///
+/// Because nothing here consults the network, an `Ok` says the evidence is
+/// internally consistent — not that these blocks are on Bitcoin. That
+/// remains something the supplying bridge is trusted for.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_spv_proof(
     proof: &SpvProof,

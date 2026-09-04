@@ -1,8 +1,9 @@
 # freenet-bitcoin
 
 Bitcoin blockchain state, exposed to Freenet applications through generic
-contracts, with a bridge that observes the chain and publishes signed —
-and **independently verifiable** — observations.
+contracts, with a bridge that observes the chain and publishes signed
+observations, each carrying the transaction and block evidence behind it so
+readers can check what it says against those bytes.
 
 Nothing here is specific to any application, to Freenet.org, or to Ghost Keys.
 
@@ -29,13 +30,23 @@ with the asserting bridge's chain height, and a reorg adds a *newer* assertion
 rather than rewriting an old one. Status is derived by folding, highest height
 wins.
 
-**You do not have to trust the bridge.** A signature only proves a bridge *said*
-something. Every confirmed-payment claim also carries SPV evidence — the raw
-transaction, a Merkle branch, and block headers — so any reader confirms from
-the bytes that the txid commits to that amount and that destination, that the
-transaction is in that block, and that the block carries real proof-of-work.
-A bridge is left trusted for availability and for chain selection, and the
-second is bounded by work rather than by its signature.
+**The evidence travels with the claim, and it narrows what the bridge can lie
+about.** A signature only proves a bridge *said* something, so every
+confirmed-payment claim also carries SPV evidence — the raw transaction, a
+Merkle branch, and block headers. Any reader confirms from those bytes that
+the txid commits to that amount and that destination, that the transaction is
+committed to by that header, and that each header meets the target it names.
+So a bridge cannot misreport what a real transaction paid, or to whom.
+
+**The bridge is still trusted, and for the thing that matters most.** Nothing
+here anchors a header to Bitcoin — there is no checkpoint, no path to genesis,
+no accumulated-work comparison — so *which blocks are on the chain* is the
+bridge's word, and so is confirmation depth, which applications compute from
+the claim's block height and a bridge-signed tip. A holder of a trusted bridge
+key can assert a payment that never happened. The SPV layer is defence in
+depth against a lying bridge, not a way to stop trusting one; choose
+`trusted_bridges` accordingly. [docs/trust-boundaries.md](docs/trust-boundaries.md)
+states the boundary in full.
 
 ## Privacy
 
@@ -85,7 +96,7 @@ cargo build --release -p bitcoin-freenet-bridge
 ## Status
 
 A prototype with a working vertical slice. Real third-party signet payments are
-observed, published to Freenet, retrieved, and independently verified. See
-[docs/deployment.md](docs/deployment.md) for what is deployed and what is
+observed, published to Freenet, retrieved, and re-checked against their own
+evidence. See [docs/deployment.md](docs/deployment.md) for what is deployed and what is
 deliberately not (the bridge is loopback-only and must not be exposed without
 switching on Ghost Key authorization and rate limiting first).
