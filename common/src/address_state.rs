@@ -209,30 +209,21 @@ impl ClaimSetV1 {
 
     /// Current status of every outpoint the bridges have told us about.
     pub fn outpoint_statuses(&self) -> BTreeMap<OutPoint, OutpointStatus> {
-        let mut by_outpoint: BTreeMap<OutPoint, Vec<ClaimBody>> = BTreeMap::new();
-        for body in self.claim_bodies() {
-            if let Some(op) = body.claim.outpoint() {
-                by_outpoint.entry(op).or_default().push(body);
-            }
-        }
-        by_outpoint
-            .into_iter()
-            .filter_map(|(op, bodies)| crate::fold_outpoint_status(bodies.iter()).map(|s| (op, s)))
-            .collect()
+        let bodies: Vec<ClaimBody> = self.claim_bodies().collect();
+        crate::fold_claims_by_outpoint(bodies.iter())
     }
 
     /// Total value confirmed to this script at or below `tip_height`, counting
     /// only outputs with at least `min_confirmations`.
+    ///
+    /// Depth is [`OutpointStatus::confirmations_at`], not raw tip arithmetic,
+    /// so this agrees with what a verifier handed the same claims will
+    /// conclude. Producing evidence a verifier would then reject is how the
+    /// two halves of a payment check drift apart.
     pub fn confirmed_value_sats(&self, tip_height: u32, min_confirmations: u32) -> u64 {
         self.outpoint_statuses()
             .values()
-            .filter_map(|s| match s {
-                OutpointStatus::Confirmed { value_sats, anchor } => {
-                    (crate::confirmations(anchor, tip_height) >= min_confirmations)
-                        .then_some(*value_sats)
-                }
-                _ => None,
-            })
+            .filter_map(|s| s.confirmed_value_at(tip_height, min_confirmations))
             .sum()
     }
 
@@ -242,9 +233,8 @@ impl ClaimSetV1 {
             .values()
             .filter_map(|s| match s {
                 OutpointStatus::Unconfirmed { value_sats } => Some(*value_sats),
-                OutpointStatus::Confirmed { value_sats, anchor } => {
-                    (crate::confirmations(anchor, tip_height) < min_confirmations)
-                        .then_some(*value_sats)
+                OutpointStatus::Confirmed { value_sats, .. } => {
+                    (s.confirmations_at(tip_height) < min_confirmations).then_some(*value_sats)
                 }
                 OutpointStatus::Retracted => None,
             })
@@ -268,13 +258,9 @@ impl ClaimSetV1 {
         let statuses = self.outpoint_statuses();
         let mut qualifying: Vec<(OutPoint, u64)> = statuses
             .iter()
-            .filter_map(|(op, s)| match s {
-                OutpointStatus::Confirmed { value_sats, anchor }
-                    if crate::confirmations(anchor, tip_height) >= min_confirmations =>
-                {
-                    Some((*op, *value_sats))
-                }
-                _ => None,
+            .filter_map(|(op, s)| {
+                s.confirmed_value_at(tip_height, min_confirmations)
+                    .map(|v| (*op, v))
             })
             .collect();
         // Deterministic order so two readers build the same proof.
@@ -762,15 +748,57 @@ mod tests {
     #[test]
     fn payment_evidence_requires_enough_value_and_depth() {
         let p = params();
+        // The bridge's first-sight claim: found at 100, asserted with its tip
+        // at 100, so it attests exactly one confirmation.
         let s =
             BitcoinAddressStateV1::from_claims(&p, [confirmed(&p, 1, 50_000, 100, 100)]).unwrap();
 
+        assert!(s.claims.payment_evidence(50_000, 100, 1).is_some());
         // Only 1 confirmation at tip 100, so a 2-deep requirement is unmet.
         assert!(s.claims.payment_evidence(50_000, 100, 2).is_none());
-        // At tip 101 it is 2 deep.
-        assert!(s.claims.payment_evidence(50_000, 101, 2).is_some());
+        // And it STAYS unmet however far the tip advances. Depth is what the
+        // bridge asserted inside the signature, not what the chain has done
+        // since; letting the tip alone supply it is what made a retracted
+        // claim provable by omitting the retraction. The bridge republishes
+        // once the payment is genuinely buried -- see `deep_claims` -- and
+        // that republished claim is what carries real depth.
+        assert!(s.claims.payment_evidence(50_000, 101, 2).is_none());
+        assert!(s.claims.payment_evidence(50_000, 1_000_000, 2).is_none());
+        assert_eq!(s.claims.confirmed_value_sats(1_000_000, 2), 0);
+
+        // The bridge's deep re-publication of the same payment: same block,
+        // asserted later with its tip at 105.
+        let deep =
+            BitcoinAddressStateV1::from_claims(&p, [confirmed(&p, 1, 50_000, 100, 105)]).unwrap();
+        assert!(deep.claims.payment_evidence(50_000, 105, 2).is_some());
+        assert!(deep.claims.payment_evidence(50_000, 105, 6).is_some());
+        // A reader whose own tip view lags is still bounded by what it sees.
+        assert!(deep.claims.payment_evidence(50_000, 101, 6).is_none());
         // Not enough value.
-        assert!(s.claims.payment_evidence(50_001, 101, 2).is_none());
+        assert!(deep.claims.payment_evidence(50_001, 105, 2).is_none());
+    }
+
+    /// The producer half of the omission fix: `payment_evidence` must not hand
+    /// back a proof that a verifier applying the same bound would reject. If
+    /// the two halves disagree, honest clients build proofs that bounce.
+    #[test]
+    fn evidence_is_only_offered_at_a_depth_a_verifier_will_accept() {
+        let p = params();
+        let s =
+            BitcoinAddressStateV1::from_claims(&p, [confirmed(&p, 1, 50_000, 100, 103)]).unwrap();
+
+        for min_conf in 1..=8u32 {
+            let offered = s.claims.payment_evidence(50_000, 200, min_conf).is_some();
+            // What a verifier handed exactly those claims would conclude.
+            let statuses = s.claims.outpoint_statuses();
+            let accepted = statuses
+                .values()
+                .any(|st| st.confirmed_value_at(200, min_conf) == Some(50_000));
+            assert_eq!(
+                offered, accepted,
+                "producer and verifier disagree at {min_conf} confirmations"
+            );
+        }
     }
 
     #[test]

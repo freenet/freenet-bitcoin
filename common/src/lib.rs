@@ -42,6 +42,24 @@
 //! is trivially associative, commutative and idempotent, and the fold is a
 //! deterministic pure function of the set, so every replica computes the same
 //! answer from the same bytes. See [`fold_outpoint_status`].
+//!
+//! # Why depth comes from the claim, not from the tip
+//!
+//! The fold is a pure function of the claims it is *handed*, and on a
+//! verification path those are the claims a submitter chose to hand over. A
+//! submitter holding a pre-reorg confirmation and the retraction that
+//! superseded it can present the first and drop the second; nothing in a pure
+//! function can tell a complete set from a curated one.
+//!
+//! What turned that omission into a forgery was measuring confirmation depth
+//! as `supplied_tip - anchor + 1`. That number grows with the chain, so a
+//! retracted assertion the bridge made at depth 1 read as arbitrarily deep
+//! against a current tip. So depth is now bounded by what the signing bridge
+//! itself asserted — `as_of.height - anchor.height + 1`, both fields inside
+//! the signature — via [`OutpointStatus::confirmations_at`]. A stale
+//! confirmation is worth stale depth, and reaching depth `d` with a block that
+//! was reorged out requires a reorg at least `d` deep, which is the risk a
+//! recipient waiting `d` confirmations already accepts.
 
 #![deny(unsafe_code)]
 
@@ -484,14 +502,98 @@ pub const TIP_RETAIN: usize = 64;
 pub enum OutpointStatus {
     /// Seen in the mempool only.
     Unconfirmed { value_sats: u64 },
-    /// Included in a block. `confirmations` is derived against a chain tip the
-    /// caller supplies; it is not stored anywhere.
+    /// Included in a block, as of the winning claim's own chain position.
     Confirmed {
         value_sats: u64,
         anchor: BlockAnchor,
+        /// How deeply the **bridge itself** said this block was buried, taken
+        /// from inside the signature: `as_of.height - anchor.height + 1` on the
+        /// claim that won the fold.
+        ///
+        /// This is the number a verifier must gate on. See
+        /// [`OutpointStatus::confirmations_at`] for why a tip-derived count
+        /// alone is forgeable by omission.
+        attested_depth: u32,
     },
     /// The most recent assertion says this outpoint is no longer on the chain.
     Retracted,
+}
+
+impl OutpointStatus {
+    /// Confirmations a verifier may **act on**, against a chain tip it holds.
+    ///
+    /// The lesser of two bounds, and it needs both:
+    ///
+    /// * [`confirmations`] against `tip_height` — falls to zero while the
+    ///   reader's own tip view is behind the block, so a reader cannot count a
+    ///   block it has not caught up to;
+    /// * `attested_depth` — how deeply the signing bridge said the block was
+    ///   buried *at the moment it signed*, which no submitter can inflate
+    ///   without the bridge's key.
+    ///
+    /// # Why the second bound exists
+    ///
+    /// The claim set handed to a verifier is chosen by whoever submits it, and
+    /// a pure verification function cannot tell a complete set from a curated
+    /// one. Across a reorg a submitter can present the bridge's pre-reorg
+    /// `ConfirmedOutput` and silently drop the [`Claim::Retracted`] that
+    /// superseded it: every remaining check passes, because the confirmation
+    /// really is signed, really is about this script, and really does name a
+    /// self-consistent block.
+    ///
+    /// What made that a *forgery* rather than a stale reading was pairing it
+    /// with a **fresh** tip. Depth computed as `tip - anchor + 1` grows with
+    /// the chain, so an assertion the bridge made at depth 1 and has since
+    /// retracted reads as arbitrarily deep simply by supplying a current tip.
+    /// Capping at `attested_depth` severs that: the stale confirmation carries
+    /// a stale `as_of`, so it can never be worth more confirmations than the
+    /// bridge had actually seen when it signed.
+    ///
+    /// The residual is then exactly Bitcoin's own assumption. To reach depth
+    /// `d` with an orphaned block, the bridge must have signed that block as
+    /// `d` deep before it was reorged out — that is, a reorg at least `d`
+    /// blocks deep. A recipient waiting `d` confirmations is already accepting
+    /// that risk.
+    ///
+    /// This bounds a lying **submitter**, not a lying bridge. A bridge holding
+    /// a trusted key can still stamp any `as_of` it likes; that trust is
+    /// deliberate and is set out in the crate docs and `docs/trust-boundaries.md`.
+    pub fn confirmations_at(&self, tip_height: u32) -> u32 {
+        match self {
+            OutpointStatus::Confirmed {
+                anchor,
+                attested_depth,
+                ..
+            } => confirmations(anchor, tip_height).min(*attested_depth),
+            OutpointStatus::Unconfirmed { .. } | OutpointStatus::Retracted => 0,
+        }
+    }
+
+    /// Value if this outpoint is confirmed to at least `min_confirmations`,
+    /// measured by [`OutpointStatus::confirmations_at`].
+    pub fn confirmed_value_at(&self, tip_height: u32, min_confirmations: u32) -> Option<u64> {
+        match self {
+            OutpointStatus::Confirmed { value_sats, .. }
+                if self.confirmations_at(tip_height) >= min_confirmations =>
+            {
+                Some(*value_sats)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Depth a claim asserts on its own: how far its `as_of` sits above `anchor`.
+///
+/// Both fields are inside the bridge's signature, so this is not something a
+/// submitter can choose. Zero when `as_of` is below `anchor`, which is a
+/// malformed assertion (a bridge claiming a block above its own tip) and is
+/// treated as proving nothing rather than as a small positive depth.
+pub fn attested_depth(anchor: &BlockAnchor, as_of: &BlockAnchor) -> u32 {
+    if as_of.height < anchor.height {
+        return 0;
+    }
+    as_of.height - anchor.height + 1
 }
 
 /// Fold every claim about one outpoint into a single current status.
@@ -504,6 +606,12 @@ pub enum OutpointStatus {
 /// `claims` may be supplied in any order and may contain duplicates; both are
 /// harmless, which is the property that lets the underlying state be a
 /// grow-only set merged by union.
+///
+/// It is a pure function of the claims it is *given*, which is not the same as
+/// a function of the claims that exist. Anything acting on the result must
+/// measure depth with [`OutpointStatus::confirmations_at`], never with
+/// [`confirmations`] against a separately-supplied tip — that is the whole of
+/// what stops a submitter proving a payment by omitting its retraction.
 pub fn fold_outpoint_status<'a, I>(claims: I) -> Option<OutpointStatus>
 where
     I: IntoIterator<Item = &'a ClaimBody>,
@@ -538,16 +646,53 @@ where
         } => OutpointStatus::Confirmed {
             value_sats: *value_sats,
             anchor: *anchor,
+            attested_depth: attested_depth(anchor, &c.as_of),
         },
         Claim::Retracted { .. } => OutpointStatus::Retracted,
         Claim::ScannedTo => unreachable!("ScannedTo filtered above"),
     })
 }
 
+/// Group a pile of claims by outpoint and fold each group.
+///
+/// The same grouping every consumer needs, in one place so the fold and the
+/// depth bound cannot drift apart between them.
+pub fn fold_claims_by_outpoint<'a, I>(
+    claims: I,
+) -> std::collections::BTreeMap<OutPoint, OutpointStatus>
+where
+    I: IntoIterator<Item = &'a ClaimBody>,
+{
+    let mut by_outpoint: std::collections::BTreeMap<OutPoint, Vec<&ClaimBody>> =
+        std::collections::BTreeMap::new();
+    for body in claims {
+        if let Some(op) = body.claim.outpoint() {
+            by_outpoint.entry(op).or_default().push(body);
+        }
+    }
+    by_outpoint
+        .into_iter()
+        .filter_map(|(op, bodies)| fold_outpoint_status(bodies).map(|s| (op, s)))
+        .collect()
+}
+
 /// Confirmations for a confirmed anchor against a chain tip.
 ///
 /// Returns 0 if the tip is behind the anchor, which happens legitimately while
 /// a reader's tip view is stale.
+///
+/// # This is an upper bound, not a gate
+///
+/// `tip_height` comes from wherever the caller got it, and on a verification
+/// path that is *whatever the submitter supplied*. Pairing a current tip with
+/// a claim the bridge has since retracted is the omission forgery described on
+/// [`OutpointStatus::confirmations_at`], and this function cannot see it — it
+/// is handed one anchor and one number and has nothing to compare them
+/// against.
+///
+/// Use it to **display** a confirmation count. To decide whether a payment is
+/// deep enough to act on, use [`OutpointStatus::confirmations_at`], which caps
+/// this by what the bridge actually attested.
 pub fn confirmations(anchor: &BlockAnchor, tip_height: u32) -> u32 {
     if tip_height < anchor.height {
         // Our chain view does not reach this block yet, so we have not
@@ -677,7 +822,10 @@ mod tests {
             fold_outpoint_status([&confirmed, &retracted, &reconfirmed]),
             Some(OutpointStatus::Confirmed {
                 value_sats: 50_000,
-                anchor: anchor(101, 2)
+                anchor: anchor(101, 2),
+                // as_of 102 over an anchor at 101: the bridge saw it one block
+                // deep when it re-confirmed.
+                attested_depth: 2,
             })
         );
     }
@@ -704,6 +852,114 @@ mod tests {
             fold_outpoint_status([&low, &high]),
             fold_outpoint_status([&high, &low])
         );
+    }
+
+    /// The forgery this bound exists to stop.
+    ///
+    /// A submitter holds the bridge's pre-reorg confirmation AND the retraction
+    /// that superseded it. Presenting both reaches the honest verdict. Omitting
+    /// the retraction leaves a claim set every other check passes -- the
+    /// signature is genuine, the script matches, the block is self-consistent
+    /// -- and there is nothing left to fold it against.
+    ///
+    /// What used to finish the job was pairing that stale claim with a CURRENT
+    /// tip, because `tip - anchor + 1` grows with the chain. Capping by the
+    /// depth the bridge attested inside its own signature severs that link.
+    #[test]
+    fn omitting_a_newer_retraction_cannot_buy_confirmations() {
+        // The bridge saw the payment the moment it was mined: as_of == anchor,
+        // so it attested exactly one confirmation.
+        let confirmed = claim(
+            100,
+            Claim::ConfirmedOutput {
+                outpoint: op(),
+                value_sats: 50_000,
+                anchor: anchor(100, 1),
+                spv: any_spv(),
+            },
+        );
+        // Five blocks later a reorg took that block out and the bridge said so.
+        let retracted = claim(105, Claim::Retracted { outpoint: op() });
+
+        // Honest submission: the payment is gone, at any tip.
+        assert_eq!(
+            fold_outpoint_status([&confirmed, &retracted]),
+            Some(OutpointStatus::Retracted)
+        );
+
+        // Curated submission: the retraction is simply not sent.
+        let curated = fold_outpoint_status([&confirmed]).expect("still folds");
+
+        // Tip arithmetic alone -- what a verifier used to do -- reads a
+        // long-dead payment as ten blocks deep, purely because the chain moved
+        // on. This assertion is the ATTACK, kept so the gap stays visible.
+        assert_eq!(confirmations(&anchor(100, 1), 109), 10);
+
+        // The bound a verifier must actually gate on says one, however fresh a
+        // tip is supplied. An order wanting two confirmations is not paid.
+        assert_eq!(curated.confirmations_at(109), 1);
+        assert_eq!(curated.confirmations_at(1_000_000), 1);
+        assert_eq!(curated.confirmed_value_at(109, 2), None);
+        // ... and one confirmation is still one confirmation, so a zero- or
+        // one-deep requirement is unaffected. The bound tells the truth; it
+        // does not simply refuse.
+        assert_eq!(curated.confirmed_value_at(109, 1), Some(50_000));
+    }
+
+    /// The honest path the bound must not break: once the bridge has published
+    /// a claim asserting real depth, that depth is available.
+    #[test]
+    fn a_bridge_attested_deep_claim_still_confirms() {
+        // Same payment, re-published by the bridge once six blocks buried.
+        let deep = claim(
+            105,
+            Claim::ConfirmedOutput {
+                outpoint: op(),
+                value_sats: 50_000,
+                anchor: anchor(100, 1),
+                spv: any_spv(),
+            },
+        );
+        let st = fold_outpoint_status([&deep]).unwrap();
+        assert_eq!(st.confirmations_at(105), 6);
+        assert_eq!(st.confirmed_value_at(105, 6), Some(50_000));
+        // A reader whose own tip view lags still counts only what it can see.
+        assert_eq!(st.confirmations_at(102), 3);
+        assert_eq!(st.confirmed_value_at(102, 6), None);
+    }
+
+    /// A bridge asserting a block above its own tip proves nothing, rather
+    /// than proving a little.
+    #[test]
+    fn an_anchor_above_its_own_as_of_attests_no_depth() {
+        let impossible = claim(
+            90,
+            Claim::ConfirmedOutput {
+                outpoint: op(),
+                value_sats: 1,
+                anchor: anchor(100, 1),
+                spv: any_spv(),
+            },
+        );
+        let st = fold_outpoint_status([&impossible]).unwrap();
+        assert_eq!(st.confirmations_at(1_000), 0);
+        assert_eq!(st.confirmed_value_at(1_000, 1), None);
+    }
+
+    #[test]
+    fn grouping_by_outpoint_applies_the_same_bound() {
+        let a = claim(
+            100,
+            Claim::ConfirmedOutput {
+                outpoint: op(),
+                value_sats: 50_000,
+                anchor: anchor(100, 1),
+                spv: any_spv(),
+            },
+        );
+        let statuses = fold_claims_by_outpoint([&a]);
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[&op()].confirmations_at(999), 1);
     }
 
     #[test]

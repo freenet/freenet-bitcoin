@@ -535,7 +535,7 @@ async fn verify_address(
     use freenet_bitcoin_common::address_state::BitcoinAddressStateV1;
     use freenet_bitcoin_common::tip_state::BitcoinTipStateV1;
     use freenet_bitcoin_common::{
-        confirmations, from_cbor, BitcoinAddressParameters, BitcoinTipParameters, OutpointStatus,
+        from_cbor, BitcoinAddressParameters, BitcoinTipParameters, OutpointStatus,
     };
 
     let signer = Signer::load_or_create(&cfg.signing_key_path)?;
@@ -598,8 +598,12 @@ async fn verify_address(
         println!("payments :");
         for (op, status) in &statuses {
             let line = match status {
-                OutpointStatus::Confirmed { value_sats, anchor } => {
-                    let confs = tip_height.map(|t| confirmations(anchor, t)).unwrap_or(0);
+                OutpointStatus::Confirmed {
+                    value_sats, anchor, ..
+                } => {
+                    // The depth a verifier would accept, not the raw tip
+                    // difference -- see `OutpointStatus::confirmations_at`.
+                    let confs = tip_height.map(|t| status.confirmations_at(t)).unwrap_or(0);
                     format!(
                         "{value_sats} sats  confirmed in block {} ({confs} conf)",
                         anchor.height

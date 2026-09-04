@@ -215,13 +215,18 @@ impl App {
                 let key = (op.txid.0.to_vec(), op.vout);
                 let verification = verifications.get(&key).cloned();
                 let (value_sats, status) = match status {
-                    OutpointStatus::Confirmed { value_sats, anchor } => (
+                    // `confirmations_at`, not raw tip arithmetic: the UI shows
+                    // the depth a verifier would act on, capped by what the
+                    // signing bridge actually attested. Showing the larger
+                    // number would tell a user a payment is deeper than
+                    // anything they could prove it to be.
+                    OutpointStatus::Confirmed {
+                        value_sats, anchor, ..
+                    } => (
                         value_sats,
                         RowStatus::Confirmed {
                             height: anchor.height,
-                            confirmations: freenet_bitcoin_common::confirmations(
-                                &anchor, tip_height,
-                            ),
+                            confirmations: status.confirmations_at(tip_height),
                         },
                     ),
                     OutpointStatus::Unconfirmed { value_sats } => {
