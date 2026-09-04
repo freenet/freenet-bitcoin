@@ -37,6 +37,12 @@ command = "cargo"
 args = ["build", "--release", "-p", "bitcoin-freenet-bridge"]
 
 [tasks.test]
+# The webapp `include_bytes!`s the contract WASM, which is gitignored build
+# output, so it cannot compile until the contracts have been built and copied
+# into place. Without this dependency a clean checkout fails to compile rather
+# than failing a test, which reads as a broken toolchain instead of a missing
+# step.
+dependencies = ["sync-webapp-contracts"]
 command = "cargo"
 args = ["test", "-p", "freenet-bitcoin-common", "-p", "bitcoin-freenet-bridge", "-p", "freenet-bitcoin-webapp"]
 
@@ -49,6 +55,7 @@ command = "cargo"
 args = ["fmt", "--all", "--", "--check"]
 
 [tasks.clippy]
+dependencies = ["sync-webapp-contracts"]
 command = "cargo"
 args = ["clippy", "--workspace", "--exclude", "bitcoin-address-contract",
         "--exclude", "bitcoin-tip-contract", "--all-targets", "--", "-D", "warnings"]

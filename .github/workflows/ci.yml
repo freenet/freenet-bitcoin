@@ -27,6 +27,23 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+      # The webapp `include_bytes!`s the contract WASM so its code hash is a
+      # fact about the bundle rather than a claim about a deployment. That
+      # WASM is build output and is gitignored, so it must exist before
+      # anything compiles the webapp -- clippy and test both do. Without this
+      # step a clean checkout fails at `couldn't read
+      # ../contracts/bitcoin_address_contract.wasm`, which is how the pinned
+      # contract-id vectors in `webapp/src/keys.rs` came to have never run in
+      # CI at all.
+      - name: Build and embed the contracts the webapp reads
+        run: |
+          cargo build --target wasm32-unknown-unknown \
+            -p bitcoin-address-contract -p bitcoin-tip-contract \
+            --features contract --release
+          mkdir -p webapp/contracts
+          cp target/wasm32-unknown-unknown/release/bitcoin_address_contract.wasm webapp/contracts/
+          cp target/wasm32-unknown-unknown/release/bitcoin_tip_contract.wasm webapp/contracts/
+
       - name: Clippy
         run: cargo clippy --workspace
              --exclude bitcoin-address-contract --exclude bitcoin-tip-contract
