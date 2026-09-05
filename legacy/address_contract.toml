@@ -86,3 +86,9 @@ version = "A7"
 description = "Deployed on signet and mainnet for about twenty minutes on 2026-09-04; real observations were published under it, so it must stay on this list. Superseded by --remap-path-prefix, which took the build machine's own paths out of the binary: dependency panic locations are absolute, so every contract this project had ever shipped was specific to the machine that compiled it and could not be reproduced anywhere else"
 date = "2026-09-04"
 code_hash = "c6d86e667d8d735cc7367caa4f9c704ba655587fd5d4bb2e94f9a49d9a45b472"
+
+[[entry]]
+version = "A8"
+description = "The first generation whose hash is reproducible from source anywhere: built with --remap-path-prefix, and verified by rebuilding a pristine checkout of 55df22e at an unrelated path to exactly this hash. Deployed on signet from 2026-09-04 and publishing real observations continuously, so it must stay on this list. Superseded by the fold tie-break fix in freenet-bitcoin-common: two contradictory claims stamped at one identical anchor compared equal, so the winner was whichever the iterator reached first -- on a verification path, the order the submitter chose"
+date = "2026-09-05"
+code_hash = "cd2ae7418e3b29c2770fab549763b8a268d54787a86a9bfad5b59ca3d2023555"

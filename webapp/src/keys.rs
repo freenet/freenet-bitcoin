@@ -165,9 +165,18 @@ mod tests {
             &[bridge()],
         )
         .unwrap();
+        // Moved from 5Q1Dj2P6J4YgctzByLVfWg5yVkW5GsVMZfFZj9SXTuqx by the fold
+        // tie-break fix in freenet-bitcoin-common, which re-keys the address
+        // contract cd2ae741... -> c2273660... The outgoing generation is
+        // recorded as A8 in legacy/address_contract.toml, so the bridge's
+        // migration probe carries its state forward.
+        //
+        // The old id is still the LIVE one until the rebuilt WASM is deployed:
+        // this vector pins what THIS BUNDLE derives, which is the whole point
+        // of it, and a bundle built from this branch derives the new address.
         assert_eq!(
             addr.to_string(),
-            "5Q1Dj2P6J4YgctzByLVfWg5yVkW5GsVMZfFZj9SXTuqx",
+            "4KgYWMvGJtYdTAPAvXUUQWGd5Jv7KLsaaA2tQwFH2E6F",
             "address contract id drifted; same procedure as above"
         );
     }

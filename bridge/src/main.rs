@@ -29,7 +29,7 @@ use bitcoin_freenet_bridge::{
     chain::ChainClient,
     config::BridgeConfig,
     freenet::FreenetPublisher,
-    observer::{ClaimsByScript, Observer},
+    observer::{Observer, RoundClaims},
     service::{router, ServiceState},
     signer::Signer,
     store::{Store, WatchedScript},
@@ -450,17 +450,25 @@ async fn observe_once(
         .map(|w| w.script_pubkey)
         .collect();
 
-    let mut claims: ClaimsByScript = HashMap::new();
+    let mut round = RoundClaims::default();
 
     // Reorg first: a reorg invalidates the range we were about to scan.
-    let mut next = obs.handle_reorg(store, signer, &tip, &mut claims)?;
-    if next == 0 {
+    //
+    // This yields retraction CANDIDATES rather than signed retractions,
+    // because the rescan below usually puts the orphaned transactions straight
+    // back on the chain in the replacement blocks. Signing a retraction now
+    // and a re-confirmation moments later would have the bridge assert both
+    // about one outpoint at one identical `as_of`. See
+    // `Observer::retraction_claims`.
+    let mut reorg = obs.handle_reorg(store)?;
+    if reorg.resume_from == 0 {
         // First run: start from the current tip rather than scanning the whole
         // chain. History for a newly-watched script is a separate concern (see
         // `scantxoutset` in the deployment notes) and a full rescan on a pruned
         // node is not possible anyway.
-        next = tip.height;
+        reorg.resume_from = tip.height;
     }
+    let next = reorg.resume_from;
 
     // A tip entry for EVERY block scanned, not only the last.
     //
@@ -474,19 +482,26 @@ async fn observe_once(
     // Bounded by construction: the state prunes to TIP_RETAIN, the round
     // scans at most 50 blocks, and an entry is about 150 bytes.
     let mut tip_entries = Vec::new();
-    // Bound the work per round so a long catch-up cannot starve the service.
-    let ceiling = tip.height.min(next.saturating_add(50));
+    // Bound the work per round so a long catch-up cannot starve the service --
+    // but widen the bound when this round is going to retract something, so it
+    // reaches the tip it will stamp those retractions with rather than leaving
+    // blocks for the next round to contradict them from. See `scan_ceiling`.
+    let ceiling = reorg.scan_ceiling(tip.height, obs.cfg.max_reorg_depth);
     for height in next..=ceiling {
         let hash = obs.chain.block_hash_at(height)?;
         let block = obs.chain.scan_block(&hash, &watched)?;
-        obs.claims_from_block(store, signer, &block, &tip, &mut claims)?;
+        obs.claims_from_block(store, signer, &block, &tip, &mut round)?;
         tip_entries.push(obs.tip_entry(signer, &block)?);
         store.set_checkpoint(obs.network(), &block.anchor)?;
     }
 
+    // Now that the rescan has said what is actually on the chain, retract only
+    // what it did not find.
+    obs.retraction_claims(signer, &tip, &reorg.orphaned, &mut round)?;
+
     // Re-publish payments that have now reached the configured depth, this
     // time with headers proving it.
-    obs.deep_claims(store, signer, &tip, &mut claims)?;
+    obs.deep_claims(store, signer, &tip, &mut round)?;
 
     // A scan watermark per watched script, so a reader can tell "nothing
     // received" from "nobody has looked".
@@ -505,7 +520,7 @@ async fn observe_once(
     };
     for script in &watched {
         let wm = obs.scan_watermark(signer, script, &scanned_anchor)?;
-        claims.entry(script.clone()).or_default().push(wm);
+        round.record(script, &freenet_bitcoin_common::Claim::ScannedTo, wm);
     }
 
     store.prune_blocks(obs.network(), tip.height, 1000)?;
@@ -515,7 +530,7 @@ async fn observe_once(
         return Ok(());
     };
 
-    for (script, script_claims) in claims {
+    for (script, script_claims) in round.into_by_script() {
         let params = obs.address_params(&script, signer.bridge_id());
 
         // Recover a predecessor generation BEFORE this instance is first
@@ -829,6 +844,60 @@ async fn verify_address(
 
 #[cfg(test)]
 mod tests {
+    /// `observe_once` must take its ceiling from the reorg outcome.
+    ///
+    /// The behaviour lives in `ReorgOutcome::scan_ceiling`, which is tested
+    /// directly -- but `observe_once` needs a live bitcoind, so nothing
+    /// executes its call to it. Deleting that call, or going back to computing
+    /// a ceiling inline, left all 142 tests green. This is a source pin
+    /// precisely because the wiring is the part that cannot be run here; it is
+    /// weaker than a behavioural test and is not a substitute for one.
+    #[test]
+    fn observe_once_takes_its_ceiling_from_the_reorg_outcome() {
+        let src = include_str!("main.rs");
+
+        // READ THIS BEFORE COPYING THIS PATTERN.
+        //
+        // `include_str!("main.rs")` pulls in the whole file INCLUDING this
+        // test, so any needle written as a single string literal appears in
+        // the haystack by virtue of being written here at all. Both assertions
+        // below are then decided by their own source text rather than by the
+        // code they are meant to pin, and each fails in the direction that
+        // hides the problem:
+        //
+        //   * the POSITIVE assertion (`contains`) passes whatever the call
+        //     site says, because its literal is in the file -- so the pin
+        //     stays green when the call is deleted, which is the one thing it
+        //     exists to catch;
+        //   * the NEGATIVE assertion (`!contains`) fails while the call site
+        //     is CORRECT, because its literal is in the file -- a red check
+        //     with no defect behind it.
+        //
+        // Both of those happened here, in a test whose entire purpose was to
+        // catch a guard that did nothing. Splitting each needle across
+        // `concat!` fragments fixes it: the joined string exists only at
+        // runtime, and no fragment appears contiguously in the source, so the
+        // haystack contains the needle only if the CODE does.
+        //
+        // The fragments must be split inside the meaningful token, not at a
+        // convenient boundary -- `concat!("reorg.", "scan_ceiling(")` would
+        // still leave `scan_ceiling(` in the file and match a mention of it in
+        // any comment, including this one.
+        let calls_it = concat!("reorg.scan", "_ceiling(tip.height");
+        let inline_ceiling = concat!("tip.height", ".min(next");
+        assert!(
+            src.contains(calls_it),
+            "observe_once no longer asks the ReorgOutcome for its ceiling, so a \
+             round that retracts may not scan as far as the tip it stamps those \
+             retractions with"
+        );
+        assert!(
+            !src.contains(inline_ceiling),
+            "the ceiling is being computed inline again, bypassing the widening \
+             that a retracting round depends on"
+        );
+    }
+
     use super::*;
 
     #[test]
