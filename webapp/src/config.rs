@@ -15,10 +15,17 @@ pub fn trusted_bridges(network: BitcoinNetwork) -> Vec<BridgeId> {
     let b58 = match network {
         // The Freenet.org bridge on nova, observing signet.
         BitcoinNetwork::Signet => Some("4MZnDAQWccEWXBUb1wt4iTEkDi6Z2MCcZ9WQN1umRsVL"),
-        // No mainnet bridge is published yet: its node is still in initial
-        // block download, and publishing observations during IBD would be
-        // misleading because an absence of payments means nothing.
-        BitcoinNetwork::Bitcoin => None,
+        // The same bridge, observing mainnet. Its node finished initial block
+        // download on 2026-09-04; before that it published nothing, because
+        // during IBD an absence of payments means nothing.
+        //
+        // It watches no addresses, deliberately (`always_watch = []` in the
+        // operator's config): the chain tip is public data about nobody, while
+        // observations about a specific mainnet address are a real person's
+        // money published to a permanent, replicated network. So mainnet shows
+        // a live tip and recent blocks and no payments, and that is correct
+        // rather than broken.
+        BitcoinNetwork::Bitcoin => Some("4MZnDAQWccEWXBUb1wt4iTEkDi6Z2MCcZ9WQN1umRsVL"),
         BitcoinNetwork::Testnet4 | BitcoinNetwork::Regtest => None,
     };
     b58.and_then(|s| BridgeId::from_bs58(s).ok())
@@ -28,6 +35,47 @@ pub fn trusted_bridges(network: BitcoinNetwork) -> Vec<BridgeId> {
 
 pub fn default_network() -> BitcoinNetwork {
     BitcoinNetwork::Signet
+}
+
+/// Networks this build can show anything about, in the order to offer them.
+///
+/// Derived from [`trusted_bridges`] rather than listed separately, so a
+/// network can never appear in the switcher with nothing behind it.
+pub fn available_networks() -> Vec<BitcoinNetwork> {
+    [
+        BitcoinNetwork::Signet,
+        BitcoinNetwork::Bitcoin,
+        BitcoinNetwork::Testnet4,
+        BitcoinNetwork::Regtest,
+    ]
+    .into_iter()
+    .filter(|n| !trusted_bridges(*n).is_empty())
+    .collect()
+}
+
+/// What a visitor needs to know about this network before drawing conclusions
+/// from an empty screen.
+///
+/// Mainnet is the case that matters. The bridge watches no mainnet address on
+/// purpose, so mainnet has a live chain tip and no payments — and "no
+/// payments" is the same thing a broken deployment shows. Saying why turns an
+/// ambiguous blank into a stated policy.
+pub fn network_note(network: BitcoinNetwork) -> Option<&'static str> {
+    match network {
+        BitcoinNetwork::Bitcoin => Some(
+            "This bridge publishes mainnet's chain tip and recent blocks, and watches no \
+             mainnet address. Observations about a specific address are somebody's real \
+             money published to a permanent, replicated network, so which addresses to \
+             watch is an operator's decision rather than a default. Look one up below and \
+             it will show as unscanned until an operator chooses to synchronise it.",
+        ),
+        BitcoinNetwork::Signet => Some(
+            "Signet is a Bitcoin test network. Its coins are worthless and its blocks are \
+             cheap to produce, which is exactly why the bridge is willing to watch a busy \
+             third-party address on it.",
+        ),
+        _ => None,
+    }
 }
 
 /// An address worth showing before the visitor has looked anything up.

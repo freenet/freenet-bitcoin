@@ -19,6 +19,7 @@
 mod address;
 mod app;
 mod config;
+mod generation;
 mod keys;
 mod node;
 mod state;

@@ -8,6 +8,10 @@ description = "A verifiable Bitcoin address viewer served from Freenet"
 
 [dependencies]
 freenet-bitcoin-common = { workspace = true }
+freenet-bitcoin-generation = { workspace = true }
+# The pointer resolver. No features: the `ui` half is release-signing tooling
+# a browser has no use for.
+freenet-migrate = { workspace = true }
 # `net` brings WebApi, the client half used to talk to the local node.
 freenet-stdlib = { workspace = true, features = ["net"] }
 

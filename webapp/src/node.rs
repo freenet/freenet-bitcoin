@@ -5,8 +5,61 @@
 //! route to anything. Everything the page shows arrives through it.
 
 use dioxus::prelude::*;
-use freenet_stdlib::client_api::WebApi;
+use freenet_stdlib::client_api::{ClientError, WebApi};
+use freenet_stdlib::prelude::ContractInstanceId;
 use futures::channel::mpsc;
+
+/// Everything that arrives from the node, including the failures.
+///
+/// The failures used to be flattened to a string and then ignored, which is
+/// how a GET for a contract nobody publishes to became indistinguishable from
+/// a contract with nothing in it. Resolving a generation pointer needs the
+/// opposite: "the network says there is nothing at that address" and "we did
+/// not hear back" lead to different conclusions, and conflating them is a
+/// downgrade primitive.
+#[allow(dead_code)] // Constructed only on the wasm path; matched on both.
+pub enum Incoming {
+    Response(freenet_stdlib::client_api::HostResponse),
+    Failed(Failure),
+}
+
+/// A request the node refused or could not complete.
+pub struct Failure {
+    /// The contract it was about, when the error names one. Many do not: the
+    /// node reports a missing contract as a bare operation error, which is
+    /// why the app keeps exactly one pointer GET in flight at a time.
+    pub key: Option<ContractInstanceId>,
+    /// The network answered, positively, that there is no such state.
+    ///
+    /// Deliberately narrow, and narrow in the safe direction: anything
+    /// unrecognised is "we learned nothing", because a false "nothing is
+    /// there" would let a stalled request push this page onto a stale
+    /// build-time generation, while a false "we learned nothing" costs a
+    /// warning banner.
+    pub not_found: bool,
+    pub message: String,
+}
+
+#[allow(dead_code)] // Called only on the wasm path.
+fn classify(e: &ClientError) -> Failure {
+    use freenet_stdlib::client_api::{ContractError, ErrorKind, RequestError};
+    let message = e.to_string();
+    let key = match e.kind() {
+        ErrorKind::RequestError(RequestError::ContractError(
+            ContractError::Get { key, .. }
+            | ContractError::Put { key, .. }
+            | ContractError::Update { key, .. }
+            | ContractError::Subscribe { key, .. },
+        )) => Some(*key.id()),
+        _ => None,
+    };
+    let lowered = message.to_ascii_lowercase();
+    Failure {
+        key,
+        not_found: lowered.contains("not found") || lowered.contains("notfound"),
+        message,
+    }
+}
 
 // Only ever touched from wasm: the native build exists so `cargo test` and
 // clippy can run the pure logic (address parsing, formatting, key derivation)
@@ -34,10 +87,8 @@ impl Connection {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub async fn connect(
-) -> Result<mpsc::UnboundedReceiver<Result<freenet_stdlib::client_api::HostResponse, String>>, String>
-{
-    use freenet_stdlib::client_api::{ClientError, HostResponse};
+pub async fn connect() -> Result<mpsc::UnboundedReceiver<Incoming>, String> {
+    use freenet_stdlib::client_api::HostResponse;
     use wasm_bindgen_futures::spawn_local;
 
     *CONNECTION.write() = Connection::Connecting;
@@ -52,7 +103,10 @@ pub async fn connect(
     let api = WebApi::start(
         ws,
         move |res: Result<HostResponse, ClientError>| {
-            let mapped = res.map_err(|e| e.to_string());
+            let mapped = match res {
+                Ok(r) => Incoming::Response(r),
+                Err(e) => Incoming::Failed(classify(&e)),
+            };
             let tx = tx2.clone();
             spawn_local(async move {
                 let _ = tx.unbounded_send(mapped);
@@ -75,9 +129,7 @@ pub async fn connect(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub async fn connect(
-) -> Result<mpsc::UnboundedReceiver<Result<freenet_stdlib::client_api::HostResponse, String>>, String>
-{
+pub async fn connect() -> Result<mpsc::UnboundedReceiver<Incoming>, String> {
     let (_tx, rx) = mpsc::unbounded();
     Ok(rx)
 }
@@ -139,3 +191,55 @@ pub fn get_and_subscribe(id: freenet_stdlib::prelude::ContractInstanceId) {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn get_and_subscribe(_id: freenet_stdlib::prelude::ContractInstanceId) {}
+
+/// GET a generation pointer: no subscription, no contract code.
+///
+/// Separate from [`get_and_subscribe`] because a pointer is read once at
+/// startup and a subscription to it would be a standing cost for a 100-byte
+/// record that changes only when the bridge re-keys.
+#[cfg(target_arch = "wasm32")]
+pub fn get_pointer(id: ContractInstanceId) {
+    use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
+
+    let req = ContractRequest::Get {
+        key: id,
+        return_contract_code: false,
+        subscribe: false,
+        blocking_subscribe: false,
+    };
+    wasm_bindgen_futures::spawn_local(async move {
+        let mut guard = WEB_API.write();
+        let Some(api) = guard.as_mut() else { return };
+        if let Err(e) = api.send(ClientRequest::ContractOp(req)).await {
+            dioxus::logger::tracing::warn!("pointer get failed: {e}");
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn get_pointer(_id: ContractInstanceId) {}
+
+/// Run a task for the page's lifetime. A no-op off the browser, where the app
+/// exists only so the pure logic can be tested.
+#[cfg(target_arch = "wasm32")]
+pub fn spawn(f: impl std::future::Future<Output = ()> + 'static) {
+    wasm_bindgen_futures::spawn_local(f);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn spawn(_f: impl std::future::Future<Output = ()> + 'static) {}
+
+/// Wait, so a request that never comes back becomes a stated fact rather than
+/// a page that waits forever.
+#[cfg(target_arch = "wasm32")]
+pub async fn sleep_ms(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        if let Some(w) = web_sys::window() {
+            let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn sleep_ms(_ms: i32) {}

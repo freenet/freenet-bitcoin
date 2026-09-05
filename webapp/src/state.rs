@@ -10,6 +10,27 @@ use freenet_stdlib::prelude::ContractInstanceId;
 
 use crate::{config, keys, verify};
 
+/// Which contract generation the page is deriving addresses from.
+///
+/// Starts as what this build embeds and is replaced once the bridge's
+/// generation pointers resolve (see [`crate::generation`]). It is `Copy` so it
+/// can live inside [`App`] without dragging the resolver machinery — which is
+/// neither `Clone` nor cheap — along with it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Derivation {
+    pub address_code_hash: [u8; 32],
+    pub tip_code_hash: [u8; 32],
+}
+
+impl Default for Derivation {
+    fn default() -> Self {
+        Self {
+            address_code_hash: keys::embedded_address_code_hash(),
+            tip_code_hash: keys::embedded_tip_code_hash(),
+        }
+    }
+}
+
 pub static APP: GlobalSignal<App> = GlobalSignal::new(App::default);
 
 #[derive(Clone)]
@@ -22,6 +43,25 @@ pub struct App {
     pub lookups: HashMap<Vec<u8>, Lookup>,
     pub pending: Option<String>,
     pub error: Option<String>,
+    /// The contract generation being read. See [`Derivation`].
+    pub derivation: Derivation,
+    /// Set when a contract answered with state this build cannot decode.
+    ///
+    /// This is the one failure that following the bridge's generation can
+    /// produce and embedding cannot: a generation whose wire format moved. It
+    /// gets its own field because it must be shown as loudly as possible —
+    /// silently ignoring the parse, which is what this code used to do, turns
+    /// an incompatible bridge into a blank page.
+    pub unreadable: Option<String>,
+    /// True once the tip contract has stayed silent long enough that the
+    /// page should say so rather than keep spinning.
+    pub tip_silent: bool,
+    /// Lookups requested before the generation pointers settled.
+    ///
+    /// Deriving an address from the wrong generation and re-deriving later
+    /// would leave a subscription outstanding on a contract nobody writes to,
+    /// so a lookup asked for early waits rather than guessing.
+    pub queued_lookups: Vec<Lookup>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -42,6 +82,10 @@ impl Default for App {
             lookups: HashMap::new(),
             pending: None,
             error: None,
+            derivation: Derivation::default(),
+            unreadable: None,
+            tip_silent: false,
+            queued_lookups: Vec::new(),
         }
     }
 }
@@ -100,21 +144,41 @@ impl App {
         if bridges.is_empty() {
             return None;
         }
-        keys::tip_contract_id(self.network, &bridges).ok()
+        keys::tip_contract_id_at(&self.derivation.tip_code_hash, self.network, &bridges).ok()
     }
 
     /// Route an arriving contract state to whatever asked for it.
+    ///
+    /// A decode failure is recorded rather than dropped. The bytes came from
+    /// the contract the bridge is publishing to, so failing to read them means
+    /// this build and that generation disagree about the wire format — which
+    /// the page must say, not swallow.
     pub fn on_contract_state(&mut self, id: Vec<u8>, bytes: Vec<u8>) {
         if Some(id.as_slice()) == self.tip_id().map(|i| i.as_bytes().to_vec()).as_deref() {
-            if let Ok(tip) = from_cbor::<BitcoinTipStateV1>(&bytes) {
-                self.apply_tip(&tip);
+            match from_cbor::<BitcoinTipStateV1>(&bytes) {
+                Ok(tip) => self.apply_tip(&tip),
+                Err(e) => {
+                    self.unreadable = Some(format!(
+                        "The tip contract returned {} bytes this build could not decode ({e}).",
+                        bytes.len()
+                    ))
+                }
             }
             return;
         }
         if let Some(lookup) = self.lookups.get(&id).cloned() {
-            if let Ok(state) = from_cbor::<BitcoinAddressStateV1>(&bytes) {
-                self.apply_address(&lookup, &state);
-                self.pending = None;
+            match from_cbor::<BitcoinAddressStateV1>(&bytes) {
+                Ok(state) => {
+                    self.apply_address(&lookup, &state);
+                    self.pending = None;
+                }
+                Err(e) => {
+                    self.pending = None;
+                    self.unreadable = Some(format!(
+                        "An address contract returned {} bytes this build could not decode ({e}).",
+                        bytes.len()
+                    ));
+                }
             }
         }
     }
@@ -159,7 +223,8 @@ impl App {
             &lookup.script_pubkey,
             state,
         );
-        if let Ok(id) = keys::address_contract_id(
+        if let Ok(id) = keys::address_contract_id_at(
+            &self.derivation.address_code_hash,
             lookup.network,
             &lookup.script_pubkey,
             &config::trusted_bridges(lookup.network),

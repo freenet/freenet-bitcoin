@@ -103,3 +103,27 @@ table.blocks tr:last-child td { border-bottom: none; }
   .row { flex-direction: column; }
   .stats { gap: 16px; }
 }
+
+/* Generation notices.
+   Shown only when this build and the bridge disagree about which contracts to
+   read, or when nothing confirms that they agree. A blank page is the failure
+   these replace, so they sit above everything and are impossible to mistake
+   for chrome -- but they are absent in the healthy case, because a banner that
+   is always there is a banner nobody reads. */
+.notice { border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; border: 1px solid var(--line); background: var(--panel); }
+.notice strong { display: block; font-size: 14px; margin-bottom: 5px; }
+.notice p { margin: 0; color: var(--muted); font-size: 13px; max-width: 78ch; }
+.notice .mono { color: var(--ink); }
+.notice-stale { border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
+.notice-stale strong { color: var(--warn); }
+.notice-unconfirmed { border-color: color-mix(in srgb, var(--muted) 45%, var(--line)); }
+.notice-unconfirmed strong { color: var(--ink); }
+.notice-broken { border-color: color-mix(in srgb, var(--bad) 55%, var(--line)); background: color-mix(in srgb, var(--bad) 7%, var(--panel)); }
+.notice-broken strong { color: var(--bad); }
+
+/* Network switcher. Two networks with the same bridge, showing genuinely
+   different chains; the pill it replaces was a label, not a control. */
+.tabs { display: flex; gap: 4px; }
+.tab { background: transparent; border: 1px solid var(--line); color: var(--muted); border-radius: 999px; padding: 3px 11px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; cursor: pointer; font-family: inherit; }
+.tab:hover { color: var(--ink); }
+.tab-on { color: var(--ink); border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); background: color-mix(in srgb, var(--accent) 10%, transparent); }

@@ -2,10 +2,34 @@
 
 use dioxus::prelude::*;
 use freenet_bitcoin_common::BitcoinNetwork;
+use freenet_bitcoin_generation::Artifact;
 
-use crate::state::{AddressView, PaymentRow, RowStatus, APP};
+use crate::generation::{Generations, Notice};
+use crate::state::{AddressView, Derivation, PaymentRow, RowStatus, APP};
 use crate::verify::{fmt_sats, Verification};
 use crate::{address, config, keys, node, state};
+
+/// Which contract generation the bridge says it publishes to.
+///
+/// Kept out of [`APP`] because the resolver it holds is neither `Clone` nor
+/// cheap, and `App` is cloned freely; what the rest of the app needs from it
+/// is two 32-byte hashes, which live in [`Derivation`].
+pub static GENERATIONS: GlobalSignal<Generations> = GlobalSignal::new(Generations::default);
+
+/// How long to wait for a generation pointer before saying it did not answer.
+///
+/// The page cannot start reading contracts until it knows which generation to
+/// read, so this is a hard bound on time-to-first-paint in the failure case.
+/// It resolves in well under a second when the node is healthy.
+const POINTER_TIMEOUT_MS: i32 = 10_000;
+
+/// How long the tip contract may stay silent before the page says so.
+///
+/// Silence here is the exact symptom this whole mechanism exists to explain:
+/// an empty contract and a contract nobody publishes to look identical. Once
+/// the page has waited longer than a plausible fetch, it says which contract
+/// it is waiting on and which generation that came from, instead of spinning.
+const TIP_PATIENCE_MS: i32 = 25_000;
 
 #[component]
 pub fn App() -> Element {
@@ -13,13 +37,13 @@ pub fn App() -> Element {
     use_future(move || async move {
         match node::connect().await {
             Ok(mut rx) => {
-                subscribe_to_tip();
-                lookup_demo_address();
+                // Nothing is read until the page knows WHICH contracts to
+                // read. Fetching first and re-deriving afterwards would leave
+                // a subscription standing on a contract nobody writes to.
+                advance_generations();
                 use futures::StreamExt;
                 while let Some(msg) = rx.next().await {
-                    if let Ok(resp) = msg {
-                        handle_response(resp);
-                    }
+                    handle_incoming(msg);
                 }
             }
             Err(e) => {
@@ -32,6 +56,7 @@ pub fn App() -> Element {
     rsx! {
         div { class: "page",
             Header {}
+            GenerationNotices {}
             ChainPanel {}
             LookupPanel {}
             Results {}
@@ -62,16 +87,38 @@ fn Header() -> Element {
 fn ChainPanel() -> Element {
     let app = APP.read();
     let network = app.network;
+    let silent = app.tip_silent;
+    let tip_id = app.tip_id().map(|i| i.to_string());
+    let generation = freenet_bitcoin_generation::short(&app.derivation.tip_code_hash);
     let Some(tip) = app.tip.clone() else {
+        drop(app);
         return rsx! {
             section { class: "card",
-                h2 { "The chain" }
-                p { class: "muted",
-                    if config::trusted_bridges(network).is_empty() {
+                div { class: "card-head",
+                    h2 { "The chain" }
+                    NetworkTabs {}
+                }
+                if config::trusted_bridges(network).is_empty() {
+                    p { class: "muted",
                         "No bridge publishes for this network yet, so there is nothing to show."
-                    } else {
-                        "Waiting for the tip contract…"
                     }
+                } else if silent {
+                    // The failure mode in words. An empty contract and a
+                    // contract nobody publishes to are byte-identical, so the
+                    // page names what it asked for and lets the reader check.
+                    p { class: "err",
+                        "Nothing has come back from the tip contract. It is empty, or nobody is \
+                         publishing to it."
+                    }
+                    p { class: "muted",
+                        "Asked for contract "
+                        span { class: "mono", "{tip_id.clone().unwrap_or_default()}" }
+                        ", derived from contract generation "
+                        span { class: "mono", "{generation}" }
+                        "."
+                    }
+                } else {
+                    p { class: "muted", "Waiting for the tip contract…" }
                 }
             }
         };
@@ -82,7 +129,7 @@ fn ChainPanel() -> Element {
         section { class: "card",
             div { class: "card-head",
                 h2 { "The chain" }
-                span { class: "pill", "{network.as_str()}" }
+                NetworkTabs {}
             }
             div { class: "stats",
                 Stat { label: "Tip height", value: "{tip.height}" }
@@ -103,6 +150,80 @@ fn ChainPanel() -> Element {
             }
         }
     }
+}
+
+/// What the page says when it cannot vouch for what it is showing.
+///
+/// Renders nothing when the bridge's generation and this build's agree, which
+/// is the healthy case. A page that warns when everything is fine teaches
+/// people to scroll past the warning that matters.
+#[component]
+fn GenerationNotices() -> Element {
+    let unreadable = APP.read().unreadable.clone();
+    let notices: Vec<Notice> = GENERATIONS.read().notices(unreadable.as_deref());
+    if notices.is_empty() {
+        return rsx! { div {} };
+    }
+    rsx! {
+        for n in notices {
+            div { key: "{n.headline}", class: "{n.severity.css()}",
+                strong { "{n.headline}" }
+                p { "{n.detail}" }
+            }
+        }
+    }
+}
+
+/// Which network the page is showing, and how to change it.
+///
+/// Rendered even before a tip arrives: a visitor who lands on a network that
+/// is not answering must be able to get back to one that is.
+#[component]
+fn NetworkTabs() -> Element {
+    let current = APP.read().network;
+    let networks = config::available_networks();
+    if networks.len() < 2 {
+        return rsx! { span { class: "pill", "{current.as_str()}" } };
+    }
+    rsx! {
+        div { class: "tabs",
+            for n in networks {
+                button {
+                    key: "{n.as_str()}",
+                    class: if n == current { "tab tab-on" } else { "tab" },
+                    onclick: move |_| switch_network(n),
+                    "{n.as_str()}"
+                }
+            }
+        }
+    }
+}
+
+/// Start again on a different network.
+///
+/// Everything on screen was derived for the old one — the tip, the addresses,
+/// the generation the bridge for that network publishes to — so all of it is
+/// dropped rather than filtered. A stale row surviving a switch would be a
+/// claim about the wrong chain.
+fn switch_network(network: BitcoinNetwork) {
+    {
+        let mut app = APP.write();
+        if app.network == network {
+            return;
+        }
+        app.network = network;
+        app.tip = None;
+        app.tip_silent = false;
+        app.addresses.clear();
+        app.lookups.clear();
+        app.queued_lookups.clear();
+        app.pending = None;
+        app.error = None;
+        app.unreadable = None;
+        app.derivation = Derivation::default();
+    }
+    *GENERATIONS.write() = Generations::for_network(network);
+    advance_generations();
 }
 
 #[component]
@@ -143,6 +264,9 @@ fn LookupPanel() -> Element {
             p { class: "muted",
                 "Any Bitcoin address on this network. You are asking Freenet what it \
                  knows — no account, no key, and nothing recorded about the fact that you asked."
+            }
+            if let Some(note) = config::network_note(network) {
+                p { class: "muted", "{note}" }
             }
             div { class: "row",
                 input {
@@ -350,13 +474,84 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Fetch the next generation pointer, or start reading once both have
+/// settled.
+///
+/// One pointer GET at a time, each with its own deadline. The node reports a
+/// missing contract as a bare operation error that does not name the contract,
+/// so a second concurrent GET would make a failure unattributable — and
+/// attributing it to the wrong pointer would resolve the wrong generation.
+fn advance_generations() {
+    let next = GENERATIONS.write().next_pointer();
+    let Some(id) = next else {
+        if GENERATIONS.read().settled() {
+            on_generations_settled();
+        }
+        return;
+    };
+    node::get_pointer(id);
+    node::spawn(async move {
+        node::sleep_ms(POINTER_TIMEOUT_MS).await;
+        if GENERATIONS.read().in_flight() != Some(id) {
+            return;
+        }
+        // Silence, never absence: a stalled GET must not read as "no pointer
+        // was ever published", which is the one answer that would let the page
+        // treat its build-time generation as confirmed.
+        GENERATIONS.write().on_pointer_unreachable(id);
+        advance_generations();
+    });
+}
+
+/// Both generations are known: start reading contracts.
+fn on_generations_settled() {
+    let (address_code_hash, tip_code_hash, tip_usable, address_usable) = {
+        let g = GENERATIONS.read();
+        (
+            g.code_hash(Artifact::Address),
+            g.code_hash(Artifact::Tip),
+            g.usable(Artifact::Tip),
+            g.usable(Artifact::Address),
+        )
+    };
+
+    let queued = {
+        let mut app = APP.write();
+        app.derivation = Derivation {
+            address_code_hash,
+            tip_code_hash,
+        };
+        std::mem::take(&mut app.queued_lookups)
+    };
+
+    if tip_usable {
+        subscribe_to_tip();
+        node::spawn(async move {
+            node::sleep_ms(TIP_PATIENCE_MS).await;
+            let mut app = APP.write();
+            if app.tip.is_none() {
+                app.tip_silent = true;
+            }
+        });
+    }
+    if address_usable {
+        lookup_demo_address();
+        for lookup in queued {
+            issue_lookup(lookup);
+        }
+    }
+}
+
 fn subscribe_to_tip() {
-    let network = APP.read().network;
+    let (network, code_hash) = {
+        let app = APP.read();
+        (app.network, app.derivation.tip_code_hash)
+    };
     let bridges = config::trusted_bridges(network);
     if bridges.is_empty() {
         return;
     }
-    if let Ok(id) = keys::tip_contract_id(network, &bridges) {
+    if let Ok(id) = keys::tip_contract_id_at(&code_hash, network, &bridges) {
         node::get_and_subscribe(id);
     }
 }
@@ -372,36 +567,74 @@ fn lookup_demo_address() {
 }
 
 fn start_lookup(address: String, script: Vec<u8>, network: BitcoinNetwork, is_demo: bool) {
-    let bridges = config::trusted_bridges(network);
-    let Ok(id) = keys::address_contract_id(network, &script, &bridges) else {
+    let lookup = state::Lookup {
+        address,
+        script_pubkey: script,
+        network,
+        is_demo,
+    };
+    // Before the generation is known there is no correct address to derive.
+    // Guessing and re-deriving later would leave a subscription standing on a
+    // contract nobody writes to, which is the failure this all exists to stop.
+    if !GENERATIONS.read().settled() {
+        let mut app = APP.write();
+        if !lookup.is_demo {
+            app.pending = Some(lookup.address.clone());
+        }
+        app.queued_lookups.push(lookup);
+        return;
+    }
+    issue_lookup(lookup);
+}
+
+fn issue_lookup(lookup: state::Lookup) {
+    if !GENERATIONS.read().usable(Artifact::Address) {
+        APP.write().error = Some(
+            "This bridge has withdrawn its address contract, so there is nothing to look up."
+                .into(),
+        );
+        return;
+    }
+    let code_hash = APP.read().derivation.address_code_hash;
+    let bridges = config::trusted_bridges(lookup.network);
+    let Ok(id) =
+        keys::address_contract_id_at(&code_hash, lookup.network, &lookup.script_pubkey, &bridges)
+    else {
         APP.write().error = Some("could not derive the contract for that address".into());
         return;
     };
     {
         let mut app = APP.write();
-        app.lookups.insert(
-            id.as_bytes().to_vec(),
-            state::Lookup {
-                address: address.clone(),
-                script_pubkey: script,
-                network,
-                is_demo,
-            },
-        );
-        if !is_demo {
-            app.pending = Some(address);
+        if !lookup.is_demo {
+            app.pending = Some(lookup.address.clone());
         }
+        app.lookups.insert(id.as_bytes().to_vec(), lookup);
     }
     node::get_and_subscribe(id);
 }
 
-fn handle_response(resp: freenet_stdlib::client_api::HostResponse) {
+fn handle_incoming(msg: node::Incoming) {
     use freenet_stdlib::client_api::{ContractResponse, HostResponse};
+
+    let resp = match msg {
+        node::Incoming::Response(r) => r,
+        node::Incoming::Failed(f) => return handle_failure(f),
+    };
+
     if let HostResponse::ContractResponse(cr) = resp {
         match cr {
             ContractResponse::GetResponse { key, state, .. } => {
+                let id = *key.id();
+                // A pointer's reply settles a generation rather than filling
+                // the page, so it is routed first and never parsed as
+                // contract state.
+                if GENERATIONS.read().in_flight() == Some(id) {
+                    GENERATIONS.write().on_pointer_state(id, state.as_ref());
+                    advance_generations();
+                    return;
+                }
                 APP.write()
-                    .on_contract_state(key.id().as_bytes().to_vec(), state.as_ref().to_vec());
+                    .on_contract_state(id.as_bytes().to_vec(), state.as_ref().to_vec());
             }
             // A delta's wire shape differs from full state, so re-GET rather
             // than trying to parse it as state — the bug that made Harvest's
@@ -412,4 +645,44 @@ fn handle_response(resp: freenet_stdlib::client_api::HostResponse) {
             _ => {}
         }
     }
+}
+
+/// A request the node refused.
+///
+/// This used to be dropped on the floor, which is how "there is no such
+/// contract" became indistinguishable from "the contract is empty". The one
+/// case that must be got right is a pointer: a definitive absence is the only
+/// answer that permits treating this build's own generation as the answer, and
+/// anything else has to stay an unconfirmed guess.
+fn handle_failure(f: node::Failure) {
+    let waiting = GENERATIONS.read().in_flight();
+    let Some(pointer) = waiting else {
+        if let Some(message) = describe_failure(&f) {
+            APP.write().error = Some(message);
+        }
+        return;
+    };
+    // Attribute by key when the error names one; otherwise by the fact that
+    // exactly one pointer GET is ever outstanding.
+    if f.key.is_some_and(|k| k != pointer) {
+        return;
+    }
+    if f.not_found {
+        GENERATIONS.write().on_pointer_absent(pointer);
+    } else {
+        GENERATIONS.write().on_pointer_unreachable(pointer);
+    }
+    advance_generations();
+}
+
+fn describe_failure(f: &node::Failure) -> Option<String> {
+    if f.not_found {
+        // Expected for an address nobody has ever published observations for.
+        // The address card already distinguishes that from "not scanned".
+        return None;
+    }
+    Some(format!(
+        "The node could not complete a request: {}",
+        f.message
+    ))
 }

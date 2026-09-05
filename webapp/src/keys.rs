@@ -21,11 +21,21 @@
 //!
 //! The one thing that IS configuration is which bridge to believe — and that
 //! should be explicit, because it is a trust decision rather than an address.
+//!
+//! # Embedding is half the answer
+//!
+//! It guarantees this build's derivation matches this build's bytes. It
+//! guarantees nothing about the *bridge's* bytes, and a bridge running a
+//! different generation is writing to different addresses. That half is
+//! handled at runtime by [`crate::generation`], which reads the code hash the
+//! bridge signs for itself; the functions here take a code hash so the app can
+//! derive from what the bridge says rather than from what it happens to ship.
 
 use freenet_bitcoin_common::{
     to_cbor, BitcoinAddressParameters, BitcoinNetwork, BitcoinTipParameters, BridgeId,
 };
-use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
+use freenet_migrate::contract::contract_id_from_code_hash;
+use freenet_stdlib::prelude::{ContractInstanceId, Parameters};
 
 /// The contract WASM this build talks to, embedded so the code hash is a fact
 /// about this bundle rather than a claim about a deployment.
@@ -33,8 +43,23 @@ pub const ADDRESS_CONTRACT_WASM: &[u8] =
     include_bytes!("../contracts/bitcoin_address_contract.wasm");
 pub const TIP_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/bitcoin_tip_contract.wasm");
 
-/// Contract instance holding the public chain tip for a network.
-pub fn tip_contract_id(
+/// The address contract generation this build ships.
+pub fn embedded_address_code_hash() -> [u8; 32] {
+    freenet_bitcoin_generation::code_hash(ADDRESS_CONTRACT_WASM)
+}
+
+/// The tip contract generation this build ships.
+pub fn embedded_tip_code_hash() -> [u8; 32] {
+    freenet_bitcoin_generation::code_hash(TIP_CONTRACT_WASM)
+}
+
+/// Contract instance holding the public chain tip for a network, at a given
+/// contract generation.
+///
+/// `code_hash` is what makes this a *generation*: the same parameters under a
+/// different code hash are a different, unrelated contract holding nothing.
+pub fn tip_contract_id_at(
+    code_hash: &[u8; 32],
     network: BitcoinNetwork,
     trusted: &[BridgeId],
 ) -> Result<ContractInstanceId, String> {
@@ -42,25 +67,25 @@ pub fn tip_contract_id(
         network,
         trusted_bridges: trusted.to_vec(),
     };
-    let key = ContractKey::from_params_and_code(
-        Parameters::from(to_cbor(&params)?),
-        ContractCode::from(TIP_CONTRACT_WASM.to_vec()),
-    );
-    Ok(*key.id())
+    Ok(contract_id_from_code_hash(
+        code_hash,
+        &Parameters::from(to_cbor(&params)?),
+    ))
 }
 
-/// Contract instance holding observations for one output script.
-pub fn address_contract_id(
+/// Contract instance holding observations for one output script, at a given
+/// contract generation.
+pub fn address_contract_id_at(
+    code_hash: &[u8; 32],
     network: BitcoinNetwork,
     script_pubkey: &[u8],
     trusted: &[BridgeId],
 ) -> Result<ContractInstanceId, String> {
     let params = address_params(network, script_pubkey, trusted);
-    let key = ContractKey::from_params_and_code(
-        Parameters::from(to_cbor(&params)?),
-        ContractCode::from(ADDRESS_CONTRACT_WASM.to_vec()),
-    );
-    Ok(*key.id())
+    Ok(contract_id_from_code_hash(
+        code_hash,
+        &Parameters::from(to_cbor(&params)?),
+    ))
 }
 
 /// The parameters an address contract is instantiated with.
@@ -111,7 +136,12 @@ mod tests {
     /// which is how that was found.
     #[test]
     fn derivation_matches_the_embedded_contracts() {
-        let tip = tip_contract_id(BitcoinNetwork::Signet, &[bridge()]).unwrap();
+        let tip = tip_contract_id_at(
+            &embedded_tip_code_hash(),
+            BitcoinNetwork::Signet,
+            &[bridge()],
+        )
+        .unwrap();
         assert_eq!(
             tip.to_string(),
             "ESNzqEXi1MnNeojZRtE7ZJkDyaNninNtcmRriKBtmubt",
@@ -120,7 +150,13 @@ mod tests {
         );
 
         let script = hex::decode("0014360a3ba02d9603554f7746bf90e7c10d107d2cca").unwrap();
-        let addr = address_contract_id(BitcoinNetwork::Signet, &script, &[bridge()]).unwrap();
+        let addr = address_contract_id_at(
+            &embedded_address_code_hash(),
+            BitcoinNetwork::Signet,
+            &script,
+            &[bridge()],
+        )
+        .unwrap();
         assert_eq!(
             addr.to_string(),
             "GXGFupaJwFmE2BvsMXcTsNNDhad6vDPWpLB38Grt3am9",
@@ -133,18 +169,20 @@ mod tests {
         // Trust is part of the address, not a filter applied after reading:
         // two apps trusting different bridges genuinely read different state.
         let other = BridgeId([9u8; 32]);
+        let h = embedded_tip_code_hash();
         assert_ne!(
-            tip_contract_id(BitcoinNetwork::Signet, &[bridge()]).unwrap(),
-            tip_contract_id(BitcoinNetwork::Signet, &[other]).unwrap()
+            tip_contract_id_at(&h, BitcoinNetwork::Signet, &[bridge()]).unwrap(),
+            tip_contract_id_at(&h, BitcoinNetwork::Signet, &[other]).unwrap()
         );
     }
 
     #[test]
     fn networks_do_not_collide() {
         let script = hex::decode("0014360a3ba02d9603554f7746bf90e7c10d107d2cca").unwrap();
+        let h = embedded_address_code_hash();
         assert_ne!(
-            address_contract_id(BitcoinNetwork::Signet, &script, &[bridge()]).unwrap(),
-            address_contract_id(BitcoinNetwork::Bitcoin, &script, &[bridge()]).unwrap()
+            address_contract_id_at(&h, BitcoinNetwork::Signet, &script, &[bridge()]).unwrap(),
+            address_contract_id_at(&h, BitcoinNetwork::Bitcoin, &script, &[bridge()]).unwrap()
         );
     }
 }
