@@ -858,10 +858,34 @@ mod tests {
     #[test]
     fn observe_once_takes_its_ceiling_from_the_reorg_outcome() {
         let src = include_str!("main.rs");
-        // The needles are assembled from fragments on purpose. `include_str!`
-        // pulls in THIS test too, so a needle written as one literal matches
-        // its own source and the pin passes whatever the call site says --
-        // which is how the first version of this test was itself inert.
+
+        // READ THIS BEFORE COPYING THIS PATTERN.
+        //
+        // `include_str!("main.rs")` pulls in the whole file INCLUDING this
+        // test, so any needle written as a single string literal appears in
+        // the haystack by virtue of being written here at all. Both assertions
+        // below are then decided by their own source text rather than by the
+        // code they are meant to pin, and each fails in the direction that
+        // hides the problem:
+        //
+        //   * the POSITIVE assertion (`contains`) passes whatever the call
+        //     site says, because its literal is in the file -- so the pin
+        //     stays green when the call is deleted, which is the one thing it
+        //     exists to catch;
+        //   * the NEGATIVE assertion (`!contains`) fails while the call site
+        //     is CORRECT, because its literal is in the file -- a red check
+        //     with no defect behind it.
+        //
+        // Both of those happened here, in a test whose entire purpose was to
+        // catch a guard that did nothing. Splitting each needle across
+        // `concat!` fragments fixes it: the joined string exists only at
+        // runtime, and no fragment appears contiguously in the source, so the
+        // haystack contains the needle only if the CODE does.
+        //
+        // The fragments must be split inside the meaningful token, not at a
+        // convenient boundary -- `concat!("reorg.", "scan_ceiling(")` would
+        // still leave `scan_ceiling(` in the file and match a mention of it in
+        // any comment, including this one.
         let calls_it = concat!("reorg.scan", "_ceiling(tip.height");
         let inline_ceiling = concat!("tip.height", ".min(next");
         assert!(

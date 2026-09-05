@@ -1172,8 +1172,21 @@ mod tests {
                 },
             ));
         }
-        // The cycle itself, constructed rather than hoped for. Three claims at
-        // ONE height on competing forks, whose `as_of.hash` puts the watermark
+        // The cycle itself, CONSTRUCTED rather than hoped for -- and the
+        // construction is the whole test, so do not simplify it away.
+        //
+        // A first version of this test merely included a `ScannedTo` in the
+        // set and asserted transitivity. It passed with the bug restored, and
+        // therefore proved nothing. The reason is worth keeping: serde encodes
+        // a UNIT variant as a CBOR text string (major type 3) and a STRUCT
+        // variant as a map (major type 5), so with every earlier field equal
+        // the comparison reduces to that one leading byte and every
+        // `ScannedTo` sorts to the SAME side of every `ConfirmedOutput`. No
+        // interleaving, no cycle. The claims must be made to differ in an
+        // EARLIER field -- here `as_of.hash`, two competing forks at one
+        // height -- so the watermark lands between the two confirmations.
+        //
+        // Three claims at one height whose `as_of.hash` puts the watermark
         // between the two confirmations in canonical-byte order:
         //
         //   C1 < S  and  S < C2   by bytes (the shared-bucket path)
