@@ -460,14 +460,15 @@ async fn observe_once(
     // and a re-confirmation moments later would have the bridge assert both
     // about one outpoint at one identical `as_of`. See
     // `Observer::retraction_claims`.
-    let (mut next, orphaned) = obs.handle_reorg(store)?;
-    if next == 0 {
+    let mut reorg = obs.handle_reorg(store)?;
+    if reorg.resume_from == 0 {
         // First run: start from the current tip rather than scanning the whole
         // chain. History for a newly-watched script is a separate concern (see
         // `scantxoutset` in the deployment notes) and a full rescan on a pruned
         // node is not possible anyway.
-        next = tip.height;
+        reorg.resume_from = tip.height;
     }
+    let next = reorg.resume_from;
 
     // A tip entry for EVERY block scanned, not only the last.
     //
@@ -488,12 +489,7 @@ async fn observe_once(
     // but widen the bound when this round is going to retract something, so it
     // reaches the tip it will stamp those retractions with rather than leaving
     // blocks for the next round to contradict them from. See `scan_ceiling`.
-    let ceiling = bitcoin_freenet_bridge::observer::scan_ceiling(
-        next,
-        tip.height,
-        !orphaned.is_empty(),
-        obs.cfg.max_reorg_depth,
-    );
+    let ceiling = reorg.scan_ceiling(tip.height, obs.cfg.max_reorg_depth);
     for height in next..=ceiling {
         let hash = obs.chain.block_hash_at(height)?;
         let block = obs.chain.scan_block(&hash, &watched)?;
@@ -504,7 +500,7 @@ async fn observe_once(
 
     // Now that the rescan has said what is actually on the chain, retract only
     // what it did not find.
-    obs.retraction_claims(signer, &tip, &orphaned, &reconfirmed, &mut claims)?;
+    obs.retraction_claims(signer, &tip, &reorg.orphaned, &reconfirmed, &mut claims)?;
 
     // Re-publish payments that have now reached the configured depth, this
     // time with headers proving it.
@@ -851,6 +847,36 @@ async fn verify_address(
 
 #[cfg(test)]
 mod tests {
+    /// `observe_once` must take its ceiling from the reorg outcome.
+    ///
+    /// The behaviour lives in `ReorgOutcome::scan_ceiling`, which is tested
+    /// directly -- but `observe_once` needs a live bitcoind, so nothing
+    /// executes its call to it. Deleting that call, or going back to computing
+    /// a ceiling inline, left all 142 tests green. This is a source pin
+    /// precisely because the wiring is the part that cannot be run here; it is
+    /// weaker than a behavioural test and is not a substitute for one.
+    #[test]
+    fn observe_once_takes_its_ceiling_from_the_reorg_outcome() {
+        let src = include_str!("main.rs");
+        // The needles are assembled from fragments on purpose. `include_str!`
+        // pulls in THIS test too, so a needle written as one literal matches
+        // its own source and the pin passes whatever the call site says --
+        // which is how the first version of this test was itself inert.
+        let calls_it = concat!("reorg.scan", "_ceiling(tip.height");
+        let inline_ceiling = concat!("tip.height", ".min(next");
+        assert!(
+            src.contains(calls_it),
+            "observe_once no longer asks the ReorgOutcome for its ceiling, so a \
+             round that retracts may not scan as far as the tip it stamps those \
+             retractions with"
+        );
+        assert!(
+            !src.contains(inline_ceiling),
+            "the ceiling is being computed inline again, bypassing the widening \
+             that a retracting round depends on"
+        );
+    }
+
     use super::*;
 
     #[test]

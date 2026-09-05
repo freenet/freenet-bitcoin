@@ -85,6 +85,39 @@ pub fn scan_ceiling(next: u32, tip_height: u32, orphaned: bool, max_reorg_depth:
 /// paid — a retraction CANDIDATE, not yet a claim. See [`Observer::handle_reorg`].
 pub type OrphanedOutpoint = (Vec<u8>, OutPoint);
 
+/// What reorg handling decided about this round.
+///
+/// The two fields travel together because the round's scan ceiling DEPENDS on
+/// whether there is anything to retract: a round that will sign retractions
+/// must scan as far as the tip it stamps them with, or its own next round can
+/// contradict it at that same tip. Passing the resume height and the orphan
+/// list around as two loose values let a caller pair one with a ceiling
+/// computed from the other, and nothing failed when it did.
+///
+/// So the ceiling is a METHOD here, deriving the decision from
+/// [`ReorgOutcome::orphaned`] itself rather than from a `bool` a caller has to
+/// remember to pass. Same remedy as bundling paired `Option` fields: make the
+/// mismatch unrepresentable instead of testing for it.
+pub struct ReorgOutcome {
+    /// First block height this round should scan.
+    pub resume_from: u32,
+    /// Outpoints the reorg orphaned — retraction candidates, not yet claims.
+    pub orphaned: Vec<OrphanedOutpoint>,
+}
+
+impl ReorgOutcome {
+    /// The highest block this round must scan, widened when this round will
+    /// retract something. See [`scan_ceiling`].
+    pub fn scan_ceiling(&self, tip_height: u32, max_reorg_depth: u32) -> u32 {
+        scan_ceiling(
+            self.resume_from,
+            tip_height,
+            !self.orphaned.is_empty(),
+            max_reorg_depth,
+        )
+    }
+}
+
 /// What one round of observation produced, ready to publish.
 pub struct Observations {
     pub tip: BlockAnchor,
@@ -141,10 +174,13 @@ impl Observer {
     ///
     /// So the caller rescans first and then calls [`Observer::retraction_claims`]
     /// with what the rescan actually found.
-    pub fn handle_reorg(&self, store: &Store) -> Result<(u32, Vec<OrphanedOutpoint>)> {
+    pub fn handle_reorg(&self, store: &Store) -> Result<ReorgOutcome> {
         let Some(checkpoint) = store.checkpoint(self.cfg.network)? else {
             // Nothing recorded yet, so nothing can have been orphaned.
-            return Ok((0, Vec::new()));
+            return Ok(ReorgOutcome {
+                resume_from: 0,
+                orphaned: Vec::new(),
+            });
         };
 
         // Cheap path: the block we last recorded is still the node's block at
@@ -159,7 +195,10 @@ impl Observer {
             })
             .unwrap_or(false);
         if still_current {
-            return Ok((checkpoint.height + 1, Vec::new()));
+            return Ok(ReorgOutcome {
+                resume_from: checkpoint.height + 1,
+                orphaned: Vec::new(),
+            });
         }
 
         let fork =
@@ -190,7 +229,10 @@ impl Observer {
 
         store.unconfirm_above(self.cfg.network, fork)?;
         store.forget_blocks_above(self.cfg.network, fork)?;
-        Ok((fork + 1, orphaned))
+        Ok(ReorgOutcome {
+            resume_from: fork + 1,
+            orphaned,
+        })
     }
 
     /// Sign a `Retracted` claim for every orphaned outpoint the round's rescan
@@ -533,6 +575,40 @@ mod tests {
             .get(script)
             .map(|v| v.iter().map(|c| c.body().unwrap()).collect())
             .unwrap_or_default()
+    }
+
+    /// The wiring, not just the arithmetic.
+    ///
+    /// `scan_ceiling`'s own tests prove the formula. They do NOT prove that a
+    /// round which is going to retract something actually asks for the wider
+    /// window -- that lived in a single argument at the call site, and deleting
+    /// it left every test green. This exercises the decision through the type
+    /// that owns both halves, so flipping it fails here.
+    #[test]
+    fn a_round_holding_retractions_widens_its_own_ceiling() {
+        let tip = 1_000;
+        let resume_from = tip - 60;
+
+        let will_retract = ReorgOutcome {
+            resume_from,
+            orphaned: vec![(b"spk".to_vec(), outpoint(1, 0))],
+        };
+        assert_eq!(
+            will_retract.scan_ceiling(tip, 100),
+            tip,
+            "a round that will sign retractions must scan as far as the tip it \
+             stamps them with"
+        );
+
+        let nothing_to_retract = ReorgOutcome {
+            resume_from,
+            orphaned: Vec::new(),
+        };
+        assert_eq!(
+            nothing_to_retract.scan_ceiling(tip, 100),
+            resume_from + ROUND_SCAN_BLOCKS,
+            "with nothing to contradict, the ordinary cap still applies"
+        );
     }
 
     /// A round that retracts must have scanned as far as the tip it stamps the
