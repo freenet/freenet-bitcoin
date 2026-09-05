@@ -628,12 +628,31 @@ pub fn attested_depth(anchor: &BlockAnchor, as_of: &BlockAnchor) -> u32 {
 /// * [`Claim::ConfirmedOutput`] grants a value at a depth an application may
 ///   settle on — the only claim whose acceptance can move money.
 ///
-/// [`Claim::ScannedTo`] is not about an outpoint and never reaches the fold.
+/// [`Claim::ScannedTo`] is not about an outpoint at all, and
+/// [`fold_outpoint_status`] filters it before the comparator ever sees it. It
+/// still gets its OWN rank rather than sharing one, and that is load-bearing
+/// rather than tidiness: sharing a rank with `ConfirmedOutput` made the order
+/// **intransitive**, because two claims in one rank bucket that are not the
+/// same variant fall through level 3 to the byte tiebreak while two
+/// `ConfirmedOutput`s are ordered by amount, so `C1 < S < C2 < C1` was
+/// constructible. A `sort_by` or `max_by` on an intransitive comparator is
+/// undefined behaviour in `slice::sort`. With every variant in its own bucket,
+/// level 3 can only ever compare same-variant pairs and transitivity is
+/// structural — the comparator is sound on its own terms rather than sound
+/// because of a filter one function away.
 const fn concession_rank(claim: &Claim) -> u8 {
     match claim {
-        Claim::Retracted { .. } => 2,
-        Claim::MempoolOutput { .. } => 1,
-        Claim::ConfirmedOutput { .. } | Claim::ScannedTo => 0,
+        Claim::Retracted { .. } => 3,
+        Claim::MempoolOutput { .. } => 2,
+        Claim::ConfirmedOutput { .. } => 1,
+        // Lowest, so that AT A GIVEN `as_of` a watermark never outranks a
+        // real assertion. Note what that does NOT say: `as_of.height` is the
+        // primary key and is compared first, so a watermark at a later height
+        // still sorts above an earlier real claim. The filter in
+        // `fold_outpoint_status` is the actual guarantee that a watermark
+        // never wins; this rank narrows the damage, and returning `None`
+        // rather than panicking bounds what is left.
+        Claim::ScannedTo => 0,
     }
 }
 
@@ -680,9 +699,14 @@ fn claim_precedence(a: &ClaimBody, b: &ClaimBody) -> core::cmp::Ordering {
             _ => core::cmp::Ordering::Equal,
         })
         // Serialization of a `ClaimBody` into a `Vec` cannot fail: there is no
-        // map with non-string keys, no float, and no writer that can error.
-        // `unwrap_or_default` is a total-function formality, and it stays
-        // deterministic if it ever fires, because both sides take the same path.
+        // map with non-string keys, no float, and no writer that can error. So
+        // `unwrap_or_default` is a total-function formality.
+        //
+        // It is NOT a safe fallback and must not be read as one. If both sides
+        // ever failed, both would be empty, distinct claims would compare
+        // `Equal`, and the winner would once again be whichever the iterator
+        // reached first -- precisely the defect this order exists to remove.
+        // What makes the order total is the impossibility above, not this arm.
         .then_with(|| {
             to_cbor(a)
                 .unwrap_or_default()
@@ -749,19 +773,24 @@ where
         }
     }
 
-    best.map(|c| match &c.claim {
-        Claim::MempoolOutput { value_sats, .. } => OutpointStatus::Unconfirmed {
+    best.and_then(|c| match &c.claim {
+        Claim::MempoolOutput { value_sats, .. } => Some(OutpointStatus::Unconfirmed {
             value_sats: *value_sats,
-        },
+        }),
         Claim::ConfirmedOutput {
             value_sats, anchor, ..
-        } => OutpointStatus::Confirmed {
+        } => Some(OutpointStatus::Confirmed {
             value_sats: *value_sats,
             anchor: *anchor,
             attested_depth: attested_depth(anchor, &c.as_of),
-        },
-        Claim::Retracted { .. } => OutpointStatus::Retracted,
-        Claim::ScannedTo => unreachable!("ScannedTo filtered above"),
+        }),
+        Claim::Retracted { .. } => Some(OutpointStatus::Retracted),
+        // Filtered above, so this is unreachable -- but expressed as "no
+        // status" rather than `unreachable!`. A watermark says nothing about
+        // any outpoint, so `None` is its honest fold result, and a contract
+        // panics by aborting: a soundness argument that ends in a panic is
+        // worth less than one that ends in the right answer.
+        Claim::ScannedTo => None,
     })
 }
 
@@ -1077,6 +1106,195 @@ mod tests {
         let statuses = fold_claims_by_outpoint([&a]);
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[&op()].confirmations_at(999), 1);
+    }
+
+    /// `claim_precedence` must be a total order ON ITS OWN TERMS.
+    ///
+    /// Its doc comment claims three properties, and every one of them was
+    /// asserted before it was checked. Sharing a rank between `ScannedTo` and
+    /// `ConfirmedOutput` made the order INTRANSITIVE: two claims in one bucket
+    /// that are not the same variant fall through level 3 to the byte
+    /// tiebreak, while two `ConfirmedOutput`s are ordered by amount, so
+    /// `C1 < S < C2 < C1` was constructible. It was unreachable only because
+    /// `fold_outpoint_status` filters `ScannedTo` one function away -- and a
+    /// `sort_by` or `max_by` on an intransitive comparator is undefined
+    /// behaviour in `slice::sort`, so the next caller to reuse this without
+    /// that filter would have got it.
+    ///
+    /// So this checks the comparator directly, INCLUDING `ScannedTo`, rather
+    /// than through the fold that hides it.
+    #[test]
+    fn claim_precedence_is_a_total_order_including_scanned_to() {
+        use core::cmp::Ordering;
+
+        let mut set = vec![
+            claim(100, Claim::ScannedTo),
+            claim(100, Claim::Retracted { outpoint: op() }),
+            claim(
+                100,
+                Claim::MempoolOutput {
+                    outpoint: op(),
+                    value_sats: 7,
+                },
+            ),
+            claim(
+                100,
+                Claim::MempoolOutput {
+                    outpoint: op(),
+                    value_sats: 50_000,
+                },
+            ),
+            claim(101, Claim::ScannedTo),
+            claim(99, Claim::Retracted { outpoint: op() }),
+        ];
+        // Several confirmations at one anchor differing only in amount: the
+        // level-3 rule that made the shared bucket intransitive.
+        for value in [1u64, 7, 50_000, u64::MAX] {
+            set.push(claim(
+                100,
+                Claim::ConfirmedOutput {
+                    outpoint: op(),
+                    value_sats: value,
+                    anchor: anchor(100, 1),
+                    spv: any_spv(),
+                },
+            ));
+        }
+        // ... and at differing anchors, so level 3's depth rule is exercised.
+        for height in [98u32, 99, 100] {
+            set.push(claim(
+                100,
+                Claim::ConfirmedOutput {
+                    outpoint: op(),
+                    value_sats: 7,
+                    anchor: anchor(height, 2),
+                    spv: any_spv(),
+                },
+            ));
+        }
+        // The cycle itself, constructed rather than hoped for. Three claims at
+        // ONE height on competing forks, whose `as_of.hash` puts the watermark
+        // between the two confirmations in canonical-byte order:
+        //
+        //   C1 < S  and  S < C2   by bytes (the shared-bucket path)
+        //   C2 < C1               by amount (the same-variant path)
+        //
+        // which is `C1 < S < C2 < C1`. Level 3 discriminates only same-variant
+        // pairs, so while `ScannedTo` shared a rank with `ConfirmedOutput` the
+        // two paths disagreed and the order was intransitive.
+        let cycle_c1 = ClaimBody {
+            as_of: anchor(100, 1),
+            ..claim(
+                100,
+                Claim::ConfirmedOutput {
+                    outpoint: op(),
+                    // Smaller amount, so C1 beats C2 at level 3.
+                    value_sats: 1,
+                    anchor: anchor(100, 1),
+                    spv: any_spv(),
+                },
+            )
+        };
+        let cycle_s = ClaimBody {
+            as_of: anchor(100, 5),
+            ..claim(100, Claim::ScannedTo)
+        };
+        let cycle_c2 = ClaimBody {
+            as_of: anchor(100, 9),
+            ..claim(
+                100,
+                Claim::ConfirmedOutput {
+                    outpoint: op(),
+                    value_sats: 50_000,
+                    anchor: anchor(100, 9),
+                    spv: any_spv(),
+                },
+            )
+        };
+        set.push(cycle_c1);
+        set.push(cycle_s);
+        set.push(cycle_c2);
+
+        // A duplicate, so the reflexive/equal case is covered by real data.
+        set.push(set[0].clone());
+
+        for a in &set {
+            assert_eq!(
+                claim_precedence(a, a),
+                Ordering::Equal,
+                "a comparator must be reflexive"
+            );
+            for b in &set {
+                // Antisymmetry.
+                assert_eq!(
+                    claim_precedence(a, b),
+                    claim_precedence(b, a).reverse(),
+                    "asymmetry broken"
+                );
+                // `Equal` only for claims that really are identical -- the
+                // property that makes the fold a function of the SET. If two
+                // distinct claims compared Equal, the max-scan would keep
+                // whichever it reached first.
+                if claim_precedence(a, b) == Ordering::Equal {
+                    assert_eq!(
+                        to_cbor(a).unwrap(),
+                        to_cbor(b).unwrap(),
+                        "distinct claims must never compare Equal"
+                    );
+                }
+                for c in &set {
+                    // Transitivity, over every ordered triple.
+                    if claim_precedence(a, b) == Ordering::Less
+                        && claim_precedence(b, c) == Ordering::Less
+                    {
+                        assert_eq!(
+                            claim_precedence(a, c),
+                            Ordering::Less,
+                            "intransitive: a < b < c but not a < c"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Sorting is then well-defined, and agrees with the fold's max-scan
+        // however the input was arranged.
+        let mut ascending = set.iter().collect::<Vec<_>>();
+        ascending.sort_by(|x, y| claim_precedence(x, y));
+        let winner = *ascending.last().unwrap();
+        let mut reversed = set.clone();
+        reversed.reverse();
+        assert_eq!(
+            fold_outpoint_status(set.iter().filter(|c| !matches!(c.claim, Claim::ScannedTo))),
+            fold_outpoint_status(
+                reversed
+                    .iter()
+                    .filter(|c| !matches!(c.claim, Claim::ScannedTo))
+            )
+        );
+        // What the low rank actually buys, stated no more strongly than it is
+        // true: among claims at ONE `as_of`, a watermark never wins. Across
+        // heights it can, because `as_of.height` is compared first -- which is
+        // why the filter in `fold_outpoint_status`, not this rank, is what
+        // guarantees a watermark never becomes an `OutpointStatus`.
+        let at_one_height: Vec<&ClaimBody> = set.iter().filter(|c| c.as_of.height == 100).collect();
+        let top = at_one_height
+            .iter()
+            .copied()
+            .max_by(|x, y| claim_precedence(x, y))
+            .unwrap();
+        assert!(
+            !matches!(top.claim, Claim::ScannedTo),
+            "at one anchor a watermark must never outrank a real assertion"
+        );
+        // And the winner overall may indeed be a watermark, by height alone.
+        assert!(matches!(winner.claim, Claim::ScannedTo));
+    }
+
+    /// A watermark reaching the fold yields no status, rather than aborting.
+    #[test]
+    fn a_scanned_to_only_claim_set_folds_to_nothing() {
+        assert_eq!(fold_outpoint_status([&claim(100, Claim::ScannedTo)]), None);
     }
 
     /// The tie the anchor-hash rule left unbroken.
