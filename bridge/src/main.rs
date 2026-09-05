@@ -484,8 +484,16 @@ async fn observe_once(
     // Outpoints this round's rescan confirmed, so a reorged output that was
     // re-mined is not also retracted at the same `as_of`.
     let mut reconfirmed = std::collections::HashSet::new();
-    // Bound the work per round so a long catch-up cannot starve the service.
-    let ceiling = tip.height.min(next.saturating_add(50));
+    // Bound the work per round so a long catch-up cannot starve the service --
+    // but widen the bound when this round is going to retract something, so it
+    // reaches the tip it will stamp those retractions with rather than leaving
+    // blocks for the next round to contradict them from. See `scan_ceiling`.
+    let ceiling = bitcoin_freenet_bridge::observer::scan_ceiling(
+        next,
+        tip.height,
+        !orphaned.is_empty(),
+        obs.cfg.max_reorg_depth,
+    );
     for height in next..=ceiling {
         let hash = obs.chain.block_hash_at(height)?;
         let block = obs.chain.scan_block(&hash, &watched)?;

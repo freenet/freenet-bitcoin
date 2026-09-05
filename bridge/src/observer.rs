@@ -45,6 +45,42 @@ pub struct Observer {
 /// Claims produced by processing a block, grouped by the script they concern.
 pub type ClaimsByScript = HashMap<Vec<u8>, Vec<SignedClaim>>;
 
+/// Blocks an ordinary round will scan, so a long catch-up cannot starve the
+/// request service behind it.
+pub const ROUND_SCAN_BLOCKS: u32 = 50;
+
+/// The highest block this round should scan.
+///
+/// # Why a reorg round gets a bigger window
+///
+/// A round that signs a retraction without having scanned as far as the tip
+/// it stamps that retraction with can be contradicted by its own next round.
+/// The orphaned transaction is usually re-mined in the replacement chain, and
+/// if it lands above this ceiling the retraction goes out at `tip` now and the
+/// re-confirmation goes out at the SAME `tip` seconds later, because Bitcoin
+/// blocks are ten minutes apart and rounds are two seconds apart. That pair is
+/// the contradiction `fold_outpoint_status` has to resolve, and it resolves it
+/// conservatively — so a real payment reads as retracted.
+///
+/// A reorg forks at most `max_reorg_depth` below the checkpoint, so a window of
+/// `ROUND_SCAN_BLOCKS + max_reorg_depth` reaches the tip whenever the bridge
+/// was within one ordinary round of it. That is the whole of the guarantee:
+/// pinned by `a_reorg_round_reaches_the_tip_from_up_to_one_round_behind`, and
+/// deliberately NOT claimed for a bridge further behind than that (see the
+/// residual documented on [`Observer::retraction_claims`]).
+///
+/// `orphaned` rather than "a reorg happened": a reorg that orphaned no watched
+/// output signs no retraction, so it has nothing to contradict and does not
+/// need the wider window.
+pub fn scan_ceiling(next: u32, tip_height: u32, orphaned: bool, max_reorg_depth: u32) -> u32 {
+    let window = if orphaned {
+        ROUND_SCAN_BLOCKS.saturating_add(max_reorg_depth)
+    } else {
+        ROUND_SCAN_BLOCKS
+    };
+    tip_height.min(next.saturating_add(window))
+}
+
 /// An outpoint a reorg took off the bridge's best chain, with the script it
 /// paid — a retraction CANDIDATE, not yet a claim. See [`Observer::handle_reorg`].
 pub type OrphanedOutpoint = (Vec<u8>, OutPoint);
@@ -179,15 +215,28 @@ impl Observer {
     ///
     /// # The residual this does NOT close
     ///
-    /// The rescan is capped per round, so a reorg deeper than the round's
-    /// window can leave the re-mined block unscanned; the retraction is signed
-    /// this round and the re-confirmation next round, and if no new block has
-    /// arrived in between both carry the same `as_of`. The fold then reads the
-    /// payment as retracted until the next block re-confirms it — a stall,
-    /// fail-closed, and self-clearing. Closing it entirely would mean deferring
-    /// retractions across rounds, which delays the one claim that is safe to be
-    /// early. Nothing here can bound what an ATTACKER assembles from claims
-    /// signed in different rounds anyway; that is `fold_outpoint_status`'s job.
+    /// The suppression only sees what THIS round scanned, so it depends on the
+    /// round having reached the tip it stamps retractions with. [`scan_ceiling`]
+    /// guarantees that while the bridge is within one ordinary round of the
+    /// tip, which covers a reorg of any depth up to `max_reorg_depth` on a
+    /// healthy bridge. It does NOT cover a bridge that is further behind than
+    /// that — down for hours, say — where a reorg at its checkpoint whose
+    /// transaction was re-mined beyond the round's window still splits the pair
+    /// across two rounds carrying one tip.
+    ///
+    /// That residual is not self-clearing, which is the part worth knowing. The
+    /// re-confirmation and the retraction tie, the fold reads the payment as
+    /// retracted, and if the output has by then reached `deep_confirmations`
+    /// depth the ladder marks it complete and the bridge never speaks about that
+    /// outpoint again — so it reads retracted permanently. It fails closed (a
+    /// real payment reads unpaid; nobody is paid for money that is not on the
+    /// chain) and no third party can induce it, since it needs the bridge's own
+    /// downtime. Closing it entirely needs cross-round memory of which anchors
+    /// have already been retracted at, which is a schema change and is not done
+    /// here.
+    ///
+    /// Nothing here can bound what an ATTACKER assembles from claims signed in
+    /// different rounds anyway; that is `fold_outpoint_status`'s job.
     pub fn retraction_claims(
         &self,
         signer: &Signer,
@@ -484,6 +533,62 @@ mod tests {
             .get(script)
             .map(|v| v.iter().map(|c| c.body().unwrap()).collect())
             .unwrap_or_default()
+    }
+
+    /// A round that retracts must have scanned as far as the tip it stamps the
+    /// retraction with, or the blocks it skipped can re-confirm the outpoint at
+    /// that very same tip in the next round.
+    #[test]
+    fn a_reorg_round_scans_all_the_way_to_the_tip() {
+        let max_reorg = 100;
+        let tip = 1_000;
+        // Caught up, so a reorg forks at most `max_reorg_depth` below the tip.
+        for depth in 1..=max_reorg {
+            let next = tip - depth + 1;
+            assert_eq!(
+                scan_ceiling(next, tip, true, max_reorg),
+                tip,
+                "a reorg {depth} deep left blocks unscanned below the tip"
+            );
+        }
+    }
+
+    /// The guarantee stated precisely: it holds while the bridge is no more
+    /// than one ordinary round behind the tip, and is not claimed beyond that.
+    #[test]
+    fn a_reorg_round_reaches_the_tip_from_up_to_one_round_behind() {
+        let max_reorg = 100;
+        let tip = 10_000;
+        for lag in 0..=ROUND_SCAN_BLOCKS {
+            for depth in 1..=max_reorg {
+                let next = tip - lag - depth + 1;
+                assert_eq!(
+                    scan_ceiling(next, tip, true, max_reorg),
+                    tip,
+                    "lag {lag}, reorg depth {depth}"
+                );
+            }
+        }
+        // Further behind than that, the round is bounded again and the residual
+        // on `retraction_claims` applies.
+        let next = tip - ROUND_SCAN_BLOCKS - max_reorg - 1;
+        assert!(scan_ceiling(next, tip, true, max_reorg) < tip);
+    }
+
+    /// An ordinary round stays capped, so a long catch-up cannot starve the
+    /// request service running beside it.
+    #[test]
+    fn an_ordinary_round_is_still_bounded_by_one_window() {
+        assert_eq!(
+            scan_ceiling(100, 10_000, false, 100),
+            100 + ROUND_SCAN_BLOCKS
+        );
+        // Never past the tip, however wide the window.
+        assert_eq!(scan_ceiling(100, 120, false, 100), 120);
+        assert_eq!(scan_ceiling(100, 120, true, 100), 120);
+        // A tip below `next` (nothing to scan) must not wrap.
+        assert_eq!(scan_ceiling(200, 100, true, 100), 100);
+        assert_eq!(scan_ceiling(u32::MAX - 1, u32::MAX, true, 100), u32::MAX);
     }
 
     /// The pair the bridge must never sign.
