@@ -236,6 +236,21 @@ bridge rescans and converges to the same contract state, because claims are
 keyed by digest and re-publishing one the network already holds is a no-op. The
 cost of losing it is bandwidth, never correctness.
 
+**One row is not like the others: `pointer_versions`.** A generation pointer is
+accepted only if it supersedes the record already published, so its version
+counter must be monotonic across restarts. Deleted along with everything else,
+that counter restarts at 1, every write is refused as stale, and the pointer
+silently freezes at whatever generation it last named — pointing every reader
+at contracts the bridge no longer writes to. That is the failure the pointer
+exists to prevent, reintroduced by following the paragraph above.
+
+The bridge handles this itself and needs no special procedure: before writing,
+it reads the standing record back off the network and adopts its version
+whenever that record verifies under the bridge's own key. So deleting the
+database is still safe. It is called out because the reasoning is not obvious
+from the sentence above it, and because anyone tempted to "simplify" that
+read-back would be removing the only thing that makes this paragraph true.
+
 Restart safety comes from the chain checkpoint plus recorded block hashes. On
 start the bridge compares its recorded hash at the checkpoint height with what
 the node reports there now; a mismatch means a reorg happened while it was
