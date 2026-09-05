@@ -453,7 +453,14 @@ async fn observe_once(
     let mut claims: ClaimsByScript = HashMap::new();
 
     // Reorg first: a reorg invalidates the range we were about to scan.
-    let mut next = obs.handle_reorg(store, signer, &tip, &mut claims)?;
+    //
+    // This yields retraction CANDIDATES rather than signed retractions,
+    // because the rescan below usually puts the orphaned transactions straight
+    // back on the chain in the replacement blocks. Signing a retraction now
+    // and a re-confirmation moments later would have the bridge assert both
+    // about one outpoint at one identical `as_of`. See
+    // `Observer::retraction_claims`.
+    let (mut next, orphaned) = obs.handle_reorg(store)?;
     if next == 0 {
         // First run: start from the current tip rather than scanning the whole
         // chain. History for a newly-watched script is a separate concern (see
@@ -474,15 +481,22 @@ async fn observe_once(
     // Bounded by construction: the state prunes to TIP_RETAIN, the round
     // scans at most 50 blocks, and an entry is about 150 bytes.
     let mut tip_entries = Vec::new();
+    // Outpoints this round's rescan confirmed, so a reorged output that was
+    // re-mined is not also retracted at the same `as_of`.
+    let mut reconfirmed = std::collections::HashSet::new();
     // Bound the work per round so a long catch-up cannot starve the service.
     let ceiling = tip.height.min(next.saturating_add(50));
     for height in next..=ceiling {
         let hash = obs.chain.block_hash_at(height)?;
         let block = obs.chain.scan_block(&hash, &watched)?;
-        obs.claims_from_block(store, signer, &block, &tip, &mut claims)?;
+        obs.claims_from_block(store, signer, &block, &tip, &mut claims, &mut reconfirmed)?;
         tip_entries.push(obs.tip_entry(signer, &block)?);
         store.set_checkpoint(obs.network(), &block.anchor)?;
     }
+
+    // Now that the rescan has said what is actually on the chain, retract only
+    // what it did not find.
+    obs.retraction_claims(signer, &tip, &orphaned, &reconfirmed, &mut claims)?;
 
     // Re-publish payments that have now reached the configured depth, this
     // time with headers proving it.

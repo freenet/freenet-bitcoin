@@ -23,12 +23,12 @@
 //! lets Bitcoin's non-monotonic chain live inside Freenet's requirement that
 //! state converge under an idempotent merge.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use freenet_bitcoin_common::{
     BitcoinAddressParameters, BitcoinNetwork, BitcoinTipParameters, BlockAnchor, BridgeId, Claim,
-    ClaimBody, ScriptId, SignedClaim, SignedTipEntry, TipEntryBody,
+    ClaimBody, OutPoint, ScriptId, SignedClaim, SignedTipEntry, TipEntryBody,
 };
 
 use crate::chain::{ChainClient, ScannedBlock};
@@ -44,6 +44,10 @@ pub struct Observer {
 
 /// Claims produced by processing a block, grouped by the script they concern.
 pub type ClaimsByScript = HashMap<Vec<u8>, Vec<SignedClaim>>;
+
+/// An outpoint a reorg took off the bridge's best chain, with the script it
+/// paid — a retraction CANDIDATE, not yet a claim. See [`Observer::handle_reorg`].
+pub type OrphanedOutpoint = (Vec<u8>, OutPoint);
 
 /// What one round of observation produced, ready to publish.
 pub struct Observations {
@@ -80,22 +84,31 @@ impl Observer {
         }
     }
 
-    /// Detect and handle a reorg, returning the height to resume scanning from.
+    /// Detect and handle a reorg, returning the height to resume scanning from
+    /// and the outpoints the reorg orphaned.
     ///
     /// A reorg is detected by comparing the hash we recorded at a height with
     /// the hash the node reports there now. Everything above the fork point is
-    /// orphaned: those outputs get a `Retracted` claim stamped with the CURRENT
-    /// tip, so it supersedes the earlier confirmation in every reader's fold.
-    pub fn handle_reorg(
-        &self,
-        store: &Store,
-        signer: &Signer,
-        tip: &BlockAnchor,
-        claims: &mut ClaimsByScript,
-    ) -> Result<u32> {
+    /// orphaned.
+    ///
+    /// # Why this returns candidates instead of signing retractions
+    ///
+    /// A retraction says "as of `as_of`, this outpoint is not on my best
+    /// chain", and at the moment a reorg is detected the bridge does not yet
+    /// know that: the usual outcome of a reorg is that the orphaned
+    /// transactions are re-mined in the replacement blocks, which this same
+    /// round is about to rescan. Signing here would put a `Retracted` and a
+    /// fresh `ConfirmedOutput` for one outpoint at one identical `as_of` into
+    /// the same round's output — a contradiction the bridge would have signed
+    /// itself, and one no fold can resolve back into the truth, only into a
+    /// safe answer.
+    ///
+    /// So the caller rescans first and then calls [`Observer::retraction_claims`]
+    /// with what the rescan actually found.
+    pub fn handle_reorg(&self, store: &Store) -> Result<(u32, Vec<OrphanedOutpoint>)> {
         let Some(checkpoint) = store.checkpoint(self.cfg.network)? else {
             // Nothing recorded yet, so nothing can have been orphaned.
-            return Ok(0);
+            return Ok((0, Vec::new()));
         };
 
         // Cheap path: the block we last recorded is still the node's block at
@@ -110,7 +123,7 @@ impl Observer {
             })
             .unwrap_or(false);
         if still_current {
-            return Ok(checkpoint.height + 1);
+            return Ok((checkpoint.height + 1, Vec::new()));
         }
 
         let fork =
@@ -125,32 +138,94 @@ impl Observer {
             "reorg detected; retracting orphaned observations"
         );
 
-        for (script, txid, vout) in store.outputs_above(self.cfg.network, fork)? {
-            let body = ClaimBody {
-                script_id: ScriptId::compute(self.cfg.network, &script),
-                network: self.cfg.network,
-                // Stamped with the CURRENT tip so it outranks the confirmation
-                // it supersedes. Using the orphaned block's height instead
-                // would produce a retraction that loses the fold.
-                as_of: *tip,
-                claim: Claim::Retracted {
-                    outpoint: freenet_bitcoin_common::OutPoint {
+        let orphaned: Vec<OrphanedOutpoint> = store
+            .outputs_above(self.cfg.network, fork)?
+            .into_iter()
+            .map(|(script, txid, vout)| {
+                (
+                    script,
+                    OutPoint {
                         txid: freenet_bitcoin_common::Txid(txid),
                         vout,
                     },
+                )
+            })
+            .collect();
+
+        store.unconfirm_above(self.cfg.network, fork)?;
+        store.forget_blocks_above(self.cfg.network, fork)?;
+        Ok((fork + 1, orphaned))
+    }
+
+    /// Sign a `Retracted` claim for every orphaned outpoint the round's rescan
+    /// did NOT put back on the chain.
+    ///
+    /// Stamped with the CURRENT tip so it outranks the confirmation it
+    /// supersedes; using the orphaned block's height instead would produce a
+    /// retraction that loses the fold.
+    ///
+    /// # The suppression is the point
+    ///
+    /// `reconfirmed` holds the outpoints this round's rescan found in the
+    /// replacement blocks, and those get a `ConfirmedOutput` stamped with the
+    /// same tip. Retracting them as well would have the bridge assert, in one
+    /// signature-set at one chain position, both that the outpoint is on its
+    /// best chain and that it is not. Beyond being false, it hands a third
+    /// party a pair of genuinely-signed contradictory claims to submit
+    /// selectively. The fold resolves such a pair safely
+    /// (`fold_outpoint_status` prefers the claim granting less) but "safely"
+    /// there means the payment reads as retracted, so an honestly re-mined
+    /// payment would stall until the next block.
+    ///
+    /// # The residual this does NOT close
+    ///
+    /// The rescan is capped per round, so a reorg deeper than the round's
+    /// window can leave the re-mined block unscanned; the retraction is signed
+    /// this round and the re-confirmation next round, and if no new block has
+    /// arrived in between both carry the same `as_of`. The fold then reads the
+    /// payment as retracted until the next block re-confirms it — a stall,
+    /// fail-closed, and self-clearing. Closing it entirely would mean deferring
+    /// retractions across rounds, which delays the one claim that is safe to be
+    /// early. Nothing here can bound what an ATTACKER assembles from claims
+    /// signed in different rounds anyway; that is `fold_outpoint_status`'s job.
+    pub fn retraction_claims(
+        &self,
+        signer: &Signer,
+        tip: &BlockAnchor,
+        orphaned: &[OrphanedOutpoint],
+        reconfirmed: &HashSet<OutPoint>,
+        claims: &mut ClaimsByScript,
+    ) -> Result<()> {
+        for (script, outpoint) in orphaned {
+            if reconfirmed.contains(outpoint) {
+                tracing::info!(
+                    network = ?self.cfg.network,
+                    txid = %outpoint.txid.to_display_string(),
+                    vout = outpoint.vout,
+                    "reorged output was re-mined in the replacement chain; not retracting"
+                );
+                continue;
+            }
+            let body = ClaimBody {
+                script_id: ScriptId::compute(self.cfg.network, script),
+                network: self.cfg.network,
+                as_of: *tip,
+                claim: Claim::Retracted {
+                    outpoint: *outpoint,
                 },
             };
             let signed = SignedClaim::sign(signer.key(), &body)
                 .map_err(|e| anyhow::anyhow!("signing retraction: {e}"))?;
-            claims.entry(script).or_default().push(signed);
+            claims.entry(script.clone()).or_default().push(signed);
         }
-
-        store.unconfirm_above(self.cfg.network, fork)?;
-        store.forget_blocks_above(self.cfg.network, fork)?;
-        Ok(fork + 1)
+        Ok(())
     }
 
     /// Turn a scanned block into claims and record what we saw.
+    ///
+    /// Every outpoint confirmed here is added to `confirmed`, which
+    /// [`Observer::retraction_claims`] uses to suppress the retraction of an
+    /// output a reorg orphaned and this same rescan put back.
     pub fn claims_from_block(
         &self,
         store: &Store,
@@ -158,6 +233,7 @@ impl Observer {
         block: &ScannedBlock,
         tip: &BlockAnchor,
         claims: &mut ClaimsByScript,
+        confirmed: &mut HashSet<OutPoint>,
     ) -> Result<()> {
         store.record_block(self.cfg.network, block.anchor.height, &block.anchor.hash)?;
 
@@ -185,15 +261,17 @@ impl Observer {
                 header: block.header,
                 following_headers: vec![],
             };
+            let outpoint = OutPoint {
+                txid: found.txid,
+                vout: found.vout,
+            };
+            confirmed.insert(outpoint);
             let body = ClaimBody {
                 script_id: ScriptId::compute(self.cfg.network, &found.script_pubkey),
                 network: self.cfg.network,
                 as_of: *tip,
                 claim: Claim::ConfirmedOutput {
-                    outpoint: freenet_bitcoin_common::OutPoint {
-                        txid: found.txid,
-                        vout: found.vout,
-                    },
+                    outpoint,
                     value_sats: found.value_sats,
                     anchor: block.anchor,
                     spv,
@@ -372,6 +450,160 @@ impl Observer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freenet_bitcoin_common::{BlockHash, OutpointStatus, Txid};
+
+    /// An observer whose chain client is never used.
+    ///
+    /// `bitcoincore_rpc::Client::new` builds a transport rather than opening a
+    /// connection, so this contacts nothing; the tests below only exercise
+    /// `retraction_claims`, which touches neither the chain nor the store.
+    fn observer() -> Observer {
+        Observer::new(NetworkConfig {
+            network: BitcoinNetwork::Signet,
+            rpc_url: "http://127.0.0.1:1".into(),
+            rpc_cookie_path: None,
+            rpc_user: Some("u".into()),
+            rpc_password: Some("p".into()),
+            deep_confirmations: 6,
+            max_reorg_depth: 100,
+            always_watch: Vec::new(),
+            demo_backfill_blocks: 144,
+        })
+        .expect("the RPC client is lazy, so no node is contacted")
+    }
+
+    fn outpoint(seed: u8, vout: u32) -> OutPoint {
+        OutPoint {
+            txid: Txid([seed; 32]),
+            vout,
+        }
+    }
+
+    fn bodies(claims: &ClaimsByScript, script: &[u8]) -> Vec<ClaimBody> {
+        claims
+            .get(script)
+            .map(|v| v.iter().map(|c| c.body().unwrap()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The pair the bridge must never sign.
+    ///
+    /// A reorg orphans an output and the same round's rescan finds it re-mined
+    /// in the replacement chain. Both the retraction and the re-confirmation
+    /// are stamped with the round's tip, so they would land at an IDENTICAL
+    /// `as_of` — a contradiction the bridge signed itself, and one a third
+    /// party could then submit selectively.
+    #[test]
+    fn an_output_re_mined_in_the_same_round_is_not_also_retracted() {
+        let obs = observer();
+        let dir = tempfile::tempdir().unwrap();
+        let signer = Signer::load_or_create(&dir.path().join("key")).unwrap();
+        let tip = BlockAnchor {
+            height: 105,
+            hash: BlockHash([7; 32]),
+        };
+        let script = b"spk".to_vec();
+        let re_mined = outpoint(1, 0);
+        let really_gone = outpoint(2, 1);
+
+        // What the rescan produced for the re-mined output, exactly as
+        // `claims_from_block` builds it.
+        let mut claims = ClaimsByScript::new();
+        let confirmation = ClaimBody {
+            script_id: ScriptId::compute(BitcoinNetwork::Signet, &script),
+            network: BitcoinNetwork::Signet,
+            as_of: tip,
+            claim: Claim::ConfirmedOutput {
+                outpoint: re_mined,
+                value_sats: 50_000,
+                anchor: BlockAnchor {
+                    height: 104,
+                    hash: BlockHash([8; 32]),
+                },
+                spv: freenet_bitcoin_common::spv::testing::payment_proof(&[0x51], 1, 1, [0xaa; 32])
+                    .0,
+            },
+        };
+        claims
+            .entry(script.clone())
+            .or_default()
+            .push(SignedClaim::sign(signer.key(), &confirmation).unwrap());
+        let mut reconfirmed = HashSet::new();
+        reconfirmed.insert(re_mined);
+
+        obs.retraction_claims(
+            &signer,
+            &tip,
+            &[(script.clone(), re_mined), (script.clone(), really_gone)],
+            &reconfirmed,
+            &mut claims,
+        )
+        .unwrap();
+
+        let signed = bodies(&claims, &script);
+        let retracted: Vec<OutPoint> = signed
+            .iter()
+            .filter_map(|b| match &b.claim {
+                Claim::Retracted { outpoint } => Some(*outpoint),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            retracted,
+            vec![really_gone],
+            "only the output the rescan did NOT find may be retracted"
+        );
+
+        // No outpoint carries two claims at one `as_of` -- the property the
+        // fold should never have to rescue.
+        for op in [re_mined, really_gone] {
+            let at_tip = signed
+                .iter()
+                .filter(|b| b.claim.outpoint() == Some(op) && b.as_of == tip)
+                .count();
+            assert!(at_tip <= 1, "{op:?} has {at_tip} claims at one anchor");
+        }
+
+        // And the re-mined payment reads as paid, which is the whole point of
+        // suppressing its retraction rather than leaving the fold to resolve a
+        // contradiction (it would resolve it to Retracted).
+        let for_re_mined: Vec<&ClaimBody> = signed
+            .iter()
+            .filter(|b| b.claim.outpoint() == Some(re_mined))
+            .collect();
+        assert!(matches!(
+            freenet_bitcoin_common::fold_outpoint_status(for_re_mined),
+            Some(OutpointStatus::Confirmed { .. })
+        ));
+    }
+
+    /// The suppression must not swallow a retraction that is actually due.
+    #[test]
+    fn an_output_the_rescan_did_not_find_is_still_retracted() {
+        let obs = observer();
+        let dir = tempfile::tempdir().unwrap();
+        let signer = Signer::load_or_create(&dir.path().join("key")).unwrap();
+        let tip = BlockAnchor {
+            height: 105,
+            hash: BlockHash([7; 32]),
+        };
+        let script = b"spk".to_vec();
+        let gone = outpoint(3, 0);
+        let mut claims = ClaimsByScript::new();
+        obs.retraction_claims(
+            &signer,
+            &tip,
+            &[(script.clone(), gone)],
+            // A different outpoint was re-mined; this one was not.
+            &HashSet::from([outpoint(4, 0)]),
+            &mut claims,
+        )
+        .unwrap();
+        let signed = bodies(&claims, &script);
+        assert_eq!(signed.len(), 1);
+        assert_eq!(signed[0].as_of, tip);
+        assert!(matches!(signed[0].claim, Claim::Retracted { outpoint } if outpoint == gone));
+    }
 
     #[test]
     fn the_ladder_doubles_and_then_lands_exactly_on_the_ceiling() {

@@ -38,10 +38,12 @@
 //! height H, asserts X". Assertions accumulate and are never deleted or
 //! rewritten. A reorg does not retract an old assertion; it produces a *newer*
 //! one at a greater `as_of` height. Current status is then **derived** by
-//! folding the set and letting the highest `as_of` win per outpoint. Set union
-//! is trivially associative, commutative and idempotent, and the fold is a
-//! deterministic pure function of the set, so every replica computes the same
-//! answer from the same bytes. See [`fold_outpoint_status`].
+//! folding the set and letting the highest `as_of` win per outpoint. Two
+//! assertions at the SAME `as_of` are a contradiction rather than an ordering,
+//! and resolve to whichever grants a payee less. Set union is trivially
+//! associative, commutative and idempotent, and the fold is a deterministic
+//! pure function of the set, so every replica computes the same answer from
+//! the same bytes. See [`fold_outpoint_status`].
 //!
 //! # Why depth comes from the claim, not from the tip
 //!
@@ -596,16 +598,114 @@ pub fn attested_depth(anchor: &BlockAnchor, as_of: &BlockAnchor) -> u32 {
     as_of.height - anchor.height + 1
 }
 
+/// How much a claim GRANTS a payee, ordered so the **most conservative sorts
+/// highest**.
+///
+/// This is the tie-break that decides a contradiction, so it is ordered by
+/// what a wrong answer costs rather than by anything intrinsic to the claim:
+///
+/// * [`Claim::Retracted`] grants nothing and asserts absence.
+/// * [`Claim::MempoolOutput`] grants a value but zero confirmations.
+/// * [`Claim::ConfirmedOutput`] grants a value at a depth an application may
+///   settle on — the only claim whose acceptance can move money.
+///
+/// [`Claim::ScannedTo`] is not about an outpoint and never reaches the fold.
+const fn concession_rank(claim: &Claim) -> u8 {
+    match claim {
+        Claim::Retracted { .. } => 2,
+        Claim::MempoolOutput { .. } => 1,
+        Claim::ConfirmedOutput { .. } | Claim::ScannedTo => 0,
+    }
+}
+
+/// The total order the fold takes its winner from: **greater wins**.
+///
+/// `Equal` is returned only for claims with identical canonical bytes, so
+/// distinct claims always have a strict winner and the fold's result is a
+/// function of the claim SET.
+///
+/// 1. **`as_of.height`.** The real ordering: a later chain position supersedes
+///    an earlier one. Everything below only ever decides a contradiction.
+/// 2. **[`concession_rank`].** At one chain position the bridge (or one of
+///    several trusted bridges) has said two incompatible things, and the
+///    conservative reading wins. See the module note on why.
+/// 3. **The conservative reading within a variant.** Two confirmations at one
+///    anchor disagreeing about the amount resolve to the smaller amount, and
+///    disagreeing about the block resolve to the shallower depth (the higher
+///    `anchor.height`, since `as_of` is equal by this point).
+/// 4. **Canonical CBOR bytes.** Arbitrary, and deliberately so: it exists only
+///    to make the order total, and by here the two claims differ in nothing a
+///    payee could be harmed by.
+fn claim_precedence(a: &ClaimBody, b: &ClaimBody) -> core::cmp::Ordering {
+    a.as_of
+        .height
+        .cmp(&b.as_of.height)
+        .then_with(|| concession_rank(&a.claim).cmp(&concession_rank(&b.claim)))
+        .then_with(|| match (&a.claim, &b.claim) {
+            (
+                Claim::ConfirmedOutput {
+                    value_sats: av,
+                    anchor: aa,
+                    ..
+                },
+                Claim::ConfirmedOutput {
+                    value_sats: bv,
+                    anchor: ba,
+                    ..
+                },
+            ) => bv.cmp(av).then_with(|| aa.height.cmp(&ba.height)),
+            (
+                Claim::MempoolOutput { value_sats: av, .. },
+                Claim::MempoolOutput { value_sats: bv, .. },
+            ) => bv.cmp(av),
+            _ => core::cmp::Ordering::Equal,
+        })
+        // Serialization of a `ClaimBody` into a `Vec` cannot fail: there is no
+        // map with non-string keys, no float, and no writer that can error.
+        // `unwrap_or_default` is a total-function formality, and it stays
+        // deterministic if it ever fires, because both sides take the same path.
+        .then_with(|| {
+            to_cbor(a)
+                .unwrap_or_default()
+                .cmp(&to_cbor(b).unwrap_or_default())
+        })
+}
+
 /// Fold every claim about one outpoint into a single current status.
 ///
-/// The rule is: **highest `as_of.height` wins**, ties broken by a total order
-/// on the claim bytes so the result never depends on iteration order. This is
-/// a pure function of the claim set, which is what makes it safe to compute on
+/// The rule is: **highest `as_of.height` wins**, and a genuine tie is decided
+/// by [`claim_precedence`], a total order over the claims themselves — so the
+/// result is a pure function of the claim SET and never depends on the order
+/// the claims were handed over in. That is what makes it safe to compute on
 /// every replica and get the same answer.
 ///
 /// `claims` may be supplied in any order and may contain duplicates; both are
 /// harmless, which is the property that lets the underlying state be a
 /// grow-only set merged by union.
+///
+/// # Why a contradiction resolves conservatively
+///
+/// Two claims about one outpoint at one `as_of` — a `Retracted` and a
+/// `ConfirmedOutput`, say — are already pathological: no honest, correct
+/// bridge should sign both, and this crate's own bridge is written not to (see
+/// the retraction suppression in `bridge/src/observer.rs`). But the fold is
+/// handed whatever a submitter assembles, from claims signed in any round or
+/// by any of several trusted bridges, so it must be sound against a set no
+/// bridge ever intended to produce.
+///
+/// Given that, the two directions of error are wildly asymmetric. Reading a
+/// retracted payment as confirmed hands over goods for money that is not on
+/// the chain, and it is irreversible. Reading a confirmed payment as retracted
+/// withholds goods for a payment that is real — a stall, not a loss, and one
+/// that clears itself the moment the bridge re-asserts the payment at a higher
+/// `as_of`, which the confirmation ladder does on every block. So the
+/// conservative claim wins, and no ordering of the vector can buy a
+/// confirmation that the claim set does not unambiguously support.
+///
+/// This is also why the tie-break sits ABOVE `as_of.hash`: two assertions at
+/// one height on two competing forks are not ordered by anything real, and
+/// letting an arbitrary hash comparison decide whether a payment counts would
+/// be picking the outcome by coin flip.
 ///
 /// It is a pure function of the claims it is *given*, which is not the same as
 /// a function of the claims that exist. Anything acting on the result must
@@ -623,14 +723,7 @@ where
         }
         let better = match best {
             None => true,
-            Some(b) => match c.as_of.height.cmp(&b.as_of.height) {
-                core::cmp::Ordering::Greater => true,
-                core::cmp::Ordering::Less => false,
-                // Same height: two assertions from the same chain position.
-                // Order by the anchor hash so the choice is deterministic
-                // rather than dependent on which peer merged first.
-                core::cmp::Ordering::Equal => c.as_of.hash.0 > b.as_of.hash.0,
-            },
+            Some(b) => claim_precedence(c, b) == core::cmp::Ordering::Greater,
         };
         if better {
             best = Some(c);
@@ -852,6 +945,11 @@ mod tests {
             fold_outpoint_status([&low, &high]),
             fold_outpoint_status([&high, &low])
         );
+        // The anchor hash used to decide this; the conservative claim does now.
+        assert_eq!(
+            fold_outpoint_status([&low, &high]),
+            Some(OutpointStatus::Retracted)
+        );
     }
 
     /// The forgery this bound exists to stop.
@@ -960,6 +1058,247 @@ mod tests {
         let statuses = fold_claims_by_outpoint([&a]);
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[&op()].confirmations_at(999), 1);
+    }
+
+    /// The tie the anchor-hash rule left unbroken.
+    ///
+    /// Two contradictory assertions at the SAME chain position -- same
+    /// `as_of.height` AND same `as_of.hash` -- compared equal, so the fold
+    /// kept whichever the iterator reached first. On a verification path the
+    /// iteration order is the SUBMITTER's order, so a third party could pick
+    /// the answer by ordering the vector.
+    #[test]
+    fn contradictory_claims_at_one_anchor_do_not_depend_on_order() {
+        let confirmed = claim(
+            100,
+            Claim::ConfirmedOutput {
+                outpoint: op(),
+                value_sats: 50_000,
+                anchor: anchor(100, 1),
+                spv: any_spv(),
+            },
+        );
+        let retracted = claim(100, Claim::Retracted { outpoint: op() });
+        assert_eq!(
+            confirmed.as_of, retracted.as_of,
+            "same anchor by construction"
+        );
+        assert_eq!(
+            fold_outpoint_status([&confirmed, &retracted]),
+            fold_outpoint_status([&retracted, &confirmed]),
+            "the winner must be a function of the claim SET, not of the order \
+             the submitter chose to hand them over in"
+        );
+        // ... and it resolves the way that costs a wrong answer least: a
+        // payment nobody can prove is on the chain is not paid.
+        assert_eq!(
+            fold_outpoint_status([&confirmed, &retracted]),
+            Some(OutpointStatus::Retracted)
+        );
+    }
+
+    /// The same contradiction across two competing forks at one height.
+    ///
+    /// Neither `as_of` is later than the other, so nothing real orders them,
+    /// and the old rule let the greater anchor hash decide whether a payment
+    /// counted. Which fork sorts higher must not be what settles a payment.
+    #[test]
+    fn a_fork_hash_never_decides_whether_a_payment_counts() {
+        for (retraction_seed, confirmation_seed) in [(1u8, 9u8), (9u8, 1u8)] {
+            let retracted = ClaimBody {
+                as_of: anchor(100, retraction_seed),
+                ..claim(100, Claim::Retracted { outpoint: op() })
+            };
+            let confirmed = ClaimBody {
+                as_of: anchor(100, confirmation_seed),
+                ..claim(
+                    100,
+                    Claim::ConfirmedOutput {
+                        outpoint: op(),
+                        value_sats: 50_000,
+                        anchor: anchor(100, confirmation_seed),
+                        spv: any_spv(),
+                    },
+                )
+            };
+            assert_eq!(
+                fold_outpoint_status([&retracted, &confirmed]),
+                Some(OutpointStatus::Retracted),
+                "hash order must not decide a contradiction (seeds {retraction_seed}, \
+                 {confirmation_seed})"
+            );
+            assert_eq!(
+                fold_outpoint_status([&confirmed, &retracted]),
+                fold_outpoint_status([&retracted, &confirmed])
+            );
+        }
+    }
+
+    /// A mempool sighting and a confirmation at one anchor cannot both be
+    /// true, and the one that grants no confirmations is the safe reading.
+    #[test]
+    fn a_mempool_sighting_outranks_a_confirmation_at_the_same_anchor() {
+        let mempool = claim(
+            100,
+            Claim::MempoolOutput {
+                outpoint: op(),
+                value_sats: 50_000,
+            },
+        );
+        let confirmed = claim(
+            100,
+            Claim::ConfirmedOutput {
+                outpoint: op(),
+                value_sats: 50_000,
+                anchor: anchor(100, 1),
+                spv: any_spv(),
+            },
+        );
+        assert_eq!(
+            fold_outpoint_status([&confirmed, &mempool]),
+            Some(OutpointStatus::Unconfirmed { value_sats: 50_000 })
+        );
+        assert_eq!(
+            fold_outpoint_status([&confirmed, &mempool]),
+            fold_outpoint_status([&mempool, &confirmed])
+        );
+    }
+
+    /// Two confirmations at one anchor disagreeing about the amount settle on
+    /// the smaller one, for the same reason a retraction wins: overstating a
+    /// payment is unrecoverable, understating it clears on the next block.
+    #[test]
+    fn contradictory_amounts_at_one_anchor_settle_on_the_smaller() {
+        let big = claim(
+            100,
+            Claim::ConfirmedOutput {
+                outpoint: op(),
+                value_sats: 50_000,
+                anchor: anchor(100, 1),
+                spv: any_spv(),
+            },
+        );
+        let small = claim(
+            100,
+            Claim::ConfirmedOutput {
+                outpoint: op(),
+                value_sats: 7,
+                anchor: anchor(100, 1),
+                spv: any_spv(),
+            },
+        );
+        for order in [[&big, &small], [&small, &big]] {
+            assert_eq!(
+                fold_outpoint_status(order),
+                Some(OutpointStatus::Confirmed {
+                    value_sats: 7,
+                    anchor: anchor(100, 1),
+                    attested_depth: 1,
+                })
+            );
+        }
+    }
+
+    /// A newer assertion still supersedes an older one. The conservative
+    /// tie-break decides contradictions, and must not become a ratchet that
+    /// pins a retracted outpoint retracted forever.
+    #[test]
+    fn a_later_confirmation_still_beats_an_earlier_retraction() {
+        let retracted = claim(100, Claim::Retracted { outpoint: op() });
+        let reconfirmed = claim(
+            101,
+            Claim::ConfirmedOutput {
+                outpoint: op(),
+                value_sats: 50_000,
+                anchor: anchor(101, 2),
+                spv: any_spv(),
+            },
+        );
+        assert!(matches!(
+            fold_outpoint_status([&retracted, &reconfirmed]),
+            Some(OutpointStatus::Confirmed { .. })
+        ));
+    }
+
+    /// Every ordering of a mixed pile, including the contradictory pairs,
+    /// yields one answer.
+    #[test]
+    fn every_permutation_of_a_claim_set_folds_to_one_answer() {
+        let claims = [
+            claim(
+                100,
+                Claim::MempoolOutput {
+                    outpoint: op(),
+                    value_sats: 50_000,
+                },
+            ),
+            // Contradicts the one below at an identical `as_of`.
+            claim(101, Claim::Retracted { outpoint: op() }),
+            claim(
+                101,
+                Claim::ConfirmedOutput {
+                    outpoint: op(),
+                    value_sats: 50_000,
+                    anchor: anchor(101, 3),
+                    spv: any_spv(),
+                },
+            ),
+            // Same height as the pair above, on a competing fork. Its
+            // `as_of.hash` sorts BELOW theirs, so the old anchor-hash rule
+            // reaches the contradictory tie rather than being decided here.
+            ClaimBody {
+                as_of: anchor(101, 50),
+                ..claim(
+                    101,
+                    Claim::ConfirmedOutput {
+                        outpoint: op(),
+                        value_sats: 49_999,
+                        anchor: anchor(100, 50),
+                        spv: any_spv(),
+                    },
+                )
+            },
+            claim(99, Claim::Retracted { outpoint: op() }),
+            // Not about this outpoint at all; must be ignored throughout.
+            claim(1_000, Claim::ScannedTo),
+        ];
+
+        let expected = fold_outpoint_status(claims.iter());
+        assert!(expected.is_some());
+        let mut seen = 0usize;
+        permutations(claims.len(), &mut |order| {
+            let permuted: Vec<&ClaimBody> = order.iter().map(|&i| &claims[i]).collect();
+            assert_eq!(
+                fold_outpoint_status(permuted.iter().copied()),
+                expected,
+                "order {order:?} disagreed"
+            );
+            // Duplicates must not change the answer either.
+            let mut doubled = permuted.clone();
+            doubled.extend(permuted.iter().copied());
+            assert_eq!(fold_outpoint_status(doubled), expected);
+            seen += 1;
+        });
+        assert_eq!(seen, 720, "6! orderings");
+    }
+
+    /// Heap's algorithm, so the permutation test needs no dependency.
+    fn permutations(n: usize, f: &mut impl FnMut(&[usize])) {
+        let mut a: Vec<usize> = (0..n).collect();
+        let mut c = vec![0usize; n];
+        f(&a);
+        let mut i = 0;
+        while i < n {
+            if c[i] < i {
+                a.swap(if i % 2 == 0 { 0 } else { c[i] }, i);
+                f(&a);
+                c[i] += 1;
+                i = 0;
+            } else {
+                c[i] = 0;
+                i += 1;
+            }
+        }
     }
 
     #[test]
