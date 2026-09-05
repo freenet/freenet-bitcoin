@@ -58,8 +58,12 @@ jobs:
       # is the same way the contract-id vectors in webapp/src/keys.rs came to
       # have never executed once.
       - name: Test
-        run: cargo test -p freenet-bitcoin-common -p freenet-bitcoin-generation
-             -p bitcoin-freenet-bridge -p freenet-bitcoin-webapp
+        # One line on purpose. This used to be a YAML continuation, and a
+        # `grep "cargo test"` then showed only its first half -- which reads as
+        # though the bridge crate is not tested at all. That false reading cost
+        # a review cycle. Keep it greppable.
+        run: |
+          cargo test -p freenet-bitcoin-common -p freenet-bitcoin-generation -p bitcoin-freenet-bridge -p freenet-bitcoin-webapp
 
       # The webapp ships as wasm, so lint the target that actually ships --
       # native-only dead-code findings there are noise, and wasm-only ones
