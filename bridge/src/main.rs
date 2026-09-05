@@ -241,6 +241,39 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
         }
     }
 
+    // Refill the tip contract's recent-block window on every start.
+    //
+    // The observation loop publishes a tip entry only for blocks it NEWLY
+    // scans, so a tip contract that is empty stays empty until the next block
+    // and then holds exactly one. That is invisible on signet, where blocks
+    // arrive in seconds, and it is a ten-minute blank screen followed by a
+    // one-row table on mainnet -- for the contract whose entire job is to make
+    // the first screen useful with no watched addresses.
+    //
+    // Empty is the normal state after a re-key, because the successor contract
+    // is a different instance that nobody has written to. Rather than detect
+    // that, this rewinds unconditionally: the window is bounded by
+    // `demo_backfill_blocks`, rescanning is idempotent (claims are keyed by
+    // digest, and the tip state is a pruned map merged by height), and the
+    // signet demo-address seeding above already rewinds on every start for the
+    // same reason. A condition here would be one more thing to get wrong for
+    // no saving worth having.
+    for net_cfg in &cfg.networks {
+        let Ok(client) = ChainClient::connect(net_cfg) else {
+            continue;
+        };
+        let Ok(tip) = client.tip() else { continue };
+        let from = tip.height.saturating_sub(net_cfg.demo_backfill_blocks);
+        match store.rewind_checkpoint_to(net_cfg.network, from) {
+            Ok(()) => tracing::info!(
+                network = ?net_cfg.network,
+                from,
+                "rewound the chain cursor so the tip contract's recent-block window refills"
+            ),
+            Err(e) => tracing::error!(network = ?net_cfg.network, "cannot rewind: {e}"),
+        }
+    }
+
     // Compute each network's tip-contract instance id and publish it via
     // /v1/status.
     //
