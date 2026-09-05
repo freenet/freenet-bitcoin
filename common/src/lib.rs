@@ -344,6 +344,25 @@ pub struct BitcoinAddressParameters {
     /// that wants a different bridge, several bridges, or a bridge it runs
     /// itself simply instantiates the contract with different keys. No part of
     /// the format privileges any particular operator.
+    ///
+    /// # Listing several bridges is a UNION, not a quorum
+    ///
+    /// Naming more than one bridge here does **not** mean "they must agree".
+    /// Every listed bridge's claims land in one pooled set and
+    /// [`fold_outpoint_status`] takes the claim at the highest `as_of`, so
+    /// whichever bridge asserted most recently decides. Each bridge stamps its
+    /// own current tip and republishes every round, so ANY single listed bridge
+    /// can override all the others at will. Listing N bridges widens the
+    /// trusted set to N; it is strictly weaker than listing one, not stronger,
+    /// and a reader hoping for N-of-M agreement is not getting it.
+    ///
+    /// Nothing produces a multi-bridge instance today: a bridge publishes only
+    /// to the instance naming itself alone (`Observer::address_params`), and
+    /// since this field is part of the contract's address, a two-bridge
+    /// instance is a different contract that no bridge writes to and that would
+    /// simply be empty. Real quorum would have to be built deliberately — fold
+    /// per bridge, then require agreement across the per-bridge answers. Do not
+    /// add keys here expecting that behaviour.
     pub trusted_bridges: Vec<BridgeId>,
     /// Minimum proof-of-work a block header must claim.
     ///
