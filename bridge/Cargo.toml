@@ -8,12 +8,13 @@ description = "Synchronizes Bitcoin observations into Freenet contracts, with pl
 
 [dependencies]
 freenet-bitcoin-common = { workspace = true, features = ["test-support"] }
+freenet-bitcoin-generation = { workspace = true }
 # The client half of the stdlib, for PUT/UPDATE against a local node. Pinned to
 # the same version the contracts are built against so ContractKey and the wire
 # enums are one type, not two.
 freenet-stdlib = { workspace = true, features = ["net"] }
 freenet-scaffold = { workspace = true }
-freenet-migrate = "0.6"
+freenet-migrate = { workspace = true, features = ["ui"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 

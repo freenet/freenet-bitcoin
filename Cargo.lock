@@ -291,6 +291,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "freenet-bitcoin-common",
+ "freenet-bitcoin-generation",
  "freenet-migrate",
  "freenet-migrate-build",
  "freenet-scaffold",
@@ -1707,6 +1708,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "freenet-bitcoin-generation"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bs58",
+ "ed25519-dalek",
+ "freenet-bitcoin-common",
+ "freenet-migrate",
+ "freenet-stdlib",
+]
+
+[[package]]
 name = "freenet-bitcoin-webapp"
 version = "0.1.0"
 dependencies = [
@@ -1715,6 +1728,8 @@ dependencies = [
  "ciborium",
  "dioxus",
  "freenet-bitcoin-common",
+ "freenet-bitcoin-generation",
+ "freenet-migrate",
  "freenet-stdlib",
  "futures",
  "hex",

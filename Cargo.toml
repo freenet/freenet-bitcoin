@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "common",
+    "generation",
     "contracts/bitcoin-address-contract",
     "contracts/bitcoin-tip-contract",
     "bridge",
@@ -16,12 +17,19 @@ repository = "https://github.com/freenet/freenet-bitcoin"
 
 [workspace.dependencies]
 freenet-bitcoin-common = { path = "common" }
+freenet-bitcoin-generation = { path = "generation" }
 
 # 0.8.5 is what freenet-core and River are on. The bump is not cosmetic: it is
 # required for freenet-migrate's runtime half, because freenet-stdlib's
 # __frnt_set_id is unconditionally #[no_mangle] and two versions cannot link.
 freenet-stdlib = "0.8.5"
 freenet-scaffold = "0.2.2"
+
+# The migration machinery, and with it the frozen pointer contract that lets a
+# reader discover which contract generation a bridge is publishing to. Pinned
+# at the workspace level so the bridge and the webapp resolve pointers with one
+# implementation rather than two.
+freenet-migrate = { version = "0.6", default-features = false }
 freenet-scaffold-macro = "0.2.2"
 
 serde = { version = "1.0", features = ["derive"] }

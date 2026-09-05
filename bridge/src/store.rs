@@ -168,6 +168,27 @@ impl Store {
                 PRIMARY KEY (instance_id, generation)
             );
 
+            -- The version counter behind each generation pointer record.
+            --
+            -- A pointer record is `version || code_hash || signature`, and the
+            -- pointer contract accepts a record only if it supersedes what it
+            -- holds. So the version must be monotonic across restarts, and
+            -- that memory has to live somewhere durable.
+            --
+            -- Losing this table is survivable and must be: the publisher reads
+            -- the record already on the network first and, if that record
+            -- verifies under this bridge's own key, continues from ITS version.
+            -- Without that, a restored-from-nothing database would sign
+            -- version 1 forever, every write would be refused as stale, and
+            -- the pointer would silently freeze at whatever generation it last
+            -- held -- pointing readers at contracts the bridge stopped
+            -- publishing to.
+            CREATE TABLE IF NOT EXISTS pointer_versions (
+                app_id     TEXT PRIMARY KEY,
+                version    INTEGER NOT NULL,
+                code_hash  BLOB NOT NULL
+            );
+
             -- Single-use challenges for service authorization. Rows are
             -- deleted on use, which is what makes a captured authorization
             -- non-replayable.
@@ -552,6 +573,39 @@ impl Store {
             params![code_hash.to_vec()],
         )?;
         Ok(changed)
+    }
+
+    // --- generation pointers -----------------------------------------------
+
+    /// The `(version, code_hash)` this bridge last published for `app_id`.
+    pub fn pointer_record(&self, app_id: &str) -> anyhow::Result<Option<(u32, [u8; 32])>> {
+        let row: Option<(i64, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT version, code_hash FROM pointer_versions WHERE app_id = ?1",
+                params![app_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(v, h)| {
+            let h: [u8; 32] = h.try_into().ok()?;
+            u32::try_from(v).ok().map(|v| (v, h))
+        }))
+    }
+
+    /// Remember what was published, so the next run can supersede it.
+    pub fn set_pointer_record(
+        &self,
+        app_id: &str,
+        version: u32,
+        code_hash: &[u8; 32],
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO pointer_versions (app_id, version, code_hash) VALUES (?1, ?2, ?3)
+             ON CONFLICT(app_id) DO UPDATE SET version = ?2, code_hash = ?3",
+            params![app_id, version as i64, code_hash.to_vec()],
+        )?;
+        Ok(())
     }
 
     // --- published claims --------------------------------------------------

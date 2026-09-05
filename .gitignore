@@ -1,2 +1,7 @@
 /target
 **/*.wasm
+
+# NOT build output. The frozen pointer contract, vendored so a reader can find
+# which contract generation a bridge publishes to. Its hash is checked against
+# the constant freenet-migrate ships, so these bytes prove what they are.
+!/generation/pointer-v1.wasm

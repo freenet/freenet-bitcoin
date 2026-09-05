@@ -1,0 +1,15 @@
+[package]
+name = "freenet-bitcoin-generation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Which contract generation a bridge publishes to, and how a reader finds out"
+
+[dependencies]
+freenet-bitcoin-common = { workspace = true }
+freenet-migrate = { workspace = true }
+freenet-stdlib = { workspace = true }
+ed25519-dalek = { workspace = true }
+blake3 = { workspace = true }
+bs58 = { workspace = true }

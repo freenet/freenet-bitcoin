@@ -35,6 +35,9 @@ pub struct FreenetPublisher {
     api: Arc<Mutex<WebApi>>,
     address_code: Arc<ContractCode<'static>>,
     tip_code: Arc<ContractCode<'static>>,
+    /// The frozen pointer contract. Vendored bytes, never rebuilt: the whole
+    /// point of a pointer is that its own address does not move.
+    pointer_code: Arc<ContractCode<'static>>,
 }
 
 impl FreenetPublisher {
@@ -46,6 +49,9 @@ impl FreenetPublisher {
             api: Arc::new(Mutex::new(WebApi::start(stream))),
             address_code: Arc::new(ContractCode::from(address_wasm)),
             tip_code: Arc::new(ContractCode::from(tip_wasm)),
+            pointer_code: Arc::new(ContractCode::from(
+                freenet_bitcoin_generation::POINTER_CONTRACT_WASM.to_vec(),
+            )),
         })
     }
 
@@ -77,6 +83,38 @@ impl FreenetPublisher {
         let mut out = [0u8; 32];
         out.copy_from_slice(&bytes[..32]);
         out
+    }
+
+    /// The 32-byte code hash of the tip contract WASM.
+    ///
+    /// Same role as [`Self::address_code_hash`]: it is what a generation
+    /// pointer names, so a reader can derive the tip contract's key without
+    /// shipping the WASM itself.
+    pub fn tip_code_hash(&self) -> [u8; 32] {
+        let bytes: &[u8] = self.tip_code.hash().as_ref();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes[..32]);
+        out
+    }
+
+    /// PUT or UPDATE a generation pointer record.
+    ///
+    /// `params` and `state` are the pointer contract's own encodings, built by
+    /// `freenet-migrate`; nothing here interprets them. The contract verifies
+    /// the signature against the author key inside `params` and refuses any
+    /// record that does not supersede what it already holds, so a stale or
+    /// forged record is rejected by the network rather than by this call.
+    pub async fn publish_pointer(&self, params: Vec<u8>, state: Vec<u8>) -> Result<ContractKey> {
+        let key = ContractKey::from_params_and_code(
+            Parameters::from(params.clone()),
+            self.pointer_code.as_ref(),
+        );
+        let container = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
+            self.pointer_code.clone(),
+            Parameters::from(params),
+        )));
+        self.put_or_update(key, container, state).await?;
+        Ok(key)
     }
 
     /// Recover a predecessor generation's observations, if any, BEFORE this

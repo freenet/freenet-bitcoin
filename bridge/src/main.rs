@@ -74,6 +74,15 @@ struct Cli {
     /// Confirmations required by --prove-payment-of.
     #[arg(long, default_value_t = 2)]
     confirmations: u32,
+    /// Print which contract generation this bridge publishes to, and what its
+    /// generation pointers currently say, then exit.
+    ///
+    /// This is the check to run after installing new contract WASM. It shows
+    /// the code hash on disk beside the record readers will resolve, so a
+    /// mismatch is a line of output rather than an application that renders
+    /// an empty page.
+    #[arg(long)]
+    print_generation: bool,
 }
 
 fn main() -> Result<()> {
@@ -95,6 +104,13 @@ fn main() -> Result<()> {
     if cli.check {
         println!("configuration OK: {} network(s)", cfg.networks.len());
         return Ok(());
+    }
+
+    if cli.print_generation {
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(print_generation(cfg));
     }
 
     if let Some(address) = cli.verify.clone() {
@@ -250,6 +266,29 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
                     tip_contract_ids.insert(net_cfg.network, k.id().to_string());
                 }
                 Err(e) => tracing::warn!("cannot derive tip contract id: {e}"),
+            }
+        }
+    }
+
+    // Tell readers which contract generation this bridge writes to, BEFORE
+    // the observation loop starts filling it.
+    //
+    // Order matters in one direction only. Published first, a reader lands on
+    // the generation the data is about to appear in and sees it arrive.
+    // Published last, every reader spends the gap on the previous generation,
+    // which the bridge has already stopped writing to -- and a reader cannot
+    // tell that from "no payments yet", which is the whole failure being
+    // removed here.
+    if let Some(p) = publisher.as_ref() {
+        for result in bitcoin_freenet_bridge::generation::publish_pointers(p, &signer, &store).await
+        {
+            if let Err(e) = result {
+                // Not fatal: the bridge's real job is unaffected. What is lost
+                // is a reader's ability to notice a re-key, so say so plainly
+                // rather than at debug level.
+                tracing::error!(
+                    "could not publish a generation pointer ({e}); readers built against                      different contract WASM will see an empty page with no error"
+                );
             }
         }
     }
@@ -525,6 +564,63 @@ fn parse_address(s: &str, network: BitcoinNetwork) -> Result<Vec<u8>> {
 /// bridge's own record, so the output describes what a third party reading the
 /// contract would conclude -- given the same trust in this bridge's chain
 /// state, which the check does not remove.
+/// Print the contract generation this bridge publishes to, and what its
+/// pointers currently say.
+///
+/// The operator-facing half of the same mechanism the webapp uses at runtime.
+/// After installing new contract WASM, this is the one command that answers
+/// "will readers find it" without opening a browser.
+async fn print_generation(cfg: BridgeConfig) -> Result<()> {
+    use freenet_bitcoin_generation::{code_hash_b58, Artifact};
+
+    let signer = Signer::load_or_create(&cfg.signing_key_path)?;
+    let bridge = signer.bridge_id();
+    println!("bridge   : {}", bridge.to_bs58());
+
+    let address_wasm = std::fs::read(cfg.contract_dir.join("bitcoin_address_contract.wasm"))?;
+    let tip_wasm = std::fs::read(cfg.contract_dir.join("bitcoin_tip_contract.wasm"))?;
+    println!(
+        "installed: {}  bitcoin_address_contract.wasm",
+        code_hash_b58(&freenet_bitcoin_generation::code_hash(&address_wasm))
+    );
+    println!(
+        "installed: {}  bitcoin_tip_contract.wasm",
+        code_hash_b58(&freenet_bitcoin_generation::code_hash(&tip_wasm))
+    );
+
+    for artifact in Artifact::ALL {
+        match freenet_bitcoin_generation::pointer_id(&bridge, artifact) {
+            Ok(id) => println!("pointer  : {id}  ({})", artifact.label()),
+            Err(e) => println!("pointer  : UNDERIVABLE ({}): {e}", artifact.label()),
+        }
+    }
+
+    let publisher = FreenetPublisher::connect(&cfg.freenet_ws, address_wasm, tip_wasm).await?;
+    let store = Store::open(&cfg.database_path)?;
+    let mut disagreed = false;
+    for result in
+        bitcoin_freenet_bridge::generation::publish_pointers(&publisher, &signer, &store).await
+    {
+        match result {
+            Ok(state) => println!(
+                "published: {} v{}  ({}){}",
+                code_hash_b58(&state.code_hash),
+                state.version,
+                state.artifact.label(),
+                if state.advanced { "  ADVANCED" } else { "" }
+            ),
+            Err(e) => {
+                disagreed = true;
+                println!("published: FAILED: {e}");
+            }
+        }
+    }
+    if disagreed {
+        anyhow::bail!("at least one generation pointer could not be published");
+    }
+    Ok(())
+}
+
 async fn verify_address(
     cfg: BridgeConfig,
     network: BitcoinNetwork,

@@ -2,6 +2,7 @@ pub mod auth;
 pub mod chain;
 pub mod config;
 pub mod freenet;
+pub mod generation;
 pub mod migrate;
 pub mod observer;
 pub mod service;
