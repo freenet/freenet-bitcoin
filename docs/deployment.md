@@ -141,6 +141,20 @@ workspace crates still reuses dependency artifacts and under fat LTO those
 yield a different module. Two fresh clones of one commit agreed with each other
 and disagreed with a working tree, which is how that was found.
 
+### Never `cargo build` a contract directly
+
+Use `scripts/build-contracts.sh` (which `cargo make build-contracts`, CI and
+the deploy script all call). It passes `--remap-path-prefix` for `CARGO_HOME`,
+`RUSTUP_HOME` and the repository root, and then refuses if any build-machine
+path survived into the bytes.
+
+That is not tidiness. Release binaries embed panic locations as `file:line`,
+and for dependencies those are absolute, so before 2026-09-04 every contract
+this project shipped had `/home/ian/.cargo/registry/...` compiled into it — and
+a build on any other machine was a **different contract**. Nobody could verify
+what was deployed. The flags are therefore part of a contract's identity, and a
+build that skips them silently produces a different one.
+
 ## Generation pointers: how a reader survives a re-key
 
 The bridge signs a **pointer record** naming the code hash it publishes to, at

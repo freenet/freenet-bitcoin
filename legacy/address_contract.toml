@@ -17,6 +17,15 @@
 # PROCEDURE: append the outgoing hash BEFORE rebuilding the contract, then
 # commit the entry and the rebuilt WASM together. `cargo make code-hashes`
 # prints the current hash to compare against.
+#
+# EVERY ENTRY UP TO AND INCLUDING A7 IS A NOVA-SPECIFIC BUILD and cannot be
+# reproduced from this source anywhere else. Until A8 the contracts had the
+# build machine's own cargo-registry paths compiled into them, via dependency
+# panic locations, so the same commit built on another machine was a different
+# contract. These hashes are still exactly right as a record of what was LIVE
+# -- everything was deployed from nova -- and that is all this file is for. But
+# do not treat them as checkable against source: they are not, and A8 onward
+# are (see scripts/build-contracts.sh).
 
 [[entry]]
 version = "A1"
