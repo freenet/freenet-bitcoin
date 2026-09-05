@@ -71,3 +71,9 @@ version = "A6"
 description = "The pre-change source built from a CLEAN target -- the reproducible identity of commit 2ee1c35, superseded by the confirmation-depth bound in freenet-bitcoin-common"
 date = "2026-09-04"
 code_hash = "0756e6e263530651eb734fc02db604d7cc5703610cea3b7f9d68ead484f038ba"
+
+[[entry]]
+version = "A7"
+description = "Deployed on signet and mainnet for about twenty minutes on 2026-09-04; real observations were published under it, so it must stay on this list. Superseded by --remap-path-prefix, which took the build machine's own paths out of the binary: dependency panic locations are absolute, so every contract this project had ever shipped was specific to the machine that compiled it and could not be reproduced anywhere else"
+date = "2026-09-04"
+code_hash = "c6d86e667d8d735cc7367caa4f9c704ba655587fd5d4bb2e94f9a49d9a45b472"

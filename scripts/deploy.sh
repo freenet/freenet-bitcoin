@@ -76,9 +76,7 @@ step "Build the contracts from a clean target directory"
 # ---------------------------------------------------------------------------
 BUILD_DIR="$(mktemp -d)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
-cargo build --target "$CONTRACT_TARGET" \
-  -p bitcoin-address-contract -p bitcoin-tip-contract \
-  --features contract --release --target-dir "$BUILD_DIR" >/dev/null 2>&1
+./scripts/build-contracts.sh "$BUILD_DIR" >/dev/null
 OUT="$BUILD_DIR/$CONTRACT_TARGET/release"
 
 NEW_ADDRESS_HASH=$(b3sum --no-names "$OUT/bitcoin_address_contract.wasm")

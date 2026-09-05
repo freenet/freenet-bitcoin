@@ -35,3 +35,9 @@ version = "T5"
 description = "The pre-change source built from a CLEAN target. Superseded alongside the address contract by the confirmation-depth bound in freenet-bitcoin-common; the tip contract's own logic is unchanged, but release binaries embed panic locations as file:line so a common/ edit re-keys it too"
 date = "2026-09-04"
 code_hash = "af162dfebf16b195af36379680eee4706b094cf76b2296bc0230352db0625dc6"
+
+[[entry]]
+version = "T6"
+description = "Deployed alongside A7 and superseded for the same reason: the build machine's paths were compiled into it. See address_contract.toml"
+date = "2026-09-04"
+code_hash = "46f1ea5ebb00bc178743a032cf65698a8ecb95f7fb0df35010c0997635165749"

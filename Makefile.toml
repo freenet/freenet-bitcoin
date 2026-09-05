@@ -6,9 +6,12 @@ CONTRACT_TARGET = "wasm32-unknown-unknown"
 
 [tasks.build-contracts]
 description = "Build both Bitcoin contracts to WASM"
-command = "cargo"
-args = ["build", "--target", "${CONTRACT_TARGET}", "-p", "bitcoin-address-contract",
-        "-p", "bitcoin-tip-contract", "--features", "contract", "--release"]
+# Never `cargo build` directly. The build flags are part of a contract's
+# identity -- they are what stops the build machine's paths being compiled into
+# it -- so a second way to build these is a second contract.
+script = '''
+./scripts/build-contracts.sh
+'''
 
 [tasks.check-imports]
 description = "Fail if a contract imports a namespace the runtime does not register"
@@ -41,11 +44,7 @@ description = "Contract code hashes from a pristine build -- the only ones worth
 script = '''
 set -e
 D=$(mktemp -d)
-cargo build --target ${CONTRACT_TARGET} -p bitcoin-address-contract \
-  -p bitcoin-tip-contract --features contract --release --target-dir "$D"
-for f in "$D"/${CONTRACT_TARGET}/release/bitcoin_*_contract.wasm; do
-  echo "$(b3sum --no-names "$f")  $(basename "$f")"
-done
+./scripts/build-contracts.sh "$D"
 rm -rf "$D"
 '''
 

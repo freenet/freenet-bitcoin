@@ -37,9 +37,8 @@ jobs:
       # CI at all.
       - name: Build and embed the contracts the webapp reads
         run: |
-          cargo build --target wasm32-unknown-unknown \
-            -p bitcoin-address-contract -p bitcoin-tip-contract \
-            --features contract --release
+          sudo apt-get update -qq && sudo apt-get install -y -qq b3sum
+          ./scripts/build-contracts.sh
           mkdir -p webapp/contracts
           cp target/wasm32-unknown-unknown/release/bitcoin_address_contract.wasm webapp/contracts/
           cp target/wasm32-unknown-unknown/release/bitcoin_tip_contract.wasm webapp/contracts/
@@ -69,10 +68,10 @@ jobs:
         run: cargo clippy -p freenet-bitcoin-webapp
              --target wasm32-unknown-unknown --all-targets -- -D warnings
 
+      # Already built above; kept as the step that would catch a contract
+      # that compiles for the host and not for wasm32.
       - name: Build contracts for wasm32
-        run: cargo build --target wasm32-unknown-unknown
-             -p bitcoin-address-contract -p bitcoin-tip-contract
-             --features contract --release
+        run: ./scripts/build-contracts.sh
 
       # A contract that imports a namespace the runtime does not register
       # builds and publishes fine, then silently fails to instantiate. This is
@@ -88,6 +87,14 @@ jobs:
       # the contract's identity. Print it so a re-key is visible in the log of
       # the run that caused it -- including one caused only by reformatting,
       # since release binaries embed panic locations as file:line.
+      #
+      # These must MATCH what a developer's machine produces. They did not,
+      # until scripts/build-contracts.sh started remapping the build machine's
+      # paths out of the binary: dependency panic locations are absolute, so
+      # /home/runner/.cargo/... and /home/ian/.cargo/... were two different
+      # contracts built from one source. The pinned ids in webapp/src/keys.rs
+      # are what caught it, on the first run after CI was fixed so they
+      # actually executed.
       - name: Report contract code hashes
         run: |
           for f in target/wasm32-unknown-unknown/release/bitcoin_*_contract.wasm; do

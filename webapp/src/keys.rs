@@ -125,15 +125,23 @@ mod tests {
     /// THIS bundle derives; whether a bridge has published that generation yet
     /// is a separate question this test cannot see.
     ///
-    /// Last moved on 2026-09-04 by the confirmation-depth bound in
-    /// `freenet-bitcoin-common`, which re-keyed both contracts.
+    /// Last moved on 2026-09-04 by `--remap-path-prefix`, which took the
+    /// build machine's own paths out of the binary.
     ///
-    /// Recompute these from a **clean** `target/`. A stale one silently
-    /// changes the answer: a `cargo clean -p` of the workspace crates still
-    /// reuses dependency artifacts, and under fat LTO those produce a
-    /// different module. Two fresh clones of this commit at different paths
-    /// agree with each other and disagreed with a long-lived working tree,
-    /// which is how that was found.
+    /// This test is what found that. On the first CI run after it actually
+    /// executed, it failed -- because the runner's build and nova's build were
+    /// two different contracts. Dependency panic locations are absolute, so
+    /// `/home/ian/.cargo/...` was compiled into every contract this project
+    /// had ever shipped, and nobody else could reproduce what was deployed.
+    /// A vector that only passes on one machine is not a pin, it is a local
+    /// coincidence; these now hold everywhere.
+    ///
+    /// Recompute with `cargo make code-hashes-clean`, never a bare
+    /// `cargo build`. A stale `target/` silently changes the answer -- a
+    /// `cargo clean -p` of the workspace crates still reuses dependency
+    /// artifacts, and under fat LTO those produce a different module -- and a
+    /// build that skips `scripts/build-contracts.sh` bakes the machine back
+    /// in.
     #[test]
     fn derivation_matches_the_embedded_contracts() {
         let tip = tip_contract_id_at(
@@ -144,7 +152,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             tip.to_string(),
-            "ESNzqEXi1MnNeojZRtE7ZJkDyaNninNtcmRriKBtmubt",
+            "FXFgLKfuMm3NPtzWg3Ghgt5otv4Yo7N4CWGDvHpVeZMm",
             "tip contract id drifted; rebuild the embedded WASM, record the \
              outgoing hash in legacy/, and update this vector deliberately"
         );
@@ -159,7 +167,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             addr.to_string(),
-            "GXGFupaJwFmE2BvsMXcTsNNDhad6vDPWpLB38Grt3am9",
+            "5Q1Dj2P6J4YgctzByLVfWg5yVkW5GsVMZfFZj9SXTuqx",
             "address contract id drifted; same procedure as above"
         );
     }
