@@ -52,8 +52,15 @@ jobs:
       # The merge laws, SPV verification, and the service layer. These assert
       # convergence on exact serialized bytes, which is how peers actually
       # decide they agree.
+      #
+      # freenet-bitcoin-generation is listed explicitly. It holds the check
+      # that the vendored pointer contract really is the frozen artifact the
+      # ecosystem pins -- a guard that is worth nothing unless it runs, which
+      # is the same way the contract-id vectors in webapp/src/keys.rs came to
+      # have never executed once.
       - name: Test
-        run: cargo test -p freenet-bitcoin-common -p bitcoin-freenet-bridge -p freenet-bitcoin-webapp
+        run: cargo test -p freenet-bitcoin-common -p freenet-bitcoin-generation
+             -p bitcoin-freenet-bridge -p freenet-bitcoin-webapp
 
       # The webapp ships as wasm, so lint the target that actually ships --
       # native-only dead-code findings there are noise, and wasm-only ones

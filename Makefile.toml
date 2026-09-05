@@ -62,7 +62,8 @@ args = ["build", "--release", "-p", "bitcoin-freenet-bridge"]
 # step.
 dependencies = ["sync-webapp-contracts"]
 command = "cargo"
-args = ["test", "-p", "freenet-bitcoin-common", "-p", "bitcoin-freenet-bridge", "-p", "freenet-bitcoin-webapp"]
+args = ["test", "-p", "freenet-bitcoin-common", "-p", "freenet-bitcoin-generation",
+        "-p", "bitcoin-freenet-bridge", "-p", "freenet-bitcoin-webapp"]
 
 [tasks.preflight]
 description = "Everything CI runs, before you push"
@@ -118,6 +119,12 @@ cp target/${CONTRACT_TARGET}/release/bitcoin_tip_contract.wasm webapp/contracts/
 echo "embedded contracts:"
 b3sum --no-names webapp/contracts/bitcoin_address_contract.wasm
 b3sum --no-names webapp/contracts/bitcoin_tip_contract.wasm
+'''
+
+[tasks.deploy]
+description = "Install the bridge and publish the webapp from ONE build of ONE tree"
+script = '''
+./scripts/deploy.sh ${@}
 '''
 
 [tasks.build-webapp]

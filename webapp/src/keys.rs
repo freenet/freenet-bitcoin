@@ -164,6 +164,46 @@ mod tests {
         );
     }
 
+    /// The generations `legacy/` records as SUPERSEDED, verbatim.
+    ///
+    /// Included as text rather than parsed: the check is "does this hash
+    /// appear in that file", and a TOML parser in the webapp would be a
+    /// dependency shipped to every browser to answer a question a substring
+    /// search answers exactly.
+    const SUPERSEDED_ADDRESS: &str = include_str!("../../legacy/address_contract.toml");
+    const SUPERSEDED_TIP: &str = include_str!("../../legacy/tip_contract.toml");
+
+    /// The bundle must not embed a generation the project has already
+    /// retired.
+    ///
+    /// This is the failure the pinned vectors above cannot see. They check
+    /// that the derivation matches the embedded bytes, which is true no matter
+    /// how old those bytes are: a bundle built against a stale `target/`
+    /// derives perfectly consistent addresses for a contract nobody publishes
+    /// to any more. That happened — `webapp/contracts/` held a generation
+    /// recorded in `legacy/` as superseded, and everything was self-consistent
+    /// and wrong.
+    ///
+    /// Unlike the pinned vectors, this needs no maintenance on a re-key: the
+    /// current generation is never written into `legacy/`, so a correct build
+    /// passes by construction and only a stale one fails.
+    #[test]
+    fn embedded_contracts_are_not_a_superseded_generation() {
+        for (what, hash, legacy) in [
+            ("address", embedded_address_code_hash(), SUPERSEDED_ADDRESS),
+            ("tip", embedded_tip_code_hash(), SUPERSEDED_TIP),
+        ] {
+            let hex = hex::encode(hash);
+            assert!(
+                !legacy.contains(&hex),
+                "the embedded {what} contract is generation {hex}, which legacy/ records as \
+                 SUPERSEDED. This bundle would derive addresses nobody publishes to, and the \
+                 page would look exactly like an address with no activity. Rebuild the \
+                 contracts (cargo make sync-webapp-contracts) before building the webapp."
+            );
+        }
+    }
+
     #[test]
     fn a_different_trusted_bridge_is_a_different_contract() {
         // Trust is part of the address, not a filter applied after reading:
