@@ -181,6 +181,13 @@ freenet-bitcoin`, never `publish`: the contract id is the app's URL, and
 addresses are fixed for the life of the bridge key; the contract ids they name
 move on every re-key and are deliberately not written down here.
 
+`fdev website list` also shows a key named **`btc-drift-proof`**, contract
+`2L6y7hoEXnMbPXaiTpa3ZbdUoArcoHNYBjmRrLscakAK`. It is not a deployment. It is a
+one-off copy of the app built against deliberately-wrong contract WASM,
+published on 2026-09-04 to demonstrate in a real browser that the divergence
+notice fires and that the page still shows live data by following the bridge's
+pointer. Do not update it and do not link to it.
+
 ## The bridge
 
 Configuration: `/etc/bitcoin-freenet-bridge.toml`. State:
