@@ -115,6 +115,72 @@ Two systemd details worth recording because both cost time:
   `getifaddrs()`, which opens a netlink socket; without it bitcoind aborts at
   startup with `Address family not supported by protocol (ip_resolver.cpp:542)`.
 
+## Deploying: one command, because two is the bug
+
+```bash
+cargo make deploy            # scripts/deploy.sh
+cargo make deploy --dry-run  # build and check, change nothing
+```
+
+A contract's address is `BLAKE3(BLAKE3(wasm) || params)`, so the code is part
+of the address. The bridge writes observations to an address derived from the
+WASM under `/var/lib/btcbridge/contracts`; the webapp derives one from the WASM
+it was built with. Deploy those on different days, from different trees, or
+from a `target/` that has drifted, and they derive different addresses — and
+**nothing errors**. The webapp reads a contract nobody writes to and renders
+what it renders for an address that has never been paid.
+
+So the script builds the contracts once, into a throwaway target directory, and
+installs those exact bytes into both places. It refuses to publish if the two
+disagree where they finally sit, and refuses to replace a generation that
+`legacy/` does not record as outgoing.
+
+The throwaway target directory is required rather than careful: a long-lived
+`target/` changes a contract's identity, because `cargo clean -p` of the
+workspace crates still reuses dependency artifacts and under fat LTO those
+yield a different module. Two fresh clones of one commit agreed with each other
+and disagreed with a working tree, which is how that was found.
+
+## Generation pointers: how a reader survives a re-key
+
+The bridge signs a **pointer record** naming the code hash it publishes to, at
+an address derived from its own signing key plus `freenet-migrate`'s frozen
+pointer contract. The bridge key is the only thing here that survives a
+rebuild — everything derived from WASM moves — so it is the only usable anchor,
+and it is one applications already name explicitly and already trust for every
+fact they display.
+
+A reader knowing only the bridge id computes the pointer's address offline,
+reads the code hash, and derives the real contract from that instead of from
+whatever WASM it shipped. When the two differ the webapp follows the bridge and
+says so; when the pointer cannot be read it falls back to its own generation
+and says *that*, naming what it is reading. The one thing it never does is show
+an empty page with no explanation.
+
+```bash
+# What is installed, where its pointers live, and what they currently say.
+sudo -u btcbridge /usr/local/bin/bitcoin-freenet-bridge \
+  --config /etc/bitcoin-freenet-bridge.toml --print-generation
+```
+
+Run it after installing new contract WASM. A mismatch is a line of output
+rather than an application rendering a blank page.
+
+## What is deployed
+
+| Thing | Where |
+|---|---|
+| Webapp | contract `6s9q7nSCmPrHY85RfPjQpdHo7WTFabDCTtsJAzHXfuLN`, signing key `freenet-bitcoin` (`fdev website list`) |
+| Bridge id | `4MZnDAQWccEWXBUb1wt4iTEkDi6Z2MCcZ9WQN1umRsVL` |
+| Address-contract pointer | `C1cTJXmyZ9EMDMKwTEMTSq2PNwoMNhrKWrnzWK2XbcKV` |
+| Tip-contract pointer | `G9brbHSKXEdFZW8jKtfMHYT2GcrvJH6jhebkykN35mo9` |
+
+The webapp is republished **in place** with `fdev website update --key
+freenet-bitcoin`, never `publish`: the contract id is the app's URL, and
+`publish` would mint a new one and orphan every link to this one. The pointer
+addresses are fixed for the life of the bridge key; the contract ids they name
+move on every re-key and are deliberately not written down here.
+
 ## The bridge
 
 Configuration: `/etc/bitcoin-freenet-bridge.toml`. State:
@@ -174,7 +240,13 @@ enabling `txindex`.
 
 - **Signet: fully working.** Real third-party payments are being observed,
   published, retrieved and re-checked against their own evidence.
-- **Mainnet: syncing.** Initial block download takes many hours. The bridge
+- **Mainnet: synced and observing.** Initial block download finished
+  2026-09-04. The bridge publishes mainnet's chain tip and recent blocks and
+  watches **no mainnet address**, deliberately: observations about a specific
+  address are somebody's real money published to a permanent, replicated
+  network, so which addresses to watch is an operator decision rather than a
+  default. Mainnet therefore shows a live tip and no payments, and the webapp
+  says why rather than leaving that to look like a fault. The bridge still
   refuses to publish scan watermarks while a node is in IBD, because during IBD
   an absence of payments means nothing and the claim would be misleading.
 - **The bridge listens on loopback only, with `auth = open`.**

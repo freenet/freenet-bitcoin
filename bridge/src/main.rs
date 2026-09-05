@@ -462,14 +462,25 @@ async fn observe_once(
         next = tip.height;
     }
 
-    let mut latest_tip_entry = None;
+    // A tip entry for EVERY block scanned, not only the last.
+    //
+    // The tip contract's whole job is to show a recent-block window, and it
+    // holds only what it is sent. Publishing the last block of a round means a
+    // contract that starts empty -- which is the normal state after a re-key,
+    // since the successor is a different instance -- refills one row per round
+    // however many blocks were actually scanned. That is a one-row table on
+    // the first screen of an app whose point is that the first screen works.
+    //
+    // Bounded by construction: the state prunes to TIP_RETAIN, the round
+    // scans at most 50 blocks, and an entry is about 150 bytes.
+    let mut tip_entries = Vec::new();
     // Bound the work per round so a long catch-up cannot starve the service.
     let ceiling = tip.height.min(next.saturating_add(50));
     for height in next..=ceiling {
         let hash = obs.chain.block_hash_at(height)?;
         let block = obs.chain.scan_block(&hash, &watched)?;
         obs.claims_from_block(store, signer, &block, &tip, &mut claims)?;
-        latest_tip_entry = Some(obs.tip_entry(signer, &block)?);
+        tip_entries.push(obs.tip_entry(signer, &block)?);
         store.set_checkpoint(obs.network(), &block.anchor)?;
     }
 
@@ -559,10 +570,14 @@ async fn observe_once(
         }
     }
 
-    if let Some(entry) = latest_tip_entry {
+    if !tip_entries.is_empty() {
         let params = obs.tip_params(signer.bridge_id());
-        match publisher.publish_tip(&params, &[entry]).await {
-            Ok(key) => tracing::debug!(contract = %key.id(), "published chain tip"),
+        match publisher.publish_tip(&params, &tip_entries).await {
+            Ok(key) => tracing::debug!(
+                contract = %key.id(),
+                blocks = tip_entries.len(),
+                "published chain tip"
+            ),
             Err(e) => tracing::error!("publishing chain tip failed: {e}"),
         }
     }
