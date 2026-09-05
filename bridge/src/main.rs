@@ -29,7 +29,7 @@ use bitcoin_freenet_bridge::{
     chain::ChainClient,
     config::BridgeConfig,
     freenet::FreenetPublisher,
-    observer::{ClaimsByScript, Observer},
+    observer::{Observer, RoundClaims},
     service::{router, ServiceState},
     signer::Signer,
     store::{Store, WatchedScript},
@@ -450,7 +450,7 @@ async fn observe_once(
         .map(|w| w.script_pubkey)
         .collect();
 
-    let mut claims: ClaimsByScript = HashMap::new();
+    let mut round = RoundClaims::default();
 
     // Reorg first: a reorg invalidates the range we were about to scan.
     //
@@ -482,9 +482,6 @@ async fn observe_once(
     // Bounded by construction: the state prunes to TIP_RETAIN, the round
     // scans at most 50 blocks, and an entry is about 150 bytes.
     let mut tip_entries = Vec::new();
-    // Outpoints this round's rescan confirmed, so a reorged output that was
-    // re-mined is not also retracted at the same `as_of`.
-    let mut reconfirmed = std::collections::HashSet::new();
     // Bound the work per round so a long catch-up cannot starve the service --
     // but widen the bound when this round is going to retract something, so it
     // reaches the tip it will stamp those retractions with rather than leaving
@@ -493,18 +490,18 @@ async fn observe_once(
     for height in next..=ceiling {
         let hash = obs.chain.block_hash_at(height)?;
         let block = obs.chain.scan_block(&hash, &watched)?;
-        obs.claims_from_block(store, signer, &block, &tip, &mut claims, &mut reconfirmed)?;
+        obs.claims_from_block(store, signer, &block, &tip, &mut round)?;
         tip_entries.push(obs.tip_entry(signer, &block)?);
         store.set_checkpoint(obs.network(), &block.anchor)?;
     }
 
     // Now that the rescan has said what is actually on the chain, retract only
     // what it did not find.
-    obs.retraction_claims(signer, &tip, &reorg.orphaned, &reconfirmed, &mut claims)?;
+    obs.retraction_claims(signer, &tip, &reorg.orphaned, &mut round)?;
 
     // Re-publish payments that have now reached the configured depth, this
     // time with headers proving it.
-    obs.deep_claims(store, signer, &tip, &mut claims)?;
+    obs.deep_claims(store, signer, &tip, &mut round)?;
 
     // A scan watermark per watched script, so a reader can tell "nothing
     // received" from "nobody has looked".
@@ -523,7 +520,7 @@ async fn observe_once(
     };
     for script in &watched {
         let wm = obs.scan_watermark(signer, script, &scanned_anchor)?;
-        claims.entry(script.clone()).or_default().push(wm);
+        round.record(script, &freenet_bitcoin_common::Claim::ScannedTo, wm);
     }
 
     store.prune_blocks(obs.network(), tip.height, 1000)?;
@@ -533,7 +530,7 @@ async fn observe_once(
         return Ok(());
     };
 
-    for (script, script_claims) in claims {
+    for (script, script_claims) in round.into_by_script() {
         let params = obs.address_params(&script, signer.bridge_id());
 
         // Recover a predecessor generation BEFORE this instance is first

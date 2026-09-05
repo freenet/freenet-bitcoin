@@ -85,6 +85,62 @@ pub fn scan_ceiling(next: u32, tip_height: u32, orphaned: bool, max_reorg_depth:
 /// paid — a retraction CANDIDATE, not yet a claim. See [`Observer::handle_reorg`].
 pub type OrphanedOutpoint = (Vec<u8>, OutPoint);
 
+/// Everything one observation round is going to publish, plus the record of
+/// which outpoints its rescan re-confirmed.
+///
+/// # Why these are one object and not two
+///
+/// The reconfirmation set is a SIDE EFFECT of recording a confirmation, and it
+/// is what stops [`Observer::retraction_claims`] retracting an outpoint the
+/// same round has just confirmed at the same anchor. As a separate
+/// caller-provided `HashSet` that the scan loop had to remember to insert
+/// into, it was exactly the shape that decays: deleting the single
+/// `confirmed.insert(..)` line left the entire suite green, and the mechanism
+/// of a fix was unguarded inside the very commit that added it.
+///
+/// So there is no way to record a claim EXCEPT [`RoundClaims::record`], which
+/// derives the outpoint from the claim itself. Recording a confirmation and
+/// remembering its outpoint are one operation, and the fields are private so
+/// no caller can add a claim by another route. The omission does not compile
+/// rather than failing silently.
+#[derive(Default)]
+pub struct RoundClaims {
+    by_script: ClaimsByScript,
+    reconfirmed: HashSet<OutPoint>,
+}
+
+impl RoundClaims {
+    /// Record one signed claim, remembering its outpoint if it is a
+    /// confirmation.
+    ///
+    /// `claim` is the body that was signed; passing a different one would
+    /// misfile the claim, which is why every caller builds the body, signs it,
+    /// and hands both halves to this one method.
+    pub fn record(&mut self, script: &[u8], claim: &Claim, signed: SignedClaim) {
+        if let Claim::ConfirmedOutput { outpoint, .. } = claim {
+            self.reconfirmed.insert(*outpoint);
+        }
+        self.by_script
+            .entry(script.to_vec())
+            .or_default()
+            .push(signed);
+    }
+
+    /// Did this round's rescan put this outpoint back on the chain?
+    pub fn was_reconfirmed(&self, outpoint: &OutPoint) -> bool {
+        self.reconfirmed.contains(outpoint)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_script.is_empty()
+    }
+
+    /// The claims to publish, grouped by script.
+    pub fn into_by_script(self) -> ClaimsByScript {
+        self.by_script
+    }
+}
+
 /// What reorg handling decided about this round.
 ///
 /// The two fields travel together because the round's scan ceiling DEPENDS on
@@ -284,11 +340,10 @@ impl Observer {
         signer: &Signer,
         tip: &BlockAnchor,
         orphaned: &[OrphanedOutpoint],
-        reconfirmed: &HashSet<OutPoint>,
-        claims: &mut ClaimsByScript,
+        round: &mut RoundClaims,
     ) -> Result<()> {
         for (script, outpoint) in orphaned {
-            if reconfirmed.contains(outpoint) {
+            if round.was_reconfirmed(outpoint) {
                 tracing::info!(
                     network = ?self.cfg.network,
                     txid = %outpoint.txid.to_display_string(),
@@ -307,7 +362,7 @@ impl Observer {
             };
             let signed = SignedClaim::sign(signer.key(), &body)
                 .map_err(|e| anyhow::anyhow!("signing retraction: {e}"))?;
-            claims.entry(script.clone()).or_default().push(signed);
+            round.record(script, &body.claim, signed);
         }
         Ok(())
     }
@@ -323,8 +378,7 @@ impl Observer {
         signer: &Signer,
         block: &ScannedBlock,
         tip: &BlockAnchor,
-        claims: &mut ClaimsByScript,
-        confirmed: &mut HashSet<OutPoint>,
+        round: &mut RoundClaims,
     ) -> Result<()> {
         store.record_block(self.cfg.network, block.anchor.height, &block.anchor.hash)?;
 
@@ -356,7 +410,6 @@ impl Observer {
                 txid: found.txid,
                 vout: found.vout,
             };
-            confirmed.insert(outpoint);
             let body = ClaimBody {
                 script_id: ScriptId::compute(self.cfg.network, &found.script_pubkey),
                 network: self.cfg.network,
@@ -370,10 +423,7 @@ impl Observer {
             };
             let signed = SignedClaim::sign(signer.key(), &body)
                 .map_err(|e| anyhow::anyhow!("signing observation: {e}"))?;
-            claims
-                .entry(found.script_pubkey.clone())
-                .or_default()
-                .push(signed);
+            round.record(&found.script_pubkey, &body.claim, signed);
         }
         Ok(())
     }
@@ -421,7 +471,7 @@ impl Observer {
         store: &Store,
         signer: &Signer,
         tip: &BlockAnchor,
-        claims: &mut ClaimsByScript,
+        round: &mut RoundClaims,
     ) -> Result<()> {
         let max_depth = self.cfg.deep_confirmations;
         for (script, txid, vout, value_sats, height, published) in
@@ -494,7 +544,7 @@ impl Observer {
             };
             let signed = SignedClaim::sign(signer.key(), &body)
                 .map_err(|e| anyhow::anyhow!("signing deep observation: {e}"))?;
-            claims.entry(script.clone()).or_default().push(signed);
+            round.record(&script, &body.claim, signed);
             store.mark_deep_published(self.cfg.network, &txid, vout, rung)?;
         }
         Ok(())
@@ -667,6 +717,102 @@ mod tests {
         assert_eq!(scan_ceiling(u32::MAX - 1, u32::MAX, true, 100), u32::MAX);
     }
 
+    /// The MECHANISM of the retraction suppression, on its own.
+    ///
+    /// `retraction_claims` skips an outpoint the round re-confirmed, and that
+    /// depends on the rescan having RECORDED the reconfirmation. Those are two
+    /// separate steps, and only the skip was tested: neutralising the
+    /// recording left the whole suite green, so the core of the fix was
+    /// unguarded inside the commit that added it.
+    ///
+    /// This drives the real `claims_from_block` against a real block and
+    /// asserts ONLY on the recording, never going near `retraction_claims`, so
+    /// it cannot pass by re-covering the lookup.
+    #[test]
+    fn a_rescanned_confirmation_is_recorded_as_reconfirmed() {
+        use crate::chain::FoundOutput;
+
+        let obs = observer();
+        let dir = tempfile::tempdir().unwrap();
+        let signer = Signer::load_or_create(&dir.path().join("key")).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let tip = BlockAnchor {
+            height: 105,
+            hash: BlockHash([7; 32]),
+        };
+
+        let script = vec![0x51u8];
+        let (proof, txid, block_hash) =
+            freenet_bitcoin_common::spv::testing::payment_proof(&script, 50_000, 1, [0xbb; 32]);
+        let block = ScannedBlock {
+            anchor: BlockAnchor {
+                height: 104,
+                hash: block_hash,
+            },
+            prev_hash: BlockHash([0xbb; 32]),
+            header: proof.header,
+            time: 1_700_000_000,
+            median_time: 1_700_000_000,
+            tx_count: 1,
+            found: vec![FoundOutput {
+                script_pubkey: script.clone(),
+                txid,
+                vout: 0,
+                value_sats: 50_000,
+                raw_tx: proof.raw_tx.clone(),
+                merkle_branch: proof.merkle_branch.clone(),
+                tx_index: proof.tx_index,
+            }],
+        };
+        let found_outpoint = OutPoint { txid, vout: 0 };
+
+        let mut round = RoundClaims::default();
+        obs.claims_from_block(&store, &signer, &block, &tip, &mut round)
+            .unwrap();
+
+        assert!(
+            round.was_reconfirmed(&found_outpoint),
+            "the rescan confirmed this outpoint, so a retraction for it at the \
+             same anchor must be suppressible -- if this set is not populated, \
+             the bridge signs a Retracted and a ConfirmedOutput for one outpoint \
+             at one identical as_of"
+        );
+        // Not vacuous: an outpoint the block did NOT contain is absent, so the
+        // assertion above is about the recording and not about the set simply
+        // answering true.
+        assert!(!round.was_reconfirmed(&OutPoint { txid, vout: 1 }));
+        assert!(!round.was_reconfirmed(&outpoint(9, 0)));
+        assert!(
+            !round.is_empty(),
+            "the confirmation itself is still recorded"
+        );
+    }
+
+    /// A claim that is not a confirmation must NOT enter the reconfirmation
+    /// set, or a retraction would suppress itself.
+    #[test]
+    fn only_a_confirmation_counts_as_a_reconfirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let signer = Signer::load_or_create(&dir.path().join("key")).unwrap();
+        let op = outpoint(5, 0);
+        let body = ClaimBody {
+            script_id: ScriptId::compute(BitcoinNetwork::Signet, b"spk"),
+            network: BitcoinNetwork::Signet,
+            as_of: BlockAnchor {
+                height: 100,
+                hash: BlockHash([1; 32]),
+            },
+            claim: Claim::Retracted { outpoint: op },
+        };
+        let mut round = RoundClaims::default();
+        round.record(
+            b"spk",
+            &body.claim,
+            SignedClaim::sign(signer.key(), &body).unwrap(),
+        );
+        assert!(!round.was_reconfirmed(&op));
+    }
+
     /// The pair the bridge must never sign.
     ///
     /// A reorg orphans an output and the same round's rescan finds it re-mined
@@ -689,7 +835,7 @@ mod tests {
 
         // What the rescan produced for the re-mined output, exactly as
         // `claims_from_block` builds it.
-        let mut claims = ClaimsByScript::new();
+        let mut round = RoundClaims::default();
         let confirmation = ClaimBody {
             script_id: ScriptId::compute(BitcoinNetwork::Signet, &script),
             network: BitcoinNetwork::Signet,
@@ -705,23 +851,25 @@ mod tests {
                     .0,
             },
         };
-        claims
-            .entry(script.clone())
-            .or_default()
-            .push(SignedClaim::sign(signer.key(), &confirmation).unwrap());
-        let mut reconfirmed = HashSet::new();
-        reconfirmed.insert(re_mined);
+        // Recorded through the ONE primitive the real scan uses, so the
+        // reconfirmation set is populated the same way production populates it
+        // rather than by hand.
+        round.record(
+            &script,
+            &confirmation.claim,
+            SignedClaim::sign(signer.key(), &confirmation).unwrap(),
+        );
 
         obs.retraction_claims(
             &signer,
             &tip,
             &[(script.clone(), re_mined), (script.clone(), really_gone)],
-            &reconfirmed,
-            &mut claims,
+            &mut round,
         )
         .unwrap();
 
-        let signed = bodies(&claims, &script);
+        let by_script = round.into_by_script();
+        let signed = bodies(&by_script, &script);
         let retracted: Vec<OutPoint> = signed
             .iter()
             .filter_map(|b| match &b.claim {
@@ -770,17 +918,10 @@ mod tests {
         };
         let script = b"spk".to_vec();
         let gone = outpoint(3, 0);
-        let mut claims = ClaimsByScript::new();
-        obs.retraction_claims(
-            &signer,
-            &tip,
-            &[(script.clone(), gone)],
-            // A different outpoint was re-mined; this one was not.
-            &HashSet::from([outpoint(4, 0)]),
-            &mut claims,
-        )
-        .unwrap();
-        let signed = bodies(&claims, &script);
+        let mut round = RoundClaims::default();
+        obs.retraction_claims(&signer, &tip, &[(script.clone(), gone)], &mut round)
+            .unwrap();
+        let signed = bodies(&round.into_by_script(), &script);
         assert_eq!(signed.len(), 1);
         assert_eq!(signed[0].as_of, tip);
         assert!(matches!(signed[0].claim, Claim::Retracted { outpoint } if outpoint == gone));
