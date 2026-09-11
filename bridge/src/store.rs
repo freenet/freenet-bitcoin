@@ -315,39 +315,12 @@ impl Store {
     /// Rewinding is safe because rescanning is idempotent: claims are keyed by
     /// digest, so re-observing a payment produces a claim the contract already
     /// holds. The cost of a rewind is bandwidth, never correctness.
-    /// Returns whether the checkpoint moved.
-    pub fn rewind_checkpoint_to(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<bool> {
-        let n = self.conn.execute(
+    pub fn rewind_checkpoint_to(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<()> {
+        self.conn.execute(
             "UPDATE chain_checkpoint SET height = ?2 WHERE network = ?1 AND height > ?2",
             params![net.as_str(), height as i64],
         )?;
-        Ok(n > 0)
-    }
-
-    /// Move the checkpoint forward to `to`, but only from `from`, the height
-    /// it held when the caller last read it. False when something moved it in
-    /// between, which here means a watch request rewound it: the caller stops,
-    /// and its next round starts from the rewound height instead of writing
-    /// over the rewind.
-    pub fn advance_checkpoint(
-        &self,
-        net: BitcoinNetwork,
-        from: Option<u32>,
-        to: &BlockAnchor,
-    ) -> anyhow::Result<bool> {
-        let n = match from {
-            Some(h) => self.conn.execute(
-                "UPDATE chain_checkpoint SET height = ?2, block_hash = ?3
-                 WHERE network = ?1 AND height = ?4",
-                params![net.as_str(), to.height as i64, to.hash.0.to_vec(), h as i64],
-            )?,
-            None => self.conn.execute(
-                "INSERT OR IGNORE INTO chain_checkpoint (network, height, block_hash)
-                 VALUES (?1, ?2, ?3)",
-                params![net.as_str(), to.height as i64, to.hash.0.to_vec()],
-            )?,
-        };
-        Ok(n > 0)
+        Ok(())
     }
 
     pub fn set_checkpoint(&self, net: BitcoinNetwork, a: &BlockAnchor) -> anyhow::Result<()> {
@@ -893,61 +866,6 @@ impl Store {
         Ok(out)
     }
 
-    /// The tip of `net` when a request last made the bridge rescan it.
-    pub fn last_rewind(&self, net: BitcoinNetwork) -> anyhow::Result<Option<u32>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT value FROM inbox_meta WHERE name = ?1",
-                params![format!("rewind:{}", net.as_str())],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()?
-            .map(|v| v as u32))
-    }
-
-    pub fn set_last_rewind(&self, net: BitcoinNetwork, tip: u32) -> anyhow::Result<()> {
-        self.conn.execute(
-            "INSERT INTO inbox_meta (name, value) VALUES (?1, ?2)
-             ON CONFLICT(name) DO UPDATE SET value = ?2",
-            params![format!("rewind:{}", net.as_str()), tip as i64],
-        )?;
-        Ok(())
-    }
-
-    /// The lowest height requests have asked `net` to be rescanned from, not
-    /// yet done.
-    pub fn pending_rescan(&self, net: BitcoinNetwork) -> anyhow::Result<Option<u32>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT value FROM inbox_meta WHERE name = ?1",
-                params![format!("rescan:{}", net.as_str())],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()?
-            .map(|v| v as u32))
-    }
-
-    /// Ask for `net` to be rescanned from `from`. Only the lowest height asked
-    /// for is kept, since one rescan from there covers every request.
-    pub fn request_rescan(&self, net: BitcoinNetwork, from: u32) -> anyhow::Result<()> {
-        self.conn.execute(
-            "INSERT INTO inbox_meta (name, value) VALUES (?1, ?2)
-             ON CONFLICT(name) DO UPDATE SET value = MIN(value, ?2)",
-            params![format!("rescan:{}", net.as_str()), from as i64],
-        )?;
-        Ok(())
-    }
-
-    pub fn clear_pending_rescan(&self, net: BitcoinNetwork) -> anyhow::Result<()> {
-        self.conn.execute(
-            "DELETE FROM inbox_meta WHERE name = ?1",
-            params![format!("rescan:{}", net.as_str())],
-        )?;
-        Ok(())
-    }
-
     /// Run arbitrary SQL, for tests that need to arrange a failure.
     #[cfg(test)]
     pub fn execute_for_test(&self, sql: &str) -> anyhow::Result<()> {
@@ -1271,45 +1189,6 @@ mod tests {
             InterestChange::Stale,
             "what was recorded after migrating survives the next open"
         );
-    }
-
-    #[test]
-    fn the_checkpoint_only_advances_from_where_its_writer_last_saw_it() {
-        let s = store();
-        let net = BitcoinNetwork::Signet;
-        let at = |h: u32| BlockAnchor {
-            height: h,
-            hash: BlockHash([h as u8; 32]),
-        };
-        assert!(s.advance_checkpoint(net, None, &at(100)).unwrap());
-        assert!(s.advance_checkpoint(net, Some(100), &at(101)).unwrap());
-        assert!(s.rewind_checkpoint_to(net, 50).unwrap());
-        assert!(
-            !s.advance_checkpoint(net, Some(101), &at(102)).unwrap(),
-            "a rewind happened in between"
-        );
-        assert_eq!(
-            s.checkpoint(net).unwrap().unwrap().height,
-            50,
-            "and the rewind stands"
-        );
-        assert!(
-            !s.rewind_checkpoint_to(net, 60).unwrap(),
-            "a rewind to above the cursor moves nothing, and says so"
-        );
-    }
-
-    #[test]
-    fn a_pending_rescan_keeps_the_lowest_height_asked_for() {
-        let s = store();
-        let net = BitcoinNetwork::Signet;
-        assert_eq!(s.pending_rescan(net).unwrap(), None);
-        s.request_rescan(net, 500).unwrap();
-        s.request_rescan(net, 400).unwrap();
-        s.request_rescan(net, 450).unwrap();
-        assert_eq!(s.pending_rescan(net).unwrap(), Some(400));
-        s.clear_pending_rescan(net).unwrap();
-        assert_eq!(s.pending_rescan(net).unwrap(), None);
     }
 
     /// The observer and the inbox worker write one database through two

@@ -166,7 +166,7 @@ Keys. They receive an address and an amount and pay it with any wallet.
 | Present certificates in endless spellings to multiply RSA checks | Certificates are held in one canonical form, and a delta larger than the caps is refused before anything is verified |
 | Date a request into the future so it outlives every floor | An entry more than 18 blocks above the floor is dropped by every peer and never stored, and the floor only rises |
 | Bring back a request the bridge removed | A tombstone lasts until the floor passes the entry it removes; the bridge records what it acted on, so a request read twice is acted on once |
-| Make the bridge rescan the chain from the start | One request may rewind the scan at most 144 blocks, only for a script new to the bridge, and requests cause at most one rescan per network every 6 blocks. One Ghost Key may have at most 1000 scripts watched |
+| Make the bridge rescan the chain from the start | A request cannot move the scan cursor at all: its `scan_from_height` hint is not acted on yet (#7). One Ghost Key may have at most 1000 scripts watched |
 | Write entries under a Ghost Key anyone can sign for | A certificate for a weak (low-order) key is refused, and signatures are verified strictly |
 | Headers carrying trivially little work | `PowFloor` rejects them — a sanity check only; see below |
 | Withhold a retraction to keep an order looking paid | Depth is capped by the claim's own `as_of`, so a withheld retraction leaves a confirmation worth only the depth the bridge had actually seen. Succeeds only against a reorg at least as deep as the required confirmations — see "Withholding a retraction" |

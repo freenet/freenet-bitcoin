@@ -55,24 +55,12 @@ use crate::config::{BridgeConfig, NetworkConfig};
 use crate::freenet::is_not_found;
 use crate::store::{Interest, InterestChange, Store, WatchedScript};
 
-/// How far back one request may make the bridge rescan, in blocks.
-///
-/// A request's `scan_from_height` rewinds the scan cursor of its whole
-/// network, so every request that uses it costs a rescan of up to this many
-/// blocks for every watched script. A day covers what the hint is for, an
-/// address handed out recently; a freshly derived address needs none.
-pub const MAX_REQUEST_BACKFILL_BLOCKS: u32 = 144;
-
 /// Scripts one Ghost Key may have this bridge watch at once.
 ///
 /// The inbox bounds how many requests a Ghost Key has in flight, not how many
 /// it makes over time, so without this one Ghost Key could grow the watch list,
 /// and the work of scanning every block against it, without limit.
 pub const MAX_WATCHES_PER_GHOSTKEY: usize = 1000;
-
-/// Least number of blocks between two rescans that requests cause on one
-/// network. See where it is used, in `Processor::act`.
-pub const REWIND_INTERVAL_BLOCKS: u32 = 6;
 
 /// How often the inbox is read even when no notification arrives.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -115,8 +103,6 @@ pub struct Pass {
     pub delta: InboxDelta,
     /// Entries acted on for the first time.
     pub acted: usize,
-    /// A rescan a request asked for is waiting for its turn.
-    pub rescan_pending: bool,
 }
 
 pub struct Processor<'a> {
@@ -200,39 +186,7 @@ impl Processor<'_> {
                 pass.delta.floor = Some(SignedFloor::sign(self.key, t));
             }
         }
-        pass.rescan_pending = self.apply_pending_rescans(tips)?;
         Ok(pass)
-    }
-
-    /// Do the rescans requests have asked for, as far as the limit allows.
-    /// Returns whether any is still waiting.
-    fn apply_pending_rescans(&self, tips: &Tips) -> Result<bool> {
-        let mut waiting = false;
-        for &net in self.observed {
-            let Some(from) = self.store.pending_rescan(net)? else {
-                continue;
-            };
-            let Some(&tip) = tips.by_network.get(&net) else {
-                waiting = true;
-                continue;
-            };
-            // A tip below the last rescan's means the chain was reset or the
-            // node changed: the old stamp says nothing about now.
-            let due = self.store.last_rewind(net)?.is_none_or(|last| {
-                tip < last || tip >= last.saturating_add(REWIND_INTERVAL_BLOCKS)
-            });
-            if !due {
-                waiting = true;
-                continue;
-            }
-            // Only a rewind that moved the cursor uses up the budget.
-            if self.store.rewind_checkpoint_to(net, from)? {
-                self.store.set_last_rewind(net, tip)?;
-                tracing::info!(network = ?net, from, "rescanning for watches that asked for it");
-            }
-            self.store.clear_pending_rescan(net)?;
-        }
-        Ok(waiting)
     }
 
     /// Act on one entry. An error here is the store failing, and rolls back
@@ -264,21 +218,18 @@ impl Processor<'_> {
         let mut refused = 0usize;
         match req.action {
             Action::Watch => {
-                // The tip only bounds the rescan. Unreadable, the script is
-                // still watched and scanned from wherever the cursor is; the
-                // request is never held back for it.
+                // A new script is watched from wherever the scan cursor is.
+                // The request's `scan_from_height` hint is not acted on yet:
+                // freenet/freenet-bitcoin#7 has why, and the design it needs.
+                // The height recorded with the watch is informational, the tip
+                // when it began, or `u32::MAX` when no tip was known.
                 let tip = match tips.by_network.get(&net) {
                     Some(&t) => Some(t),
                     None => self.store.checkpoint(net)?.map(|a| a.height),
                 };
-                let scan_from = tip.map(|t| {
-                    let earliest = t.saturating_sub(MAX_REQUEST_BACKFILL_BLOCKS);
-                    req.scan_from_height.unwrap_or(t).clamp(earliest, t)
-                });
-                if tip.is_none() && req.scan_from_height.is_some() {
-                    tracing::warn!(network = ?net, "a watch asked for a rescan, but this network's tip is unknown, so none is done");
+                if req.scan_from_height.is_some() {
+                    tracing::debug!(network = ?net, "a watch's rescan hint was not acted on (freenet-bitcoin#7)");
                 }
-                let mut added = 0usize;
                 for script in &req.scripts {
                     let i = Interest {
                         network: net,
@@ -292,37 +243,19 @@ impl Processor<'_> {
                         .set_interest(&i, self.max_watches_per_ghostkey, now_ms)?
                     {
                         InterestChange::Watching => {
-                            // The column records the earliest height anyone
-                            // asked to scan from; with no tip, nobody asked
-                            // for any, which only `u32::MAX` says.
-                            let existed = self.store.add_watch(
+                            self.store.add_watch(
                                 &WatchedScript {
                                     network: net,
                                     script_pubkey: script.0.clone(),
-                                    scan_from_height: scan_from.unwrap_or(u32::MAX),
+                                    scan_from_height: tip.unwrap_or(u32::MAX),
                                     is_public_demo: false,
                                 },
                                 now_ms,
                             )?;
                             changed += 1;
-                            if !existed {
-                                added += 1;
-                            }
                         }
                         InterestChange::OverCap => refused += 1,
                         _ => {}
-                    }
-                }
-                // A rescan moves the whole network's cursor back, delaying
-                // every watched script, so only a script new to the bridge asks
-                // for one. It is recorded rather than done here:
-                // `apply_pending_rescans` does the lowest one asked for, at most
-                // once per network every REWIND_INTERVAL_BLOCKS, so no
-                // request's backfill is lost to the limit, and repeated or
-                // alternating requests cannot keep the cursor behind.
-                if let (Some(from), Some(t)) = (scan_from, tip) {
-                    if added > 0 && from < t {
-                        self.store.request_rescan(net, from)?;
                     }
                 }
                 tracing::info!(network = ?net, scripts = req.scripts.len(), watching = changed, refused, "watch request read");
@@ -675,7 +608,7 @@ impl InboxWorker {
         };
         session
             .quiet
-            .after_pass(fingerprint, !pass.delta.is_empty() || pass.rescan_pending);
+            .after_pass(fingerprint, !pass.delta.is_empty());
         if pass.acted > 0 {
             tracing::info!(acted = pass.acted, "read the request inbox");
         }
@@ -1151,8 +1084,11 @@ mod tests {
         );
     }
 
+    /// Until freenet-bitcoin#7, a request cannot move the scan cursor at all:
+    /// every way this PR tried to let it do so raced the observer, which is
+    /// the only thing that should move it.
     #[test]
-    fn a_request_cannot_rewind_the_scan_past_the_backfill_bound() {
+    fn a_watchs_rescan_hint_moves_no_cursor() {
         let store = Store::open_in_memory().unwrap();
         store
             .set_checkpoint(
@@ -1173,9 +1109,15 @@ mod tests {
             ),
             &tips(),
         );
-        let earliest = SIGNET_TIP - MAX_REQUEST_BACKFILL_BLOCKS;
-        assert_eq!(store.watched(SIGNET).unwrap()[0].scan_from_height, earliest);
-        assert_eq!(store.checkpoint(SIGNET).unwrap().unwrap().height, earliest);
+        assert_eq!(
+            store.checkpoint(SIGNET).unwrap().unwrap().height,
+            SIGNET_TIP
+        );
+        assert_eq!(
+            store.watched(SIGNET).unwrap()[0].scan_from_height,
+            SIGNET_TIP,
+            "watched from where the tip was"
+        );
     }
 
     #[test]
@@ -1313,91 +1255,6 @@ mod tests {
         let pass = run(&store, &state, &tips());
         assert_eq!(pass.acted, 1);
         assert_eq!(watched(&store).len(), 2, "both scripts, on the retry");
-    }
-
-    /// A rescan moves the whole network's cursor, so requests share a budget.
-    /// Nothing asked for may be lost to it.
-    #[test]
-    fn a_rescan_is_earned_only_by_a_new_script_and_waits_its_turn() {
-        let store = Store::open_in_memory().unwrap();
-        let checkpoint_at = |h: u32| {
-            store
-                .set_checkpoint(
-                    SIGNET,
-                    &BlockAnchor {
-                        height: h,
-                        hash: BlockHash([0; 32]),
-                    },
-                )
-                .unwrap()
-        };
-        let backfill = |script: &[u8], from: u32| {
-            let mut r = request(Action::Watch, script, 1);
-            r.scan_from_height = Some(from);
-            r
-        };
-        let height = || store.checkpoint(SIGNET).unwrap().unwrap().height;
-        let at_tip = |t: u32| {
-            let mut x = tips();
-            x.by_network.insert(SIGNET, t);
-            x
-        };
-        let watch = |g: &TestGhostkey, script: &[u8], from: u32, tip: u32| {
-            run(
-                &store,
-                &inbox(FLOOR, vec![entry(g, FLOOR + 1, &backfill(script, from))]),
-                &at_tip(tip),
-            )
-        };
-        let g = ghostkeys();
-        let t0 = SIGNET_TIP;
-
-        checkpoint_at(t0);
-        watch(&g[0], b"s1", 0, t0);
-        assert_eq!(
-            height(),
-            t0 - MAX_REQUEST_BACKFILL_BLOCKS,
-            "new, and none done lately"
-        );
-
-        // Too soon after that one: this request waits, it is not dropped.
-        checkpoint_at(t0 + 2);
-        let pass = watch(&g[1], b"s2", t0 - 50, t0 + 2);
-        assert_eq!(height(), t0 + 2);
-        assert!(pass.rescan_pending);
-
-        // Its turn comes, with nobody asking again.
-        checkpoint_at(t0 + REWIND_INTERVAL_BLOCKS);
-        let pass = run(
-            &store,
-            &inbox(FLOOR, vec![]),
-            &at_tip(t0 + REWIND_INTERVAL_BLOCKS),
-        );
-        assert_eq!(height(), t0 - 50);
-        assert!(!pass.rescan_pending);
-
-        // A script already watched asks for nothing, even when one is due.
-        let t1 = t0 + 2 * REWIND_INTERVAL_BLOCKS;
-        checkpoint_at(t1);
-        watch(&g[2], b"s1", 0, t1);
-        assert_eq!(height(), t1, "already watched");
-        assert_eq!(store.pending_rescan(SIGNET).unwrap(), None);
-
-        // A rewind that moves nothing (the cursor is already lower) does not
-        // use up the budget...
-        checkpoint_at(t0 - 100);
-        watch(&g[2], b"s3", t1 - 10, t1);
-        assert_eq!(height(), t0 - 100);
-        // ...so the next request, one block later, still gets its rescan.
-        checkpoint_at(t1 + 1);
-        watch(&g[0], b"s4", t1 - 20, t1 + 1);
-        assert_eq!(height(), t1 - 20);
-
-        // A tip below the last rescan's means the chain was reset: the old
-        // stamp says nothing about now.
-        checkpoint_at(110);
-        watch(&g[1], b"s5", 50, 100);
-        assert_eq!(height(), 50);
     }
 
     /// The bridge's rules and the contract its node runs can disagree, as

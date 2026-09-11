@@ -603,6 +603,17 @@ fn a_delta_carries_the_floor_that_admits_its_entries() {
     assert_eq!(other.entries.len(), 1, "and a sender's own submission");
 }
 
+/// A peer behind only on the floor still gets the floor, and nothing else.
+#[test]
+fn a_peer_behind_only_on_the_floor_is_sent_the_floor() {
+    let s = with_entries(105, &[entry(&ghostkeys()[0], 106, 1)]);
+    let mut behind = s.summarize();
+    behind.floor = Some(100);
+    let d = s.delta(&behind).unwrap();
+    assert_eq!(d.floor.map(|f| f.height), Some(105));
+    assert!(d.entries.is_empty() && d.tombstones.is_empty());
+}
+
 #[test]
 fn a_converged_peer_is_sent_nothing() {
     let s = with_entries(100, &[entry(&ghostkeys()[0], 104, 1)]);
@@ -689,8 +700,6 @@ fn one_certificate_spelled_two_ways_is_stored_once() {
     s.verify(&params()).unwrap();
 }
 
-/// A low-order key signs for everyone. The all-zero key is one, and the
-/// notary would certify it if asked.
 /// A reader acting on entries one at a time must still leave out every entry
 /// that does not check.
 #[test]
@@ -753,6 +762,8 @@ fn a_certificate_for_a_weak_key_is_refused() {
     assert!(verify_certificate(&certify(weak), &authority().master).is_err());
 }
 
+/// A low-order key signs for everyone. The all-zero key is one, and the
+/// notary would certify it if asked.
 #[test]
 fn a_weak_ghost_key_is_refused() {
     let weak = ed25519_dalek::VerifyingKey::from_bytes(&[0u8; 32])

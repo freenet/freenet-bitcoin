@@ -284,13 +284,16 @@ contract id as `serving the request inbox`.
 
 ### Backfilling history on a pruned node
 
-A watch request may carry `scan_from_height`, which rewinds the chain cursor so
-a newly-watched script is backfilled rather than only watched going forward.
-Rescanning is idempotent, so this costs bandwidth only. One request may rewind
-at most 144 blocks (about a day) below the tip
-(`inbox::MAX_REQUEST_BACKFILL_BLOCKS`), because the rewind moves the cursor for
-the whole network, not only for that script, so every request that uses it
-costs a rescan for every watched script.
+A watch request may carry `scan_from_height`, a hint that nothing before that
+height needs scanning. **The bridge does not act on it yet**
+(freenet/freenet-bitcoin#7): a new script is watched from wherever the scan
+cursor is. So a payment mined before the bridge reads the watch can be missed,
+most likely after the bridge was down while watches waited in its inbox. #7
+has the design a backfill needs; the attempts to add one in the inbox's first
+PR each raced the observer, which is the only thing that should move the
+cursor.
+
+The startup rewinds described below are separate, and still happen.
 
 The window is bounded, deliberately. A pruned node has not kept the early chain,
 so an unbounded backfill would fail; and on a busy address it would fill the
@@ -318,9 +321,8 @@ enabling `txindex`.
 - **Requests come only through the inbox.** There is no service to expose and
   no reverse proxy to run. The inbox admits only Ghost Key signed entries,
   verified by every peer, and holds at most 2 requests per Ghost Key and 128 in
-  all. The bridge adds its own limits: 1000 watched scripts per Ghost Key, and
-  a rescan of at most 144 blocks, only for a script new to the bridge and at
-  most once per network every 6 blocks.
+  all. The bridge adds its own limit: 1000 watched scripts per Ghost Key. A
+  request cannot move the scan cursor (see "Backfilling history" above).
 - **A tombstone means read, not done.** The bridge removes every entry it
   reads, including ones it cannot open, ones for a network it does not
   observe, and a Watch beyond its sender's limit, whose extra scripts it
