@@ -306,11 +306,10 @@ impl Store {
         }))
     }
 
-    /// Move the checkpoint BACKWARD so a newly-watched script gets backfilled.
-    ///
-    /// Without this, `scan_from_height` on a watch request is silently ignored
-    /// and a script added today never sees a payment made yesterday -- the
-    /// bridge would only ever scan forward from wherever it happened to be.
+    /// Move the checkpoint back to `height`, never forward, and never create
+    /// one. Only the startup rewinds call this (the demo scripts' backfill and
+    /// the tip contract's refill), before the observer starts. A watch request
+    /// does not: see freenet/freenet-bitcoin#7.
     ///
     /// Rewinding is safe because rescanning is idempotent: claims are keyed by
     /// digest, so re-observing a payment produces a claim the contract already
@@ -350,9 +349,10 @@ impl Store {
                  (network, script_pubkey, scan_from_height, is_public_demo, first_seen_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(network, script_pubkey) DO UPDATE SET
-                 -- Keep the EARLIEST scan height ever requested: a later
-                 -- requester asking to scan from a high block must not make us
-                 -- forget history an earlier one is relying on.
+                 -- Keep the lowest height recorded. Nothing reads it to
+                 -- decide a scan yet (freenet/freenet-bitcoin#7); once a
+                 -- backfill does, a later requester must not cut short the
+                 -- history an earlier one asked for.
                  scan_from_height = MIN(scan_from_height, ?3),
                  is_public_demo   = MAX(is_public_demo, ?4)",
             params![
@@ -933,8 +933,9 @@ mod tests {
 
     #[test]
     fn a_second_requester_cannot_raise_the_scan_floor() {
-        // If a later request could push scan_from_height up, it would silently
-        // blind the bridge to history an earlier watcher depends on.
+        // Informational until freenet/freenet-bitcoin#7. Once a backfill reads
+        // it, a later request pushing it up would cut short the history an
+        // earlier watcher asked for.
         let s = store();
         s.add_watch(&watch(b"abc", 100, false), 0).unwrap();
         s.add_watch(&watch(b"abc", 900_000, false), 0).unwrap();
@@ -942,6 +943,37 @@ mod tests {
             s.watched(BitcoinNetwork::Signet).unwrap()[0].scan_from_height,
             100
         );
+    }
+
+    /// A rewind that moved the cursor forward would skip the blocks between,
+    /// and every payment in them would never be seen.
+    #[test]
+    fn a_rewind_only_ever_moves_the_checkpoint_back() {
+        let s = store();
+        let at = |h| BlockAnchor {
+            height: h,
+            hash: BlockHash([0; 32]),
+        };
+        s.set_checkpoint(BitcoinNetwork::Signet, &at(500)).unwrap();
+        s.rewind_checkpoint_to(BitcoinNetwork::Signet, 800).unwrap();
+        assert_eq!(
+            s.checkpoint(BitcoinNetwork::Signet)
+                .unwrap()
+                .unwrap()
+                .height,
+            500
+        );
+        s.rewind_checkpoint_to(BitcoinNetwork::Signet, 300).unwrap();
+        assert_eq!(
+            s.checkpoint(BitcoinNetwork::Signet)
+                .unwrap()
+                .unwrap()
+                .height,
+            300
+        );
+        s.rewind_checkpoint_to(BitcoinNetwork::Bitcoin, 300)
+            .unwrap();
+        assert!(s.checkpoint(BitcoinNetwork::Bitcoin).unwrap().is_none());
     }
 
     #[test]

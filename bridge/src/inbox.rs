@@ -218,8 +218,10 @@ impl Processor<'_> {
         let mut refused = 0usize;
         match req.action {
             Action::Watch => {
-                // A new script is watched from wherever the scan cursor is.
-                // The request's `scan_from_height` hint is not acted on yet:
+                // A new script is watched from the observer's next round: it
+                // reads its watch list once a round, so blocks left in the
+                // round already running are not checked for it. The request's
+                // `scan_from_height` hint is not acted on yet:
                 // freenet/freenet-bitcoin#7 has why, and the design it needs.
                 // The height recorded with the watch is informational, the tip
                 // when it began, or `u32::MAX` when no tip was known.
@@ -1022,7 +1024,41 @@ mod tests {
         assert_eq!(
             store.watched(SIGNET).unwrap()[0].scan_from_height,
             u32::MAX,
-            "no rescan was asked for, so no height is recorded"
+            "no tip or checkpoint was known, so no height is recorded"
+        );
+    }
+
+    /// With the tip unreadable, the height recorded is where the scan has got
+    /// to, rather than no height at all.
+    #[test]
+    fn a_watch_with_its_networks_tip_unreadable_records_the_checkpoint() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set_checkpoint(
+                SIGNET,
+                &BlockAnchor {
+                    height: SIGNET_TIP - 3,
+                    hash: BlockHash([0; 32]),
+                },
+            )
+            .unwrap();
+        let mut no_signet = tips();
+        no_signet.by_network.remove(&SIGNET);
+        run(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![entry(
+                    &ghostkeys()[0],
+                    FLOOR + 1,
+                    &request(Action::Watch, b"spk", 1),
+                )],
+            ),
+            &no_signet,
+        );
+        assert_eq!(
+            store.watched(SIGNET).unwrap()[0].scan_from_height,
+            SIGNET_TIP - 3
         );
     }
 
