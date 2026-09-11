@@ -405,7 +405,16 @@ fn the_inbox_as_a_whole_keeps_only_its_newest_records() {
         .map(|(i, gk)| entry(gk, 100 + (i as u32 % WINDOW_BLOCKS), 1))
         .collect();
     assert!(es.len() > MAX_RECORDS);
-    let s = with_entries(100, &es);
+    // More than one delta may carry, so in two.
+    let mut s = with_entries(100, &es[..MAX_RECORDS]);
+    s.apply_delta(
+        &params(),
+        &InboxDelta {
+            entries: es[MAX_RECORDS..].to_vec(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(s.entries.len(), MAX_RECORDS);
     s.verify(&params()).unwrap();
 }
@@ -450,6 +459,11 @@ fn a_tombstone_keeps_its_entrys_slot() {
 /// A random valid state drawn from a shared pool of records, so different
 /// states overlap, collide on caps, and tombstone each other's entries.
 fn random_state(rng: &mut StdRng, pool: &[WireEntry]) -> InboxStateV1 {
+    // Sometimes a peer that has never seen the inbox opened: the commonest
+    // first contact, and a different path through the merge.
+    if rng.gen_bool(0.15) {
+        return InboxStateV1::default();
+    }
     let floor = 100 + rng.gen_range(0..6);
     let mut s = open_at(floor);
     let chosen: Vec<WireEntry> = pool.iter().filter(|_| rng.gen_bool(0.5)).cloned().collect();
@@ -562,6 +576,143 @@ fn a_converged_peer_is_sent_nothing() {
     assert!(s.delta(&s.summarize()).is_none());
 }
 
+/// The summary goes to every interested peer on every heartbeat, so it must
+/// not grow with the inbox.
+#[test]
+fn a_summary_is_the_same_small_size_whatever_the_inbox_holds() {
+    let empty = to_cbor(&open_at(100).summarize()).unwrap();
+    let es: Vec<WireEntry> = ghostkeys()[..40]
+        .iter()
+        .enumerate()
+        .map(|(i, g)| entry(g, 100 + (i as u32 % WINDOW_BLOCKS), 1))
+        .collect();
+    let full = to_cbor(&with_entries(100, &es).summarize()).unwrap();
+    assert_eq!(empty.len(), full.len());
+    assert!(full.len() < 600, "summary is {} bytes", full.len());
+}
+
+// --- bounds and canonical forms -----------------------------------------------------
+
+#[test]
+fn a_delta_larger_than_the_caps_is_refused_before_anything_is_checked() {
+    let w = entry(&ghostkeys()[0], 104, 1);
+    let t = SignedTombstone::for_entry(&bridge_sk(), w.entry.key(), &w.entry);
+    let mut s = open_at(100);
+    let before = bytes(&s);
+    let many_tombstones = InboxDelta {
+        tombstones: vec![t; MAX_RECORDS + 1],
+        ..Default::default()
+    };
+    assert!(s.apply_delta(&params(), &many_tombstones).is_err());
+    let many_entries = InboxDelta {
+        entries: vec![w; MAX_RECORDS + 1],
+        ..Default::default()
+    };
+    assert!(s.apply_delta(&params(), &many_entries).is_err());
+    assert_eq!(bytes(&s), before);
+}
+
+/// A delta refused part-way must leave nothing of itself behind.
+#[test]
+fn a_refused_delta_changes_nothing() {
+    let mut s = open_at(100);
+    let before = bytes(&s);
+    let good = entry(&ghostkeys()[0], 104, 1);
+    // Beyond the window even of the floor this same delta raises.
+    let beyond = entry(&ghostkeys()[1], 101 + WINDOW_BLOCKS + 1, 2);
+    let d = InboxDelta {
+        floor: Some(SignedFloor::sign(&bridge_sk(), 101)),
+        entries: vec![good, beyond],
+        ..Default::default()
+    };
+    assert!(s.apply_delta(&params(), &d).is_err());
+    assert_eq!(bytes(&s), before);
+}
+
+/// `ghostkey_lib` reads a certificate out of any surrounding text, so one
+/// certificate can be sent in unlimited spellings. The state holds one.
+#[test]
+fn a_certificate_is_stored_in_its_one_form_however_it_was_sent() {
+    let g = &ghostkeys()[0];
+    let mut w = entry(g, 104, 1);
+    w.certificate_pem = format!("any text at all\n{}\nand more after", g.pem);
+    let s = with_entries(100, &[w]);
+    assert_eq!(s.certificates.values().next(), Some(&g.pem));
+    s.verify(&params()).unwrap();
+}
+
+#[test]
+fn verify_refuses_a_certificate_not_in_its_one_form() {
+    let g = &ghostkeys()[0];
+    let good = with_entries(100, &[entry(g, 104, 1)]);
+    let wrapped = format!("wrapped\n{}", g.pem);
+    let mut e = good.entries.values().next().unwrap().clone();
+    e.cert = cert_key(&wrapped);
+    let mut s = good.clone();
+    s.entries = [(e.key(), e)].into_iter().collect();
+    s.certificates = [(cert_key(&wrapped), wrapped)].into_iter().collect();
+    assert!(s.verify(&params()).is_err());
+}
+
+#[test]
+fn a_floor_and_tombstones_arriving_together_apply_as_one_after_the_other() {
+    let g = &ghostkeys()[0];
+    let low = entry(g, 104, 1);
+    let high = entry(g, 110, 2);
+    let base = with_entries(100, &[low, high.clone()]);
+    let floor = SignedFloor::sign(&bridge_sk(), 105);
+    let t = SignedTombstone::for_entry(&bridge_sk(), high.entry.key(), &high.entry);
+
+    let mut together = base.clone();
+    together
+        .apply_delta(
+            &params(),
+            &InboxDelta {
+                floor: Some(floor.clone()),
+                tombstones: vec![t.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut apart = base;
+    apart
+        .apply_delta(
+            &params(),
+            &InboxDelta {
+                tombstones: vec![t],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    apart
+        .apply_delta(
+            &params(),
+            &InboxDelta {
+                floor: Some(floor),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(bytes(&together), bytes(&apart));
+    assert!(
+        together.entries.is_empty(),
+        "one below the floor, one removed"
+    );
+    assert_eq!(together.tombstones.len(), 1);
+    together.verify(&params()).unwrap();
+}
+
+#[test]
+fn a_byte_buf_encodes_as_one_byte_string_and_still_reads_an_array() {
+    let encoded = to_cbor(&ByteBuf(vec![1, 2, 200])).unwrap();
+    assert_eq!(encoded, vec![0x43, 1, 2, 200], "major type 2, length 3");
+    let from_array: ByteBuf =
+        freenet_bitcoin_common::from_cbor(&to_cbor(&vec![1u8, 2, 200]).unwrap()).unwrap();
+    assert_eq!(from_array, ByteBuf(vec![1, 2, 200]));
+}
+
 // --- normal form ------------------------------------------------------------------
 
 #[test]
@@ -584,6 +735,21 @@ fn verify_refuses_a_state_that_is_not_in_normal_form() {
     let t = SignedTombstone::for_entry(&bridge_sk(), w.entry.key(), &w.entry);
     s.tombstones.insert(t.entry, t);
     assert!(s.verify(&params()).is_err(), "removed entry still present");
+
+    let mut s = good.clone();
+    let pem = s.certificates.values().next().unwrap().clone();
+    s.certificates.clear();
+    s.certificates.insert(CertKey([7u8; 32]), pem);
+    assert!(
+        s.verify(&params()).is_err(),
+        "certificate under the wrong key"
+    );
+
+    let mut s = open_at(100);
+    let old = entry(&ghostkeys()[1], 99, 3);
+    let t = SignedTombstone::for_entry(&bridge_sk(), old.entry.key(), &old.entry);
+    s.tombstones.insert(t.entry, t);
+    assert!(s.verify(&params()).is_err(), "tombstone below the floor");
 }
 
 // --- sealing ----------------------------------------------------------------------
@@ -599,7 +765,12 @@ mod sealing {
             network: freenet_bitcoin_common::BitcoinNetwork::Bitcoin,
             scripts: vec![ByteBuf(vec![0x00, 0x14, 1, 2, 3])],
             scan_from_height: Some(900_000),
+            made_at_ms: 1_757_000_000_000,
         }
+    }
+
+    fn gk() -> GhostkeyId {
+        GhostkeyId([9u8; 32])
     }
 
     #[test]
@@ -612,26 +783,69 @@ mod sealing {
 
     #[test]
     fn a_sealed_request_opens_for_its_bridge_and_no_other() {
-        let s = seal(&bridge(), &request()).unwrap();
-        assert_eq!(unseal(&bridge_sk(), &s).unwrap(), request());
-        assert!(unseal(&SigningKey::from_bytes(&[1u8; 32]), &s).is_err());
+        let s = seal(&bridge(), &gk(), 100, &request()).unwrap();
+        assert_eq!(unseal(&bridge_sk(), &gk(), 100, &s).unwrap(), request());
+        assert!(unseal(&SigningKey::from_bytes(&[1u8; 32]), &gk(), 100, &s).is_err());
+    }
+
+    /// Without this, anyone could copy another sender's sealed request into
+    /// an entry of their own, and the bridge would record the interest under
+    /// the copier's Ghost Key, where the real sender could never withdraw it.
+    #[test]
+    fn a_sealed_request_opens_only_in_the_entry_it_was_made_for() {
+        let s = seal(&bridge(), &gk(), 100, &request()).unwrap();
+        assert!(
+            unseal(&bridge_sk(), &GhostkeyId([8u8; 32]), 100, &s).is_err(),
+            "another sender's entry"
+        );
+        assert!(
+            unseal(&bridge_sk(), &gk(), 101, &s).is_err(),
+            "the same sender, another entry"
+        );
     }
 
     #[test]
     fn a_tampered_sealed_request_does_not_open() {
-        let mut s = seal(&bridge(), &request()).unwrap();
+        let mut s = seal(&bridge(), &gk(), 100, &request()).unwrap();
         s.ciphertext.0[0] ^= 1;
-        assert!(unseal(&bridge_sk(), &s).is_err());
+        assert!(unseal(&bridge_sk(), &gk(), 100, &s).is_err());
     }
 
     #[test]
     fn a_malformed_request_is_refused_before_sealing() {
         let mut r = request();
         r.scripts.clear();
-        assert!(seal(&bridge(), &r).is_err());
+        assert!(seal(&bridge(), &gk(), 100, &r).is_err());
         let mut r = request();
         r.scripts = vec![ByteBuf(vec![1u8; MAX_SCRIPT_BYTES + 1])];
-        assert!(seal(&bridge(), &r).is_err());
+        assert!(seal(&bridge(), &gk(), 100, &r).is_err());
+        let mut r = request();
+        r.scripts = vec![ByteBuf(vec![1u8; 20]); MAX_SCRIPTS_PER_REQUEST + 1];
+        assert!(seal(&bridge(), &gk(), 100, &r).is_err());
+    }
+
+    /// The largest request allowed must fit in an entry, or a sender following
+    /// every rule could still be refused.
+    #[test]
+    fn the_largest_allowed_request_fits_in_an_entry() {
+        let mut r = request();
+        r.scripts = vec![ByteBuf(vec![0xab; MAX_SCRIPT_BYTES]); MAX_SCRIPTS_PER_REQUEST];
+        let sealed = seal(&bridge(), &gk(), 100, &r).unwrap();
+        let body = InboxEntryBody {
+            bridge: bridge(),
+            mainnet_height: 100,
+            sealed,
+        };
+        let scoped = to_cbor(&ScopedPayload {
+            requestor: webapp(),
+            payload: body.signing_payload().unwrap(),
+        })
+        .unwrap();
+        assert!(
+            scoped.len() <= MAX_SCOPED_PAYLOAD_BYTES,
+            "{} bytes against a limit of {MAX_SCOPED_PAYLOAD_BYTES}",
+            scoped.len()
+        );
     }
 
     /// Pinned because docs/privacy.md relies on it: a request has nowhere to
@@ -648,6 +862,15 @@ mod sealing {
             .map(|(k, _)| k.as_text().expect("field names are text").to_string())
             .collect();
         fields.sort();
-        assert_eq!(fields, ["action", "network", "scan_from_height", "scripts"]);
+        assert_eq!(
+            fields,
+            [
+                "action",
+                "made_at_ms",
+                "network",
+                "scan_from_height",
+                "scripts"
+            ]
+        );
     }
 }

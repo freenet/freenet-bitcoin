@@ -276,18 +276,21 @@ contract id as `serving the request inbox`.
   no requester on record, so no unwatch ends it.
 - **Acted-on entries are recorded** (`inbox_handled`) until the floor passes
   them, so an entry whose tombstone failed to land is removed again rather than
-  acted on again. Deleting the database loses that record; the cost is that
-  requests still in the inbox, at most about an hour's worth, are acted on a
-  second time.
+  acted on again. Each requester's latest request per script is kept with its
+  sender's timestamp, so requests take effect in the order they were made
+  whatever order they arrive in. Deleting the database loses both records; the
+  cost is that requests still in the inbox, a few hours' worth at most, are
+  acted on a second time.
 
 ### Backfilling history on a pruned node
 
 A watch request may carry `scan_from_height`, which rewinds the chain cursor so
 a newly-watched script is backfilled rather than only watched going forward.
 Rescanning is idempotent, so this costs bandwidth only. One request may rewind
-at most 1008 blocks (about a week) below the tip
+at most 144 blocks (about a day) below the tip
 (`inbox::MAX_REQUEST_BACKFILL_BLOCKS`), because the rewind moves the cursor for
-the whole network, not only for that script.
+the whole network, not only for that script, so every request that uses it
+costs a rescan for every watched script.
 
 The window is bounded, deliberately. A pruned node has not kept the early chain,
 so an unbounded backfill would fail; and on a busy address it would fill the
@@ -314,9 +317,14 @@ enabling `txindex`.
   an absence of payments means nothing and the claim would be misleading.
 - **Requests come only through the inbox.** There is no service to expose and
   no reverse proxy to run. The inbox admits only Ghost Key signed entries,
-  verified by every peer, and holds at most 8 requests per Ghost Key and 128 in
-  all, so the work anyone can ask of the bridge is bounded by the contract
-  rather than by an operator setting.
+  verified by every peer, and holds at most 2 requests per Ghost Key and 128 in
+  all. The bridge adds its own limits: 1000 watched scripts per Ghost Key, and
+  a rescan of at most 144 blocks per request.
+- **What the inbox does not stop.** Whoever holds 64 Ghost Keys can fill it and
+  keep other requests out for as long as they keep posting. That is the price
+  of censoring a bridge's inbox, paid once in donations; see `MAX_RECORDS` in
+  `inbox/src/lib.rs` for why it cannot be raised without raising what every
+  peer spends validating the inbox.
 
 #### What it bought, measured
 

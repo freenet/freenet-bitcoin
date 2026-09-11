@@ -41,6 +41,37 @@ pub struct Store {
     conn: Connection,
 }
 
+/// The requester recorded for a script someone watched before anyone asked
+/// for it through the inbox. No certificate certifies this key, so no request
+/// can ever withdraw it.
+pub const OPERATOR_INTEREST: [u8; 32] = [0; 32];
+
+/// One requester's request about one script.
+#[derive(Clone, Copy, Debug)]
+pub struct Interest<'a> {
+    pub network: BitcoinNetwork,
+    pub script: &'a [u8],
+    pub ghostkey: &'a [u8; 32],
+    pub watching: bool,
+    /// When the sender made the request, by the sender's clock.
+    pub request_ms: u64,
+}
+
+/// What [`Store::set_interest`] did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InterestChange {
+    /// Not newer than this requester's last request about this script.
+    Stale,
+    /// Would take this requester past its limit of watched scripts.
+    OverCap,
+    /// The requester now wants the script.
+    Watching,
+    /// The requester no longer wants it; `last` when nobody else does either.
+    Withdrawn { last: bool },
+    /// A withdrawal from a requester that was not watching it.
+    Unchanged,
+}
+
 /// A script the bridge is currently synchronizing.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WatchedScript {
@@ -191,15 +222,29 @@ impl Store {
                 code_hash  BLOB NOT NULL
             );
 
-            -- Who asked for each script, by Ghost Key, so an unwatch removes
-            -- only the sender's own interest. Never replicated. See the
-            -- module docs.
+            -- Who asked for each script, by Ghost Key, and whether they still
+            -- want it: one row per (script, requester) holding that
+            -- requester's latest request. A withdrawal is kept for a day, so a
+            -- delayed older Watch cannot bring the interest back. Never
+            -- replicated. See the module docs.
             CREATE TABLE IF NOT EXISTS script_interests (
                 network        TEXT NOT NULL,
                 script_pubkey  BLOB NOT NULL,
                 ghostkey       BLOB NOT NULL,
-                since_ms       INTEGER NOT NULL,
+                watching       INTEGER NOT NULL,
+                request_ms     INTEGER NOT NULL,
+                recorded_ms    INTEGER NOT NULL,
                 PRIMARY KEY (network, script_pubkey, ghostkey)
+            );
+            CREATE INDEX IF NOT EXISTS script_interests_by_ghostkey
+                ON script_interests (ghostkey, watching);
+
+            -- The inbox's own bookkeeping. Today only `signed_floor`, the
+            -- highest floor this bridge has signed: entries below it are never
+            -- acted on, even if a stale copy of the inbox presents them again.
+            CREATE TABLE IF NOT EXISTS inbox_meta (
+                name   TEXT PRIMARY KEY,
+                value  INTEGER NOT NULL
             );
 
             -- Inbox entries already acted on. A tombstone can fail to land,
@@ -646,47 +691,130 @@ impl Store {
 
     // --- who asked for each script ------------------------------------------
 
-    /// Record that `ghostkey` wants `script` synchronized.
-    pub fn add_interest(
+    /// Record one requester's latest request about one script.
+    ///
+    /// Requests are applied in the order their sender made them, by
+    /// `request_ms`, whatever order they arrive in: a request no newer than
+    /// the one already recorded for that requester and script changes
+    /// nothing. Call inside [`Store::with_transaction`] together with the
+    /// watch change it implies, so the two cannot come apart.
+    pub fn set_interest(
         &self,
-        net: BitcoinNetwork,
-        script: &[u8],
-        ghostkey: &[u8; 32],
+        i: &Interest,
+        max_per_ghostkey: usize,
         now_ms: i64,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<InterestChange> {
+        let net = i.network.as_str();
+        let gk = i.ghostkey.to_vec();
+        let request_ms = i.request_ms.min(i64::MAX as u64) as i64;
+        let existing: Option<(bool, i64)> = self
+            .conn
+            .query_row(
+                "SELECT watching, request_ms FROM script_interests
+                 WHERE network = ?1 AND script_pubkey = ?2 AND ghostkey = ?3",
+                params![net, i.script, gk],
+                |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        if existing.is_some_and(|(_, prev)| request_ms <= prev) {
+            return Ok(InterestChange::Stale);
+        }
+        let was_watching = existing.is_some_and(|(w, _)| w);
+
+        if i.watching && !was_watching {
+            let held: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM script_interests WHERE ghostkey = ?1 AND watching = 1",
+                params![gk],
+                |r| r.get(0),
+            )?;
+            if held as usize >= max_per_ghostkey {
+                return Ok(InterestChange::OverCap);
+            }
+            // A script watched before anyone asked for it through the inbox,
+            // an operator's demo script or one registered before the inbox
+            // existed, has no requester on record. Give it one that never
+            // leaves, so inbox requesters leaving cannot end it.
+            if self.watchers(i.network, i.script)? == 0 && self.is_watched(i.network, i.script)? {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO script_interests
+                         (network, script_pubkey, ghostkey, watching, request_ms, recorded_ms)
+                     VALUES (?1, ?2, ?3, 1, 0, ?4)",
+                    params![net, i.script, OPERATOR_INTEREST.to_vec(), now_ms],
+                )?;
+            }
+        }
+
         self.conn.execute(
-            "INSERT OR IGNORE INTO script_interests (network, script_pubkey, ghostkey, since_ms)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![net.as_str(), script, ghostkey.to_vec(), now_ms],
+            "INSERT INTO script_interests
+                 (network, script_pubkey, ghostkey, watching, request_ms, recorded_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(network, script_pubkey, ghostkey) DO UPDATE SET
+                 watching = ?4, request_ms = ?5, recorded_ms = ?6",
+            params![net, i.script, gk, i.watching as i64, request_ms, now_ms],
+        )?;
+
+        Ok(match (i.watching, was_watching) {
+            (true, _) => InterestChange::Watching,
+            (false, false) => InterestChange::Unchanged,
+            (false, true) => InterestChange::Withdrawn {
+                last: self.watchers(i.network, i.script)? == 0,
+            },
+        })
+    }
+
+    /// How many requesters currently want `script`.
+    fn watchers(&self, net: BitcoinNetwork, script: &[u8]) -> anyhow::Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM script_interests
+             WHERE network = ?1 AND script_pubkey = ?2 AND watching = 1",
+            params![net.as_str(), script],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Forget withdrawals recorded before `cutoff_ms`. A withdrawal only has
+    /// to outlive any older request still in the inbox, which is hours.
+    pub fn prune_withdrawals_before(&self, cutoff_ms: i64) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM script_interests WHERE watching = 0 AND recorded_ms < ?1",
+            params![cutoff_ms],
         )?;
         Ok(())
     }
 
-    /// Withdraw `ghostkey`'s interest in `script`.
-    ///
-    /// Returns how many requesters still want it, or `None` if `ghostkey` had
-    /// never asked for it, in which case nothing changed. The distinction is
-    /// what stops a stranger's unwatch from ending a watch it never held.
-    pub fn remove_interest(
-        &self,
-        net: BitcoinNetwork,
-        script: &[u8],
-        ghostkey: &[u8; 32],
-    ) -> anyhow::Result<Option<usize>> {
-        let removed = self.conn.execute(
-            "DELETE FROM script_interests
-             WHERE network = ?1 AND script_pubkey = ?2 AND ghostkey = ?3",
-            params![net.as_str(), script, ghostkey.to_vec()],
+    // --- inbox bookkeeping --------------------------------------------------
+
+    /// The highest floor this bridge has signed for its inbox.
+    pub fn signed_floor(&self) -> anyhow::Result<Option<u32>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM inbox_meta WHERE name = 'signed_floor'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|v| v as u32))
+    }
+
+    /// Record a floor this bridge signed. Only ever raises the record.
+    pub fn set_signed_floor(&self, height: u32) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO inbox_meta (name, value) VALUES ('signed_floor', ?1)
+             ON CONFLICT(name) DO UPDATE SET value = MAX(value, ?1)",
+            params![height as i64],
         )?;
-        if removed == 0 {
-            return Ok(None);
-        }
-        let remaining: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM script_interests WHERE network = ?1 AND script_pubkey = ?2",
-            params![net.as_str(), script],
-            |r| r.get(0),
-        )?;
-        Ok(Some(remaining as usize))
+        Ok(())
+    }
+
+    /// Run `f` as one SQLite transaction: everything it writes lands, or none
+    /// of it does.
+    pub fn with_transaction<T>(&self, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let out = f()?;
+        tx.commit()?;
+        Ok(out)
     }
 
     // --- inbox entries already acted on ------------------------------------
@@ -779,32 +907,139 @@ mod tests {
         assert_eq!(s.watched(BitcoinNetwork::Bitcoin).unwrap().len(), 1);
     }
 
-    #[test]
-    fn interest_is_counted_per_requester() {
-        let s = store();
-        let net = BitcoinNetwork::Signet;
-        s.add_interest(net, b"abc", &[1; 32], 0).unwrap();
-        s.add_interest(net, b"abc", &[2; 32], 0).unwrap();
-        // Asking twice is still one interest.
-        s.add_interest(net, b"abc", &[2; 32], 0).unwrap();
-        assert_eq!(s.remove_interest(net, b"abc", &[1; 32]).unwrap(), Some(1));
-        // Withdrawing an interest never held changes nothing, and says so.
-        assert_eq!(s.remove_interest(net, b"abc", &[9; 32]).unwrap(), None);
-        assert_eq!(s.remove_interest(net, b"abc", &[2; 32]).unwrap(), Some(0));
+    fn interest<'a>(
+        script: &'a [u8],
+        gk: &'a [u8; 32],
+        watching: bool,
+        request_ms: u64,
+    ) -> Interest<'a> {
+        Interest {
+            network: BitcoinNetwork::Signet,
+            script,
+            ghostkey: gk,
+            watching,
+            request_ms,
+        }
     }
 
     #[test]
-    fn interest_is_per_network() {
+    fn a_requesters_latest_request_wins_whatever_order_they_arrive_in() {
         let s = store();
-        s.add_interest(BitcoinNetwork::Signet, b"abc", &[1; 32], 0)
+        let gk = [1u8; 32];
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &gk, false, 20), 10, 0)
+                .unwrap(),
+            InterestChange::Unchanged
+        );
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &gk, true, 10), 10, 0)
+                .unwrap(),
+            InterestChange::Stale,
+            "the earlier Watch arrived after the later Unwatch, and changes nothing"
+        );
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &gk, true, 30), 10, 0)
+                .unwrap(),
+            InterestChange::Watching
+        );
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &gk, true, 30), 10, 0)
+                .unwrap(),
+            InterestChange::Stale,
+            "the same request read twice"
+        );
+    }
+
+    #[test]
+    fn a_withdrawal_says_whether_anyone_still_wants_the_script() {
+        let s = store();
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        s.set_interest(&interest(b"abc", &a, true, 1), 10, 0)
             .unwrap();
-        s.add_interest(BitcoinNetwork::Bitcoin, b"abc", &[1; 32], 0)
+        s.set_interest(&interest(b"abc", &b, true, 1), 10, 0)
             .unwrap();
         assert_eq!(
-            s.remove_interest(BitcoinNetwork::Signet, b"abc", &[1; 32])
+            s.set_interest(&interest(b"abc", &a, false, 2), 10, 0)
                 .unwrap(),
-            Some(0)
+            InterestChange::Withdrawn { last: false }
         );
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &b, false, 2), 10, 0)
+                .unwrap(),
+            InterestChange::Withdrawn { last: true }
+        );
+    }
+
+    #[test]
+    fn a_requester_cannot_watch_more_than_its_limit() {
+        let s = store();
+        let gk = [1u8; 32];
+        s.set_interest(&interest(b"s1", &gk, true, 1), 2, 0)
+            .unwrap();
+        s.set_interest(&interest(b"s2", &gk, true, 1), 2, 0)
+            .unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"s3", &gk, true, 1), 2, 0)
+                .unwrap(),
+            InterestChange::OverCap
+        );
+        s.set_interest(&interest(b"s1", &gk, false, 2), 2, 0)
+            .unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"s3", &gk, true, 3), 2, 0)
+                .unwrap(),
+            InterestChange::Watching,
+            "a withdrawal frees room"
+        );
+    }
+
+    #[test]
+    fn a_script_watched_before_the_inbox_gets_an_owner_that_never_leaves() {
+        let s = store();
+        s.add_watch(&watch(b"old", 0, false), 0).unwrap();
+        let gk = [1u8; 32];
+        s.set_interest(&interest(b"old", &gk, true, 1), 10, 0)
+            .unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"old", &gk, false, 2), 10, 0)
+                .unwrap(),
+            InterestChange::Withdrawn { last: false }
+        );
+    }
+
+    #[test]
+    fn old_withdrawals_are_forgotten() {
+        let s = store();
+        let gk = [1u8; 32];
+        s.set_interest(&interest(b"abc", &gk, false, 20), 10, 1_000)
+            .unwrap();
+        s.prune_withdrawals_before(2_000).unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &gk, true, 10), 10, 3_000)
+                .unwrap(),
+            InterestChange::Watching,
+            "once forgotten, the withdrawal no longer outranks an older request"
+        );
+    }
+
+    #[test]
+    fn the_signed_floor_only_rises() {
+        let s = store();
+        assert_eq!(s.signed_floor().unwrap(), None);
+        s.set_signed_floor(100).unwrap();
+        s.set_signed_floor(90).unwrap();
+        assert_eq!(s.signed_floor().unwrap(), Some(100));
+    }
+
+    #[test]
+    fn a_failed_transaction_leaves_nothing_behind() {
+        let s = store();
+        let r: anyhow::Result<()> = s.with_transaction(|| {
+            s.mark_handled(&[1; 32], 100)?;
+            anyhow::bail!("the step after it failed")
+        });
+        assert!(r.is_err());
+        assert!(!s.is_handled(&[1; 32]).unwrap());
     }
 
     #[test]

@@ -27,10 +27,23 @@
 //!
 //! # Dating, and why it is Bitcoin mainnet
 //!
-//! A contract cannot read a clock, so every entry carries its own date: the
-//! Bitcoin **mainnet** block height when it was made, read by the sender from
-//! the bridge's mainnet tip contract whichever network the request is for.
-//! One reference chain means one floor, and the network stays sealed.
+//! A contract cannot read a clock, so every entry carries its own date, a
+//! Bitcoin **mainnet** block height whichever network the request is for: one
+//! reference chain means one floor, and the network stays sealed. The bridge
+//! keeps the floor [`FLOOR_LAG_BLOCKS`] behind the mainnet tip.
+//!
+//! A sender dates its entry at the top of the window: the inbox's current
+//! floor plus [`WINDOW_BLOCKS`], read from the inbox itself. Records rank
+//! newest first when the caps bind, so an entry dated any lower could be
+//! outranked by one dated higher. At the top of the window nobody can outrank
+//! it by height, only tie with it.
+//!
+//! # What a sender does after sending
+//!
+//! The bridge sends no reply. A sender knows its request was read when the
+//! inbox holds a tombstone for its entry's key. If the entry disappears with
+//! no tombstone, because the floor passed it or the caps pushed it out before
+//! the bridge read it, the sender sends it again.
 //!
 //! # The merge, and the one subtle part
 //!
@@ -97,25 +110,40 @@ pub const FLOOR_LAG_BLOCKS: u32 = 6;
 pub const WINDOW_BLOCKS: u32 = 18;
 
 /// Records (entries plus tombstones) the inbox holds at once.
+///
+/// **This is also what censoring the inbox costs.** Filling it takes
+/// `MAX_RECORDS / MAX_RECORDS_PER_GHOSTKEY` Ghost Keys, 64 of them. Whoever
+/// holds that many can keep every other request out for as long as they keep
+/// posting: the caps rank newest first, and ties at the top of the window are
+/// broken by entry key, which a sender can grind. The price is paid once, in
+/// donations. Raising it means more records, and every record's certificate
+/// is an RSA check each time a peer validates the state.
 pub const MAX_RECORDS: usize = 128;
 
 /// Records one Ghost Key may hold at once.
 ///
-/// A Ghost Key decides who may write, not how much. A tombstone keeps its
-/// entry's slot until the floor passes the entry's height, so this is a limit
-/// on requests in flight per Ghost Key per hour or so. One request carries up
-/// to [`MAX_SCRIPTS_PER_REQUEST`] scripts, so it binds a flooder, not a seller.
-pub const MAX_RECORDS_PER_GHOSTKEY: usize = 8;
+/// A Ghost Key decides who may write; this decides how much of the inbox one
+/// can occupy. Two, so filling the inbox takes as many Ghost Keys as its size
+/// allows. A tombstone keeps its entry's slot until the floor passes the
+/// entry, so a sender's third request in that time displaces its own oldest
+/// record, which loses nothing if the bridge has read it already. Send one
+/// request naming all your scripts rather than several.
+pub const MAX_RECORDS_PER_GHOSTKEY: usize = 2;
 
 /// Scripts one request may name. Enforced by senders and the bridge; the
 /// contract cannot see inside a sealed request, and bounds its size instead.
-pub const MAX_SCRIPTS_PER_REQUEST: usize = 64;
+pub const MAX_SCRIPTS_PER_REQUEST: usize = 32;
 
 /// Longest scriptPubKey accepted. Standard scripts are at most 43 bytes.
 pub const MAX_SCRIPT_BYTES: usize = 100;
 
 /// Largest scoped payload an entry may carry, which bounds the sealed request.
-pub const MAX_SCOPED_PAYLOAD_BYTES: usize = 12 * 1024;
+/// A request naming [`MAX_SCRIPTS_PER_REQUEST`] scripts of
+/// [`MAX_SCRIPT_BYTES`] each seals to about 3.4 KB, and the scoped payload
+/// wrapping it measures 6,818 bytes: `ghostkey-common` encodes the signed
+/// payload as an array of integers, which roughly doubles it. A test pins that
+/// the largest allowed request fits.
+pub const MAX_SCOPED_PAYLOAD_BYTES: usize = 8 * 1024;
 
 /// Largest certificate accepted. A real one is about 1.7 KB.
 pub const MAX_CERTIFICATE_BYTES: usize = 4 * 1024;
@@ -223,6 +251,12 @@ pub struct InboxRequest {
     /// A hint that nothing before this height needs scanning: a freshly
     /// derived address has no history. The bridge may ignore it.
     pub scan_from_height: Option<u32>,
+    /// When the sender made this request, in milliseconds since the Unix
+    /// epoch by the sender's own clock. Only the bridge reads it, to apply one
+    /// sender's requests about one script in the order they were made, which
+    /// neither the entries' heights nor their arrival order can tell it.
+    /// Untrusted, and only ever compared with the same sender's requests.
+    pub made_at_ms: u64,
 }
 
 impl InboxRequest {
@@ -326,7 +360,27 @@ impl InboxEntry {
     }
 }
 
-/// A certificate's identity: a digest of its armoured text.
+/// A certificate's one armoured form: parsed, then armoured again.
+///
+/// `ghostkey_lib` accepts any text around the armour, so without this one
+/// certificate would have unlimited spellings, each a distinct key in the state
+/// and each costing an RSA check. A production certificate is already in this
+/// form, and armouring is a fixed point (both checked 2026-09-10).
+pub fn canonical_certificate(pem: &str) -> Result<String, String> {
+    if pem.len() > MAX_CERTIFICATE_BYTES {
+        return Err(format!(
+            "certificate is {} bytes, limit is {MAX_CERTIFICATE_BYTES}",
+            pem.len()
+        ));
+    }
+    GhostkeyCertificateV1::from_armored_string(pem)
+        .map_err(|e| format!("certificate does not parse: {e:?}"))?
+        .to_armored_string()
+        .map_err(|e| format!("certificate does not armour: {e:?}"))
+}
+
+/// A certificate's identity: a digest of its armoured text, which the state
+/// holds only in canonical form (see [`canonical_certificate`]).
 pub fn cert_key(pem: &str) -> CertKey {
     let mut h = blake3::Hasher::new_derive_key(CERT_KEY_DOMAIN);
     h.update(pem.as_bytes());
@@ -428,6 +482,14 @@ fn check_bridge_sig(bridge: &BridgeId, msg: &[u8], sig: &[u8]) -> Result<(), Str
 }
 
 /// "Ignore anything dated below this": the bridge's floor.
+///
+/// Ed25519 signing is deterministic, so a bridge that signs one height twice
+/// produces one record. The merge still orders two different signatures for
+/// one height (the smaller wins), and likewise for tombstones, so a bridge
+/// that ever signed non-deterministically would not break convergence by
+/// merging. It would break it through summaries, which carry the floor's
+/// height and a tombstone's key but not the signature, so such a pair would
+/// never be reconciled. Bridges must sign deterministically.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct SignedFloor {
     pub height: u32,

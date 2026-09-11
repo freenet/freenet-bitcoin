@@ -292,18 +292,9 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
     // which the bridge has already stopped writing to -- and a reader cannot
     // tell that from "no payments yet", which is the whole failure being
     // removed here.
+    let mut pointers_ok = true;
     if let Some(p) = publisher.as_ref() {
-        for result in bitcoin_freenet_bridge::generation::publish_pointers(p, &signer, &store).await
-        {
-            if let Err(e) = result {
-                // Not fatal: the bridge's real job is unaffected. What is lost
-                // is a reader's ability to notice a re-key, so say so plainly
-                // rather than at debug level.
-                tracing::error!(
-                    "could not publish a generation pointer ({e}); readers built against                      different contract WASM will see an empty page with no error"
-                );
-            }
-        }
+        pointers_ok = publish_pointers_logged(p, &signer, &store).await;
     }
 
     // The inbox worker gets its own OS thread, runtime, SQLite connection and
@@ -351,7 +342,13 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
                     return;
                 }
             };
-            rt.block_on(observation_loop(observe_cfg, signer, store, publisher));
+            rt.block_on(observation_loop(
+                observe_cfg,
+                signer,
+                store,
+                publisher,
+                pointers_ok,
+            ));
         })
         .context("spawning the observer thread")?;
 
@@ -361,6 +358,39 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
     tracing::info!("shutting down");
     drop(observe);
     Ok(())
+}
+
+/// How often generation pointers are re-asserted once they published cleanly.
+const POINTER_REASSERT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// How soon to try again after a pointer failed to publish.
+const POINTER_RETRY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Publish every generation pointer, logging each failure. True when all
+/// published.
+///
+/// A failure is not fatal: the bridge's real job is unaffected. What is lost is
+/// a reader's ability to notice a re-key, or to find the inbox at all, so it is
+/// said plainly rather than at debug level.
+async fn publish_pointers_logged(
+    publisher: &FreenetPublisher,
+    signer: &Signer,
+    store: &Store,
+) -> bool {
+    let mut ok = true;
+    for result in
+        bitcoin_freenet_bridge::generation::publish_pointers(publisher, signer, store).await
+    {
+        if let Err(e) = result {
+            ok = false;
+            tracing::error!(
+                "could not publish a generation pointer ({e}); readers built against different \
+                 contract WASM will see an empty page with no error, and senders cannot find the \
+                 request inbox"
+            );
+        }
+    }
+    ok
 }
 
 /// Follow the chain and publish what we see.
@@ -373,6 +403,7 @@ async fn observation_loop(
     signer: Signer,
     store: Store,
     publisher: Option<Arc<FreenetPublisher>>,
+    pointers_ok: bool,
 ) {
     let mut observers: Vec<Observer> = Vec::new();
     for net_cfg in &cfg.networks {
@@ -381,10 +412,24 @@ async fn observation_loop(
         }
     }
 
+    // Generation pointers are re-asserted for the life of the process, not
+    // only at startup. A pointer that failed to publish would otherwise stay
+    // missing until a restart, and a reader resolving through it finds no
+    // inbox, or reads an old generation of the other contracts. Republishing
+    // an unchanged record is harmless.
+    let pointer_wait = |ok: bool| if ok { POINTER_REASSERT } else { POINTER_RETRY };
+    let mut pointers_due = std::time::Instant::now() + pointer_wait(pointers_ok);
+
     loop {
         for obs in &observers {
             if let Err(e) = observe_once(obs, &signer, &store, publisher.as_deref()).await {
                 tracing::error!(network = ?obs.network(), "observation round failed: {e}");
+            }
+        }
+        if let Some(p) = publisher.as_deref() {
+            if std::time::Instant::now() >= pointers_due {
+                let ok = publish_pointers_logged(p, &signer, &store).await;
+                pointers_due = std::time::Instant::now() + pointer_wait(ok);
             }
         }
         // A short sleep rather than a tight loop. `wait_for_new_block` inside

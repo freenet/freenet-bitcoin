@@ -52,8 +52,17 @@ impl ContractInterface for Contract {
             return Ok(ValidateResult::Valid);
         }
         let params = decode_params(&parameters)?;
-        decode_state(state.as_ref())?
-            .verify(&params)
+        let st = decode_state(state.as_ref())?;
+        // One content, one byte string. Peers decide they agree by comparing
+        // bytes, so a re-encoded copy of a valid state (a byte string sent as
+        // an array, a non-minimal integer) would sit beside the canonical one
+        // with an identical summary and never be healed.
+        if encode(&st)? != state.as_ref() {
+            return Err(invalid(
+                "inbox state is not in its canonical encoding".to_string(),
+            ));
+        }
+        st.verify(&params)
             .map(|_| ValidateResult::Valid)
             .map_err(|e| invalid(format!("inbox state verification failed: {e}")))
     }

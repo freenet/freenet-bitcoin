@@ -3,15 +3,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::VerifyingKey;
-use freenet_bitcoin_common::digest::BucketDigest;
 use ghostkey_lib::armorable::Armorable;
 use ghostkey_lib::ghost_key_certificate::GhostkeyCertificateV1;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    cert_key, verify_certificate, verify_entry, ByteBuf, CertKey, EntryKey, GhostkeyId, InboxEntry,
-    InboxEntryBody, InboxParameters, SignedFloor, SignedTombstone, MAX_RECORDS,
-    MAX_RECORDS_PER_GHOSTKEY, WINDOW_BLOCKS,
+    canonical_certificate, cert_key, verify_certificate, verify_entry, ByteBuf, CertKey, EntryKey,
+    GhostkeyId, InboxEntry, InboxEntryBody, InboxParameters, SignedFloor, SignedTombstone,
+    MAX_RECORDS, MAX_RECORDS_PER_GHOSTKEY, WINDOW_BLOCKS,
 };
 use freenet_bitcoin_common::from_cbor;
 
@@ -24,7 +23,8 @@ pub struct InboxStateV1 {
     /// Absent until the bridge opens the inbox. Nothing is admitted before
     /// then, so nobody can seed an inbox before its owner has.
     pub floor: Option<SignedFloor>,
-    /// Certificates, stored once and shared by every entry of one Ghost Key.
+    /// Certificates in canonical form, stored once and shared by every entry
+    /// of one Ghost Key.
     pub certificates: BTreeMap<CertKey, String>,
     pub entries: BTreeMap<EntryKey, InboxEntry>,
     pub tombstones: BTreeMap<EntryKey, SignedTombstone>,
@@ -42,12 +42,14 @@ impl WireEntry {
     /// Build an entry from what the ghostkey delegate's `SignResult` returned.
     ///
     /// Nothing here is trusted: the contract verifies all of it. This only
-    /// lifts out the two values the state is ordered by.
+    /// lifts out the values the state is ordered by, and puts the
+    /// certificate in the one form the state holds.
     pub fn from_sign_result(
         certificate_pem: String,
         scoped_payload: Vec<u8>,
         signature: Vec<u8>,
     ) -> Result<Self, String> {
+        let certificate_pem = canonical_certificate(&certificate_pem)?;
         let cert = GhostkeyCertificateV1::from_armored_string(&certificate_pem)
             .map_err(|e| format!("certificate does not parse: {e:?}"))?;
         let scoped: ghostkey_common::ScopedPayload = from_cbor(&scoped_payload)?;
@@ -79,6 +81,77 @@ impl InboxDelta {
     }
 }
 
+/// Buckets in a summary digest.
+const BUCKETS: usize = 16;
+const BUCKET_DOMAIN: &str = "freenet-bitcoin/inbox-bucket/v1";
+
+/// A fixed-size digest of a set of record keys: 16 buckets, each a 128-bit
+/// BLAKE3 hash of the sorted keys that fall in it.
+///
+/// Deliberately not the XOR buckets `freenet_bitcoin_common::digest` uses for
+/// claims. Those are sound there because every claim is bridge-signed, so
+/// nobody chooses the keys. Here a sender chooses its entry's key freely, by
+/// sealing again, and four chosen keys that XOR to zero in one bucket (a
+/// generalised birthday search, about 2^22 work) would give two peers equal
+/// summaries of different states, which would then never reconcile. A hash of
+/// the sorted keys needs a collision search instead: 128 bits, because the
+/// attacker controls both sides of the comparison.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Buckets(pub [[u8; 16]; BUCKETS]);
+
+impl Buckets {
+    fn bucket_of(key: &EntryKey) -> usize {
+        (key.0[0] >> 4) as usize
+    }
+
+    /// Keys must arrive in ascending order, as a `BTreeMap` yields them.
+    fn of<'a>(keys: impl Iterator<Item = &'a EntryKey>) -> Self {
+        let mut hashers: Vec<blake3::Hasher> = (0..BUCKETS)
+            .map(|i| {
+                let mut h = blake3::Hasher::new_derive_key(BUCKET_DOMAIN);
+                h.update(&[i as u8]);
+                h
+            })
+            .collect();
+        for k in keys {
+            hashers[Self::bucket_of(k)].update(&k.0);
+        }
+        let mut out = [[0u8; 16]; BUCKETS];
+        for (slot, h) in out.iter_mut().zip(hashers) {
+            slot.copy_from_slice(&h.finalize().as_bytes()[..16]);
+        }
+        Buckets(out)
+    }
+
+    fn differs(&self, other: &Buckets, key: &EntryKey) -> bool {
+        let b = Self::bucket_of(key);
+        self.0[b] != other.0[b]
+    }
+}
+
+impl Serialize for Buckets {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(self.0.as_flattened())
+    }
+}
+
+impl<'de> Deserialize<'de> for Buckets {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let bytes = ByteBuf::deserialize(d)?;
+        if bytes.len() != BUCKETS * 16 {
+            return Err(serde::de::Error::invalid_length(
+                bytes.len(),
+                &"256 bytes of bucket digests",
+            ));
+        }
+        let mut out = [[0u8; 16]; BUCKETS];
+        for (slot, chunk) in out.iter_mut().zip(bytes.chunks_exact(16)) {
+            slot.copy_from_slice(chunk);
+        }
+        Ok(Buckets(out))
+    }
+}
+
 /// What a peer holds, in a fixed size whatever the inbox holds.
 ///
 /// Bucketed, so `delta` may resend a whole bucket rather than one record. That
@@ -86,8 +159,8 @@ impl InboxDelta {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct InboxSummary {
     pub floor: Option<u32>,
-    pub entries: BucketDigest,
-    pub tombstones: BucketDigest,
+    pub entries: Buckets,
+    pub tombstones: Buckets,
 }
 
 /// One slot in the caps' order: (height, key, Ghost Key).
@@ -100,7 +173,7 @@ impl InboxStateV1 {
 
     /// Full verification of a state: every signature and identity, the window,
     /// the caps, and that it is in normal form. A state honest merges produce
-    /// always passes; there is exactly one byte representation of each.
+    /// always passes.
     pub fn verify(&self, params: &InboxParameters) -> Result<(), String> {
         let Some(floor) = &self.floor else {
             if self.entries.is_empty() && self.tombstones.is_empty() && self.certificates.is_empty()
@@ -116,6 +189,9 @@ impl InboxStateV1 {
         for (k, pem) in &self.certificates {
             if cert_key(pem) != *k {
                 return Err("certificate filed under a key that is not its digest".into());
+            }
+            if canonical_certificate(pem)? != *pem {
+                return Err("certificate is not in its canonical form".into());
             }
             certified.insert(*k, verify_certificate(pem, &params.ghostkey_master)?);
         }
@@ -201,6 +277,8 @@ impl InboxStateV1 {
     /// it, so nothing that was discarded can ever be needed again. A "lowest
     /// digests" rule, or a tombstone that freed its slot, would each break
     /// this; the tests assert the merge laws on exact bytes to catch either.
+    /// An oldest-first order would break it too, because the floor removes
+    /// the oldest, which would then be the kept records.
     pub fn normalize(&mut self) {
         let Some(floor) = self.floor_height() else {
             self.certificates.clear();
@@ -234,55 +312,85 @@ impl InboxStateV1 {
     }
 
     /// Apply changes from a peer or a sender. Every incoming record is
-    /// verified before it is admitted; nothing arriving here was covered by an
-    /// earlier check.
+    /// verified before it is admitted, except one already held byte for byte,
+    /// which an earlier check covered.
     ///
+    /// All or nothing: a delta refused part-way leaves the state as it was.
     /// An entry below the floor is dropped, never an error: a peer whose floor
     /// was lower can legitimately send one. An entry above the window IS an
-    /// error, because no valid state can hold one.
+    /// error, because no valid state can hold one: every state's entries lie
+    /// within its own floor's window, and a merge only raises the floor.
     pub fn apply_delta(
         &mut self,
         params: &InboxParameters,
         delta: &InboxDelta,
     ) -> Result<(), String> {
+        // Bounded before anything is verified. Each record is checked on its
+        // own, so without this a delta's cost would follow its size rather
+        // than the caps; tombstones are public, so anyone could otherwise send
+        // thousands of copies of one.
+        if delta.entries.len() > MAX_RECORDS || delta.tombstones.len() > MAX_RECORDS {
+            return Err(format!(
+                "a delta may carry at most {MAX_RECORDS} entries and {MAX_RECORDS} tombstones"
+            ));
+        }
+
+        let mut next = self.clone();
+
         if let Some(f) = &delta.floor {
-            f.verify(&params.bridge)?;
-            let adopt = match &self.floor {
-                None => true,
-                Some(cur) => {
-                    f.height > cur.height || (f.height == cur.height && f.signature < cur.signature)
+            if next.floor.as_ref() != Some(f) {
+                f.verify(&params.bridge)?;
+                let adopt = match &next.floor {
+                    None => true,
+                    Some(cur) => {
+                        f.height > cur.height
+                            || (f.height == cur.height && f.signature < cur.signature)
+                    }
+                };
+                if adopt {
+                    next.floor = Some(f.clone());
                 }
-            };
-            if adopt {
-                self.floor = Some(f.clone());
             }
         }
 
         for t in &delta.tombstones {
+            if next.tombstones.get(&t.entry) == Some(t) {
+                continue;
+            }
             t.verify(&params.bridge)?;
-            let keep_existing = self
+            let keep_existing = next
                 .tombstones
                 .get(&t.entry)
                 .is_some_and(|cur| cur.signature <= t.signature);
             if !keep_existing {
-                self.tombstones.insert(t.entry, t.clone());
+                next.tombstones.insert(t.entry, t.clone());
             }
         }
 
         if !delta.entries.is_empty() {
-            let floor = self
+            let floor = next
                 .floor_height()
                 .ok_or("the inbox is not open yet: its bridge has not set a floor")?;
             let mut certified: BTreeMap<CertKey, VerifyingKey> = BTreeMap::new();
             for w in &delta.entries {
-                let ck = cert_key(&w.certificate_pem);
+                let key = w.entry.key();
+                if next.entries.get(&key) == Some(&w.entry)
+                    || next.tombstones.contains_key(&key)
+                    || w.entry.mainnet_height < floor
+                {
+                    // Held already, removed already, or below the floor:
+                    // nothing this entry could change, so nothing to check.
+                    continue;
+                }
+                let pem = canonical_certificate(&w.certificate_pem)?;
+                let ck = cert_key(&pem);
                 if ck != w.entry.cert {
                     return Err("entry names a different certificate than it carries".into());
                 }
                 let vk = match certified.get(&ck) {
                     Some(v) => *v,
                     None => {
-                        let v = verify_certificate(&w.certificate_pem, &params.ghostkey_master)?;
+                        let v = verify_certificate(&pem, &params.ghostkey_master)?;
                         certified.insert(ck, v);
                         v
                     }
@@ -296,12 +404,13 @@ impl InboxStateV1 {
                         floor.saturating_add(WINDOW_BLOCKS)
                     ));
                 }
-                self.certificates.insert(ck, w.certificate_pem.clone());
-                self.entries.insert(w.entry.key(), w.entry.clone());
+                next.certificates.insert(ck, pem);
+                next.entries.insert(key, w.entry.clone());
             }
         }
 
-        self.normalize();
+        next.normalize();
+        *self = next;
         Ok(())
     }
 
@@ -329,8 +438,8 @@ impl InboxStateV1 {
     pub fn summarize(&self) -> InboxSummary {
         InboxSummary {
             floor: self.floor_height(),
-            entries: BucketDigest::from_keys(self.entries.keys().map(|k| &k.0)),
-            tombstones: BucketDigest::from_keys(self.tombstones.keys().map(|k| &k.0)),
+            entries: Buckets::of(self.entries.keys()),
+            tombstones: Buckets::of(self.tombstones.keys()),
         }
     }
 
@@ -343,21 +452,19 @@ impl InboxStateV1 {
             _ => None,
         };
 
-        let mine = BucketDigest::from_keys(self.entries.keys().map(|k| &k.0));
-        let differing = mine.differing_buckets(&old.entries);
+        let mine = Buckets::of(self.entries.keys());
         let entries: Vec<WireEntry> = self
             .entries
             .iter()
-            .filter(|(k, _)| differing.contains(&BucketDigest::bucket_of(&k.0)))
+            .filter(|(k, _)| mine.differs(&old.entries, k))
             .map(|(_, e)| self.wire(e))
             .collect();
 
-        let mine = BucketDigest::from_keys(self.tombstones.keys().map(|k| &k.0));
-        let differing = mine.differing_buckets(&old.tombstones);
+        let mine = Buckets::of(self.tombstones.keys());
         let tombstones: Vec<SignedTombstone> = self
             .tombstones
             .iter()
-            .filter(|(k, _)| differing.contains(&BucketDigest::bucket_of(&k.0)))
+            .filter(|(k, _)| mine.differs(&old.tombstones, k))
             .map(|(_, t)| t.clone())
             .collect();
 

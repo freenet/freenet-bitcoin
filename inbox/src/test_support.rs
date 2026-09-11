@@ -89,4 +89,17 @@ impl TestGhostkey {
         WireEntry::from_sign_result(self.pem.clone(), scoped, sig)
             .expect("a freshly minted entry is well formed")
     }
+
+    /// An entry carrying `request`, sealed to `bridge` as a real sender seals
+    /// it: bound to this Ghost Key and to `mainnet_height`.
+    pub fn request(
+        &self,
+        bridge: BridgeId,
+        mainnet_height: u32,
+        request: &crate::InboxRequest,
+    ) -> WireEntry {
+        let sealed = crate::seal::seal(&bridge, &self.id(), mainnet_height, request)
+            .expect("a well-formed request seals");
+        self.entry(bridge, mainnet_height, sealed)
+    }
 }

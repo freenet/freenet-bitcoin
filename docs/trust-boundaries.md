@@ -160,10 +160,13 @@ Keys. They receive an address and an amount and pay it with any wallet.
 | Replay a signet observation as mainnet | Network folded into `ScriptId` and checked against parameters |
 | Write to a bridge's inbox without a Ghost Key | Every peer verifies the certificate chain to the master key, and the entry's signature, before storing it |
 | Replay a request into another bridge's inbox | The Ghost Key's signature covers the bridge id; an inbox refuses an entry addressed to another bridge |
-| Flood a bridge's inbox | At most 8 records per Ghost Key and 128 in all, newest kept; each Ghost Key costs a donation |
+| Flood a bridge's inbox | At most 2 records per Ghost Key and 128 in all, newest kept, so filling it takes 64 Ghost Keys. **Not stopped outright:** a holder of that many can keep other requests out while they keep posting. See `MAX_RECORDS` |
+| Copy another sender's sealed request into your own entry | A request is sealed to the sender's Ghost Key and the entry's height as well as to the bridge, so a copy does not open |
+| Replay an old Watch after the sender's Unwatch | Each request carries its sender's timestamp, sealed; the bridge keeps each requester's latest request per script and ignores anything older |
+| Present certificates in endless spellings to multiply RSA checks | Certificates are held in one canonical form, and a delta larger than the caps is refused before anything is verified |
 | Date a request into the future so it outlives every floor | An entry more than 18 blocks above the floor is refused, and the floor only rises |
 | Bring back a request the bridge removed | A tombstone lasts until the floor passes the entry it removes; the bridge records what it acted on, so a request read twice is acted on once |
-| Make the bridge rescan the chain from the start | One request may rewind the scan at most 1008 blocks |
+| Make the bridge rescan the chain from the start | One request may rewind the scan at most 144 blocks, and one Ghost Key may have at most 1000 scripts watched |
 | Headers carrying trivially little work | `PowFloor` rejects them — a sanity check only; see below |
 | Withhold a retraction to keep an order looking paid | Depth is capped by the claim's own `as_of`, so a withheld retraction leaves a confirmation worth only the depth the bridge had actually seen. Succeeds only against a reorg at least as deep as the required confirmations — see "Withholding a retraction" |
 | Seller marks their own order paid without payment | Requires bridge-signed evidence any peer re-verifies; a bare seller signature is not accepted |

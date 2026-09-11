@@ -7,8 +7,13 @@
 //!
 //! The scheme: an ephemeral X25519 agreement with the bridge's key, a key
 //! derived by BLAKE3 from the shared secret and both public keys, and
-//! ChaCha20-Poly1305 with the bridge id as associated data, so a sealed
-//! request cannot be moved to another bridge's inbox and still open.
+//! ChaCha20-Poly1305. The associated data is the bridge id, the sender's Ghost
+//! Key and the entry's height, so a sealed request opens only in the entry it
+//! was made for. Without the Ghost Key there, anyone could copy another
+//! sender's sealed request into an entry of their own: the bridge would record
+//! the interest under the copier's key, and the real sender could never
+//! withdraw it. A sender learns its own Ghost Key from the ghostkey delegate
+//! (`GetCertificate`) before signing.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -17,7 +22,7 @@ use freenet_bitcoin_common::{from_cbor, to_cbor, BridgeId};
 use rand_core::{OsRng, RngCore};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
-use crate::{ByteBuf, EphemeralKey, InboxRequest, Sealed};
+use crate::{ByteBuf, EphemeralKey, GhostkeyId, InboxRequest, Sealed};
 
 const SEAL_KEY_DOMAIN: &str = "freenet-bitcoin/inbox-seal/v1";
 
@@ -40,8 +45,23 @@ fn seal_key(shared: &[u8; 32], ephemeral: &[u8; 32], recipient: &[u8; 32]) -> [u
     *h.finalize().as_bytes()
 }
 
-/// Seal `request` so only `bridge` can open it.
-pub fn seal(bridge: &BridgeId, request: &InboxRequest) -> Result<Sealed, String> {
+/// What a sealed request is bound to: this bridge, this sender, this entry.
+fn associated_data(bridge: &BridgeId, ghostkey: &GhostkeyId, mainnet_height: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(68);
+    v.extend_from_slice(&bridge.0);
+    v.extend_from_slice(&ghostkey.0);
+    v.extend_from_slice(&mainnet_height.to_le_bytes());
+    v
+}
+
+/// Seal `request` so only `bridge` can open it, and only in an entry signed by
+/// `ghostkey` and dated `mainnet_height`.
+pub fn seal(
+    bridge: &BridgeId,
+    ghostkey: &GhostkeyId,
+    mainnet_height: u32,
+    request: &InboxRequest,
+) -> Result<Sealed, String> {
     request.check()?;
     let recipient = bridge_encryption_key(bridge)?;
     let eph = EphemeralSecret::random_from_rng(OsRng);
@@ -56,12 +76,13 @@ pub fn seal(bridge: &BridgeId, request: &InboxRequest) -> Result<Sealed, String>
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
     let plaintext = to_cbor(request)?;
+    let aad = associated_data(bridge, ghostkey, mainnet_height);
     let ciphertext = ChaCha20Poly1305::new(Key::from_slice(&key))
         .encrypt(
             Nonce::from_slice(&nonce),
             Payload {
                 msg: &plaintext,
-                aad: &bridge.0,
+                aad: &aad,
             },
         )
         .map_err(|_| "sealing failed")?;
@@ -72,8 +93,14 @@ pub fn seal(bridge: &BridgeId, request: &InboxRequest) -> Result<Sealed, String>
     })
 }
 
-/// Open a request sealed to this bridge.
-pub fn unseal(signing: &SigningKey, sealed: &Sealed) -> Result<InboxRequest, String> {
+/// Open a request sealed to this bridge, found in an entry signed by
+/// `ghostkey` and dated `mainnet_height`.
+pub fn unseal(
+    signing: &SigningKey,
+    ghostkey: &GhostkeyId,
+    mainnet_height: u32,
+    sealed: &Sealed,
+) -> Result<InboxRequest, String> {
     let secret = bridge_decryption_key(signing);
     let recipient = PublicKey::from(&secret);
     let bridge = BridgeId(signing.verifying_key().to_bytes());
@@ -85,15 +112,16 @@ pub fn unseal(signing: &SigningKey, sealed: &Sealed) -> Result<InboxRequest, Str
         return Err("nonce must be 12 bytes".into());
     }
     let key = seal_key(shared.as_bytes(), &sealed.ephemeral.0, recipient.as_bytes());
+    let aad = associated_data(&bridge, ghostkey, mainnet_height);
     let plaintext = ChaCha20Poly1305::new(Key::from_slice(&key))
         .decrypt(
             Nonce::from_slice(&sealed.nonce),
             Payload {
                 msg: &sealed.ciphertext,
-                aad: &bridge.0,
+                aad: &aad,
             },
         )
-        .map_err(|_| "request does not open with this bridge's key")?;
+        .map_err(|_| "request does not open for this bridge, sender and entry")?;
     let request: InboxRequest = from_cbor(&plaintext)?;
     request.check()?;
     Ok(request)
