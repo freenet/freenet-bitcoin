@@ -166,8 +166,6 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
- "hyper",
- "hyper-util",
  "itoa",
  "matchit",
  "memchr",
@@ -180,11 +178,9 @@ dependencies = [
  "serde_path_to_error",
  "serde_urlencoded",
  "sync_wrapper",
- "tokio",
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -203,7 +199,6 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -292,7 +287,6 @@ name = "bitcoin-freenet-bridge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
  "bitcoin",
  "bitcoincore-rpc",
  "blake3",
@@ -302,12 +296,12 @@ dependencies = [
  "ed25519-dalek",
  "freenet-bitcoin-common",
  "freenet-bitcoin-generation",
+ "freenet-bitcoin-inbox",
  "freenet-migrate",
  "freenet-migrate-build",
  "freenet-scaffold",
  "freenet-stdlib",
  "futures",
- "ghostkey_lib",
  "hex",
  "rand 0.8.8",
  "rusqlite",
@@ -318,7 +312,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "toml",
- "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2317,7 +2310,6 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
- "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -4466,7 +4458,6 @@ dependencies = [
  "tokio",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -4480,12 +4471,10 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
- "http-body-util",
  "pin-project-lite",
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
  "url",
 ]
 
@@ -4507,7 +4496,6 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
- "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",

@@ -12,6 +12,7 @@
 //! The bridge tracks what it has already sent purely as an optimisation, and
 //! losing that record is harmless.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -29,26 +30,52 @@ use tokio::sync::Mutex;
 
 const REQUEST_TIMEOUT_S: u64 = 60;
 
+/// The contract WASM a bridge runs, read from its `contract_dir`.
+pub struct ContractWasm {
+    pub address: Vec<u8>,
+    pub tip: Vec<u8>,
+    pub inbox: Vec<u8>,
+}
+
+impl ContractWasm {
+    pub fn load(dir: &Path) -> Result<Self> {
+        let read = |name: &str| {
+            std::fs::read(dir.join(name))
+                .with_context(|| format!("reading {name} from {}", dir.display()))
+        };
+        Ok(ContractWasm {
+            address: read("bitcoin_address_contract.wasm")?,
+            tip: read("bitcoin_tip_contract.wasm")?,
+            inbox: read("bitcoin_inbox_contract.wasm")?,
+        })
+    }
+}
+
 /// A connection to a local Freenet node, plus the contract WASM needed to
 /// derive keys and to PUT a contract that does not exist yet.
 pub struct FreenetPublisher {
     api: Arc<Mutex<WebApi>>,
     address_code: Arc<ContractCode<'static>>,
     tip_code: Arc<ContractCode<'static>>,
+    /// Held for its code hash, which the inbox generation pointer names. The
+    /// inbox itself is read and written by `inbox::InboxWorker` over its own
+    /// connection.
+    inbox_code: Arc<ContractCode<'static>>,
     /// The frozen pointer contract. Vendored bytes, never rebuilt: the whole
     /// point of a pointer is that its own address does not move.
     pointer_code: Arc<ContractCode<'static>>,
 }
 
 impl FreenetPublisher {
-    pub async fn connect(ws_url: &str, address_wasm: Vec<u8>, tip_wasm: Vec<u8>) -> Result<Self> {
+    pub async fn connect(ws_url: &str, wasm: &ContractWasm) -> Result<Self> {
         let (stream, _) = tokio_tungstenite::connect_async(ws_url)
             .await
             .with_context(|| format!("connecting to the Freenet node at {ws_url}"))?;
         Ok(FreenetPublisher {
             api: Arc::new(Mutex::new(WebApi::start(stream))),
-            address_code: Arc::new(ContractCode::from(address_wasm)),
-            tip_code: Arc::new(ContractCode::from(tip_wasm)),
+            address_code: Arc::new(ContractCode::from(wasm.address.clone())),
+            tip_code: Arc::new(ContractCode::from(wasm.tip.clone())),
+            inbox_code: Arc::new(ContractCode::from(wasm.inbox.clone())),
             pointer_code: Arc::new(ContractCode::from(
                 freenet_bitcoin_generation::POINTER_CONTRACT_WASM.to_vec(),
             )),
@@ -75,7 +102,7 @@ impl FreenetPublisher {
     /// The 32-byte code hash of the address contract WASM.
     ///
     /// Applications need this to derive an address contract's key themselves,
-    /// so the bridge publishes it in its status response rather than making
+    /// so the bridge publishes it in a generation pointer rather than making
     /// every client hardcode it — a hardcoded code hash goes stale silently on
     /// the next rebuild.
     pub fn address_code_hash(&self) -> [u8; 32] {
@@ -92,6 +119,15 @@ impl FreenetPublisher {
     /// shipping the WASM itself.
     pub fn tip_code_hash(&self) -> [u8; 32] {
         let bytes: &[u8] = self.tip_code.hash().as_ref();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes[..32]);
+        out
+    }
+
+    /// The 32-byte code hash of the request inbox contract WASM, which the
+    /// inbox generation pointer names.
+    pub fn inbox_code_hash(&self) -> [u8; 32] {
+        let bytes: &[u8] = self.inbox_code.hash().as_ref();
         let mut out = [0u8; 32];
         out.copy_from_slice(&bytes[..32]);
         out
@@ -453,7 +489,7 @@ impl FreenetPublisher {
 /// Deliberately narrow. Anything not recognised here is `Unknown`, because the
 /// cost of a false `Absent` is permanent data loss and the cost of a false
 /// `Unknown` is one retry.
-fn is_not_found(msg: &str) -> bool {
+pub(crate) fn is_not_found(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("not found") || m.contains("notfound")
 }

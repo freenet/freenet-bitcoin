@@ -56,6 +56,9 @@ mod state;
 #[cfg(feature = "seal")]
 pub mod seal;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 #[cfg(test)]
 mod tests;
 
@@ -312,6 +315,14 @@ impl InboxEntry {
         let mut h = blake3::Hasher::new_derive_key(ENTRY_KEY_DOMAIN);
         h.update(&bytes);
         EntryKey(*h.finalize().as_bytes())
+    }
+
+    /// The body this entry's Ghost Key signed, decoded without checking the
+    /// signature. Only for entries already verified, as every entry in a
+    /// state that passed [`InboxStateV1::verify`] is.
+    pub fn body(&self) -> Result<InboxEntryBody, String> {
+        let scoped: ScopedPayload = from_cbor(&self.scoped_payload)?;
+        InboxEntryBody::from_signing_payload(&scoped.payload)
     }
 }
 

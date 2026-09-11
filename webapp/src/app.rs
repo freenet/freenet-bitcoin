@@ -2,9 +2,8 @@
 
 use dioxus::prelude::*;
 use freenet_bitcoin_common::BitcoinNetwork;
-use freenet_bitcoin_generation::Artifact;
 
-use crate::generation::{Generations, Notice};
+use crate::generation::{Generations, Notice, Read};
 use crate::state::{AddressView, Derivation, PaymentRow, RowStatus, APP};
 use crate::verify::{fmt_sats, Verification};
 use crate::{address, config, keys, node, state};
@@ -508,10 +507,10 @@ fn on_generations_settled() {
     let (address_code_hash, tip_code_hash, tip_usable, address_usable) = {
         let g = GENERATIONS.read();
         (
-            g.code_hash(Artifact::Address),
-            g.code_hash(Artifact::Tip),
-            g.usable(Artifact::Tip),
-            g.usable(Artifact::Address),
+            g.code_hash(Read::Address),
+            g.code_hash(Read::Tip),
+            g.usable(Read::Tip),
+            g.usable(Read::Address),
         )
     };
 
@@ -588,7 +587,7 @@ fn start_lookup(address: String, script: Vec<u8>, network: BitcoinNetwork, is_de
 }
 
 fn issue_lookup(lookup: state::Lookup) {
-    if !GENERATIONS.read().usable(Artifact::Address) {
+    if !GENERATIONS.read().usable(Read::Address) {
         APP.write().error = Some(
             "This bridge has withdrawn its address contract, so there is nothing to look up."
                 .into(),

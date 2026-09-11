@@ -45,8 +45,8 @@ pub struct Observer {
 /// Claims produced by processing a block, grouped by the script they concern.
 pub type ClaimsByScript = HashMap<Vec<u8>, Vec<SignedClaim>>;
 
-/// Blocks an ordinary round will scan, so a long catch-up cannot starve the
-/// request service behind it.
+/// Blocks an ordinary round will scan, so a long catch-up on one network
+/// cannot hold up the others, which the observation loop scans in turn.
 pub const ROUND_SCAN_BLOCKS: u32 = 50;
 
 /// The highest block this round should scan.
@@ -701,8 +701,8 @@ mod tests {
         assert!(scan_ceiling(next, tip, true, max_reorg) < tip);
     }
 
-    /// An ordinary round stays capped, so a long catch-up cannot starve the
-    /// request service running beside it.
+    /// An ordinary round stays capped, so a long catch-up on one network
+    /// cannot hold up the others.
     #[test]
     fn an_ordinary_round_is_still_bounded_by_one_window() {
         assert_eq!(

@@ -82,11 +82,16 @@ itself.
 ## The bridge
 
 **Holds (private operational state):** its Bitcoin Core connection, the set of
-scripts it is synchronizing, chain checkpoints, its signing key, and service
-authorization decisions including Ghost Key fingerprints.
+scripts it is synchronizing, which Ghost Key asked for each of them, chain
+checkpoints, and its signing key, which also opens the requests sealed to it.
 
 **Never holds:** any user's Bitcoin private keys. It cannot sign a Bitcoin
-transaction, and the broadcast path relays bytes it did not create.
+transaction.
+
+**Takes requests only through its inbox contract.** It has no network
+listener. What reaches it has already been checked by every peer that stored
+it: a Ghost Key certificate chaining to the master key, and that key's
+signature over a request addressed to this bridge.
 
 **Trusted for:** availability, and for chain state — which blocks are on
 Bitcoin, what height each is at, and where the tip is. Those assertions are not
@@ -119,19 +124,21 @@ block it made up.
 
 ## Ghost Keys
 
-**Used only** to prove eligibility for one operator's service.
+**Used only** to prove eligibility to ask a bridge for work, by signing an
+entry in that bridge's inbox.
 
 **Must never** become part of Bitcoin contract identity or payment semantics.
 Bitcoin contracts are parameterized by `(network, script_pubkey)` and nothing
 else. A Ghost Key is not required to own, send or receive Bitcoin, to create an
 address, to build a Bitcoin-enabled Freenet application, to implement this
-contract format, or to run a compatible bridge.
+contract format, to read observations, or to run a compatible bridge.
 
 The two authorizations that are constantly confused:
 
 ```text
   service authorization    "May this caller ask THIS bridge to do work?"
-                           -> operator policy. Never on the Freenet wire.
+                           -> the bridge's inbox contract. On the Freenet
+                              wire, and never inside an observation.
 
   observation authenticity "Did THIS bridge sign this Bitcoin fact?"
                            -> protocol-level. Always on the wire.
@@ -151,14 +158,17 @@ Keys. They receive an address and an amount and pay it with any wallet.
 | Bridge inflates what a real transaction paid | SPV evidence: the txid commits to the amount, which is read out of the transaction |
 | Bridge repoints someone else's payment to this address | Claim binds `script_id`; SPV checks the output's actual script |
 | Replay a signet observation as mainnet | Network folded into `ScriptId` and checked against parameters |
-| Replay a captured service authorization for another request | Signature covers a single-use challenge **and** the request body |
-| Use the bridge as a signature-verification oracle | Challenge consumed atomically *before* certificate verification |
-| Probe which certificates exist via error messages | Every denial returns an identical generic message |
+| Write to a bridge's inbox without a Ghost Key | Every peer verifies the certificate chain to the master key, and the entry's signature, before storing it |
+| Replay a request into another bridge's inbox | The Ghost Key's signature covers the bridge id; an inbox refuses an entry addressed to another bridge |
+| Flood a bridge's inbox | At most 8 records per Ghost Key and 128 in all, newest kept; each Ghost Key costs a donation |
+| Date a request into the future so it outlives every floor | An entry more than 18 blocks above the floor is refused, and the floor only rises |
+| Bring back a request the bridge removed | A tombstone lasts until the floor passes the entry it removes; the bridge records what it acted on, so a request read twice is acted on once |
+| Make the bridge rescan the chain from the start | One request may rewind the scan at most 1008 blocks |
 | Headers carrying trivially little work | `PowFloor` rejects them — a sanity check only; see below |
 | Withhold a retraction to keep an order looking paid | Depth is capped by the claim's own `as_of`, so a withheld retraction leaves a confirmation worth only the depth the bridge had actually seen. Succeeds only against a reorg at least as deep as the required confirmations — see "Withholding a retraction" |
 | Seller marks their own order paid without payment | Requires bridge-signed evidence any peer re-verifies; a bare seller signature is not accepted |
 | Flood one address contract to exhaust state | `MAX_CLAIMS` cap, pruned deterministically, keeping the most recent evidence |
-| Enumerate who watches what | No registry exists to enumerate |
+| Enumerate who watches what | Requests are sealed to the bridge and removed once read; the bridge's record of who asked for what stays in its own database |
 
 **Not in the table, because nothing stops it:** a trusted bridge asserting
 chain state that is not Bitcoin's. No check anchors a header to the real chain,

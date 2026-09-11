@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Synchronizes Bitcoin observations into Freenet contracts, with pluggable service authorization"
+description = "Synchronizes Bitcoin observations into Freenet contracts, taking requests through a Ghost Key gated inbox contract"
 
 [dependencies]
 freenet-bitcoin-common = { workspace = true, features = ["test-support"] }
@@ -23,13 +23,11 @@ futures = "0.3"
 bitcoin = { version = "0.32", features = ["serde"] }
 bitcoincore-rpc = "0.19"
 
-# Ghost key verification, for the Freenet.org service-authorization policy.
-# Note this is only ONE ServiceAuth variant -- the bridge runs fine without it.
-ghostkey_lib = "0.2"
+# The request inbox: reading it, opening sealed requests, signing tombstones
+# and the floor. Ghost Key verification comes with it.
+freenet-bitcoin-inbox = { workspace = true, features = ["seal"] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
-axum = "0.8"
-tower-http = { version = "0.6", features = ["trace", "limit", "cors"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 serde = { workspace = true }
@@ -50,6 +48,7 @@ toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
+freenet-bitcoin-inbox = { workspace = true, features = ["seal", "test-support"] }
 
 [build-dependencies]
 freenet-migrate-build = "0.2"

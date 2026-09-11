@@ -9,7 +9,7 @@ deployed, not what would ideally be deployed.
 |---|---|
 | `bitcoind-signet` | Pruned signet node. Fully synced; the working demo. |
 | `bitcoind-mainnet` | Pruned mainnet node. Long initial block download. |
-| `bitcoin-freenet-bridge` | Observes Bitcoin, publishes into Freenet, serves requests on `127.0.0.1:8431`. |
+| `bitcoin-freenet-bridge` | Observes Bitcoin, publishes into Freenet, reads its request inbox. No network listener. |
 
 ```bash
 systemctl status bitcoind-signet bitcoind-mainnet bitcoin-freenet-bridge
@@ -216,9 +216,6 @@ bitcoin-freenet-bridge --config /etc/... --check
 
 # Read an address's observations back OUT of Freenet and re-verify them.
 bitcoin-freenet-bridge --config /etc/... --verify <address> --network signet
-
-# Public status: bridge id, tip height, and the tip contract's id.
-curl -s http://127.0.0.1:8431/v1/status
 ```
 
 `--verify` is the honest end-to-end check and worth preferring over reading the
@@ -256,11 +253,41 @@ start the bridge compares its recorded hash at the checkpoint height with what
 the node reports there now; a mismatch means a reorg happened while it was
 down, and it walks back to the fork point and retracts the orphaned outputs.
 
+### The request inbox
+
+The bridge has no network listener. A client asks it to watch a script by
+appending a Ghost Key signed request, sealed to the bridge, to its inbox
+contract. The bridge reads the inbox over its own connection to the local node,
+acts on each request, and removes it with a signed tombstone. On first start it
+opens the inbox itself, by PUTting it with its first floor, and logs the
+contract id as `serving the request inbox`.
+
+- **Mainnet must be configured.** Requests are dated by Bitcoin mainnet block
+  height whichever network they are for, and the inbox floor follows the
+  mainnet tip, 6 blocks behind. With no `Bitcoin` network in the config the
+  inbox stays closed, and the bridge says so at startup.
+- **`bitcoin_inbox_contract.wasm` must be in the contract directory**, beside
+  the other two. `scripts/deploy.sh` installs it.
+- **`listen` and `auth` are ignored.** They configured the HTTP service the
+  inbox replaced, and a config that still sets them loads unchanged.
+- **Unwatch is per requester.** The database records which Ghost Key asked for
+  each script (`script_interests`), and a script stops being scanned only when
+  the last requester withdraws. A watch registered before the inbox existed has
+  no requester on record, so no unwatch ends it.
+- **Acted-on entries are recorded** (`inbox_handled`) until the floor passes
+  them, so an entry whose tombstone failed to land is removed again rather than
+  acted on again. Deleting the database loses that record; the cost is that
+  requests still in the inbox, at most about an hour's worth, are acted on a
+  second time.
+
 ### Backfilling history on a pruned node
 
 A watch request may carry `scan_from_height`, which rewinds the chain cursor so
 a newly-watched script is backfilled rather than only watched going forward.
-Rescanning is idempotent, so this costs bandwidth only.
+Rescanning is idempotent, so this costs bandwidth only. One request may rewind
+at most 1008 blocks (about a week) below the tip
+(`inbox::MAX_REQUEST_BACKFILL_BLOCKS`), because the rewind moves the cursor for
+the whole network, not only for that script.
 
 The window is bounded, deliberately. A pruned node has not kept the early chain,
 so an unbounded backfill would fail; and on a busy address it would fill the
@@ -285,18 +312,11 @@ enabling `txindex`.
   says why rather than leaving that to look like a fault. The bridge still
   refuses to publish scan watermarks while a node is in IBD, because during IBD
   an absence of payments means nothing and the claim would be misleading.
-- **The bridge listens on loopback only, with `auth = open`.**
-
-That last point matters. Making the bridge internet-facing is a deliberate step
-that has **not** been taken, and it needs three things first:
-
-1. `auth = { mode = "ghost_key" }`, so the service is not an open invitation to
-   make nova scan arbitrary scripts;
-2. rate limiting per credential and per source;
-3. a reverse-proxy route with TLS (nova already runs caddy).
-
-Leaving an open-auth service exposed would let anyone consume the operator's
-disk and CPU. It is a decision for the operator, not a default.
+- **Requests come only through the inbox.** There is no service to expose and
+  no reverse proxy to run. The inbox admits only Ghost Key signed entries,
+  verified by every peer, and holds at most 8 requests per Ghost Key and 128 in
+  all, so the work anyone can ask of the bridge is bounded by the contract
+  rather than by an operator setting.
 
 #### What it bought, measured
 

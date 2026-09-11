@@ -18,13 +18,27 @@ Three facts are kept distinct throughout:
 3. **A particular user is watching X.** Private. This is the fact the design
    works to protect.
 
-## What was deliberately not built
+## The request inbox, and what it is not
 
-There is no `WatchRegistry` contract, and there will not be one. It would make
-the bridge's job trivial and it is exactly the wrong artifact: Freenet contracts
-are reachable by anyone who knows the key and are replicated indefinitely, so
-such a registry would be a permanent, globally enumerable index of who cares
-about which Bitcoin address. No mapping of the following forms exists anywhere:
+A bridge takes watch requests through an inbox contract, because that is the
+only way a Freenet web app or delegate can reach it: neither can make an HTTP
+request to a bridge. Freenet contracts are reachable by anyone who knows the key
+and are replicated indefinitely, so a contract listing who watches what would
+be a permanent, globally enumerable index of who cares about which Bitcoin
+address. The inbox is built not to be one:
+
+- **What is asked is sealed.** A request (watch or unwatch, which network,
+  which scripts) is encrypted to the bridge's key. Peers store and relay only
+  ciphertext.
+- **Requests are transient.** The bridge removes each one once it has read it,
+  and every peer drops anything dated more than about an hour behind the
+  Bitcoin mainnet tip.
+- **What is visible** is that a given Ghost Key sent this bridge a request,
+  when (to the block), and how large the sealed request is. That was accepted
+  explicitly in freenet/freenet-bitcoin#3: the Ghost Key has to be visible for
+  every peer to check the writer is entitled to write.
+
+No contract holds a mapping of any of these forms:
 
 ```text
    Ghost Key      →  Bitcoin addresses
@@ -34,10 +48,10 @@ about which Bitcoin address. No mapping of the following forms exists anywhere:
 
 The public `BitcoinAddressContract` contains **no** field for who requested it,
 which Ghost Key authorized the request, how many people watch it, or why anyone
-cares. A test asserts that the bridge's watch-request format has nowhere to put
-a label, an order id, or a user identity, and another asserts that the watch
-*response* returns a boolean rather than a watcher count — a count would report
-how many other people are watching the same address.
+cares. A test pins the request format to four fields (action, network, scripts,
+and a scan height), so it has nowhere to put a label, an order id, or a user
+identity. The bridge sends no reply at all, so nothing reports how many other
+people watch the same address.
 
 ## Who learns what
 
@@ -47,6 +61,8 @@ how many other people are watching the same address.
   bridge-signed observations of on-chain activity.
 - Everything on the Bitcoin blockchain, which was already public.
 - **Not** who is interested in it.
+- From a bridge's inbox: which Ghost Keys send that bridge requests, when, and
+  how large each sealed request is. **Not** what any of them asked for.
 
 Caveat with teeth: ordinary Freenet traffic analysis can sometimes let an
 observer infer that a peer is interested in a particular contract, because a
@@ -57,25 +73,30 @@ not claim to. What it refuses to do is make it *easier* by publishing an index.
 
 The bridge necessarily learns, and can correlate:
 
-- that somebody it authorized asked it to synchronize script X;
-- the requester's source IP;
-- with `AuthPolicy::GhostKey`, a **stable fingerprint** of the requesting Ghost
-  Key.
+- that the holder of a given Ghost Key asked it to synchronize script X, and
+  when. It records this in its own database (`script_interests`), because that
+  is what lets one requester's unwatch leave other requesters' interest in
+  place.
+
+It is no longer handed the requester's IP address: a request travels through
+Freenet rather than over a connection to the bridge. Freenet traffic analysis
+still applies (see below).
 
 **A Ghost Key is a stable identifier, not an anonymous one.** Blind signing
 prevents the *notary* from linking a donation to the resulting key. It does
-nothing to stop a *verifying service* from recognising the same certificate
-across requests. So a bridge operator can link one user's requests to each
-other, and colluding operators can link a user across their services.
+nothing to stop anyone from recognising the same certificate across requests.
+So a bridge operator can link one user's requests to each other, anyone reading
+the inbox can do the same without learning what was asked, and colluding
+operators can link a user across their services.
 
 Mitigations, in descending order of effectiveness:
 
-- **Run your own bridge.** The protocol is generic; a self-hosted bridge with
-  `AuthPolicy::Open` produces byte-identical observations. This is the real
-  answer and the reason no Ghost Key appears in the contract format.
+- **Run your own bridge**, listing your scripts in its `always_watch`
+  configuration. Nothing is then sent to anyone, and the observations are
+  byte-identical to any other bridge's. This is the real answer and the reason
+  no Ghost Key appears in the observation format.
 - **Use a distinct Ghost Key per relying party.** The vault supports this; it
   does not enforce it.
-- Reach the bridge over Tor or a VPN to separate the IP from the request.
 
 The bridge is trusted with this correlation. Nobody else is. It stays in one
 SQLite file and is never replicated.
@@ -113,22 +134,21 @@ Ghost Key, and never learns that Freenet was involved.
 
 ## Residual leakage, listed plainly
 
-1. **Bridge correlation.** Stable Ghost Key fingerprint plus source IP plus
-   requested scripts, in the operator's database. Mitigated by self-hosting, not
-   eliminated by anything in this repo.
-2. **Freenet traffic analysis.** Subscribing to `BitcoinAddressContract(X)`
+1. **Bridge correlation.** Ghost Key plus requested scripts, in the operator's
+   database. Mitigated by self-hosting, not eliminated by anything in this repo.
+2. **Inbox metadata.** Anyone reading a bridge's inbox sees which Ghost Keys
+   send it requests, when, and how large each sealed request is. Requests are
+   not padded, so size hints at how many scripts one names.
+3. **Freenet traffic analysis.** Subscribing to `BitcoinAddressContract(X)`
    signals interest in X to an observer well-placed on the network. Inherent to
    the platform.
-3. **Public demo addresses.** The operator's curated demonstration addresses are
+4. **Public demo addresses.** The operator's curated demonstration addresses are
    public by construction. They are nobody's private watch, and a user cannot
    unwatch them because they are not the user's.
-4. **On-chain linkage.** Reusing one address across several Harvest orders links
+5. **On-chain linkage.** Reusing one address across several Harvest orders links
    those orders on the public blockchain. The right fix is a fresh address per
    order, which the delegate is the natural place to implement and which this
    prototype does not do.
-5. **`already_active` on a watch response.** Returns a boolean. A caller learns
-   whether *anyone at all* was already watching a script — one bit, and only for
-   a script the caller already knew. It is deliberately not a count.
 
 ## Lightning changes this picture
 

@@ -633,4 +633,21 @@ mod sealing {
         r.scripts = vec![ByteBuf(vec![1u8; MAX_SCRIPT_BYTES + 1])];
         assert!(seal(&bridge(), &r).is_err());
     }
+
+    /// Pinned because docs/privacy.md relies on it: a request has nowhere to
+    /// put a label, an order id or a user identity. Adding a field here is a
+    /// privacy decision, not a refactor.
+    #[test]
+    fn a_request_carries_only_what_the_bridge_needs() {
+        let bytes = freenet_bitcoin_common::to_cbor(&request()).unwrap();
+        let value: ciborium::Value = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let mut fields: Vec<String> = value
+            .as_map()
+            .expect("a request encodes as a map")
+            .iter()
+            .map(|(k, _)| k.as_text().expect("field names are text").to_string())
+            .collect();
+        fields.sort();
+        assert_eq!(fields, ["action", "network", "scan_from_height", "scripts"]);
+    }
 }

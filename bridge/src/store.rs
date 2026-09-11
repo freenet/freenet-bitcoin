@@ -12,11 +12,13 @@
 //!
 //! # It is also the most privacy-sensitive thing the bridge holds
 //!
-//! `watched_scripts` is the one place where "somebody asked about this
-//! address" is written down, and where a Ghost Key fingerprint sits next to a
-//! Bitcoin script. That mapping is deliberately confined to this file, is
-//! never replicated to Freenet, and is why `docs/privacy.md` says a bridge
-//! operator is trusted with correlation even though nobody else is.
+//! `watched_scripts` and `script_interests` are where "somebody asked about
+//! this address" is written down, and `script_interests` is where a Ghost Key
+//! sits next to a Bitcoin script: it records who asked for each script, which
+//! is what lets one requester's unwatch leave everyone else's interest in
+//! place. That mapping is deliberately confined to this file, is never
+//! replicated to Freenet, and is why `docs/privacy.md` says a bridge operator
+//! is trusted with correlation even though nobody else is.
 
 use std::path::Path;
 
@@ -56,7 +58,7 @@ impl Store {
             std::fs::create_dir_all(dir).ok();
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-        // WAL so a long block scan does not block the HTTP handler, and
+        // WAL so a long block scan does not block the inbox worker, and
         // NORMAL sync because losing the last few writes costs a rescan, not
         // correctness.
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -189,13 +191,30 @@ impl Store {
                 code_hash  BLOB NOT NULL
             );
 
-            -- Single-use challenges for service authorization. Rows are
-            -- deleted on use, which is what makes a captured authorization
-            -- non-replayable.
-            CREATE TABLE IF NOT EXISTS challenges (
-                challenge  BLOB PRIMARY KEY,
-                issued_ms  INTEGER NOT NULL
+            -- Who asked for each script, by Ghost Key, so an unwatch removes
+            -- only the sender's own interest. Never replicated. See the
+            -- module docs.
+            CREATE TABLE IF NOT EXISTS script_interests (
+                network        TEXT NOT NULL,
+                script_pubkey  BLOB NOT NULL,
+                ghostkey       BLOB NOT NULL,
+                since_ms       INTEGER NOT NULL,
+                PRIMARY KEY (network, script_pubkey, ghostkey)
             );
+
+            -- Inbox entries already acted on. A tombstone can fail to land,
+            -- and without this record a Watch whose tombstone was lost would
+            -- be acted on again after the same requester's later Unwatch had
+            -- been, bringing back an interest they withdrew. Pruned once the
+            -- inbox floor passes an entry, because the inbox drops the entry
+            -- itself from then on.
+            CREATE TABLE IF NOT EXISTS inbox_handled (
+                entry_key     BLOB PRIMARY KEY,
+                entry_height  INTEGER NOT NULL
+            );
+
+            -- Left behind by the HTTP request service this bridge used to run.
+            DROP TABLE IF EXISTS challenges;
             "#,
         )?;
         Ok(())
@@ -625,38 +644,79 @@ impl Store {
         Ok(n > 0)
     }
 
-    // --- challenges --------------------------------------------------------
+    // --- who asked for each script ------------------------------------------
 
-    pub fn issue_challenge(&self, challenge: &[u8], now_ms: i64) -> anyhow::Result<()> {
+    /// Record that `ghostkey` wants `script` synchronized.
+    pub fn add_interest(
+        &self,
+        net: BitcoinNetwork,
+        script: &[u8],
+        ghostkey: &[u8; 32],
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO challenges (challenge, issued_ms) VALUES (?1, ?2)",
-            params![challenge, now_ms],
+            "INSERT OR IGNORE INTO script_interests (network, script_pubkey, ghostkey, since_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![net.as_str(), script, ghostkey.to_vec(), now_ms],
         )?;
         Ok(())
     }
 
-    /// Consume a challenge. Returns true only if it existed and was fresh.
+    /// Withdraw `ghostkey`'s interest in `script`.
     ///
-    /// Deleting on consumption is what makes an intercepted authorization
-    /// useless to replay, so this must stay a single atomic delete rather than
-    /// a check followed by a delete.
-    pub fn consume_challenge(
+    /// Returns how many requesters still want it, or `None` if `ghostkey` had
+    /// never asked for it, in which case nothing changed. The distinction is
+    /// what stops a stranger's unwatch from ending a watch it never held.
+    pub fn remove_interest(
         &self,
-        challenge: &[u8],
-        now_ms: i64,
-        ttl_ms: i64,
-    ) -> anyhow::Result<bool> {
-        let n = self.conn.execute(
-            "DELETE FROM challenges WHERE challenge = ?1 AND issued_ms > ?2",
-            params![challenge, now_ms - ttl_ms],
+        net: BitcoinNetwork,
+        script: &[u8],
+        ghostkey: &[u8; 32],
+    ) -> anyhow::Result<Option<usize>> {
+        let removed = self.conn.execute(
+            "DELETE FROM script_interests
+             WHERE network = ?1 AND script_pubkey = ?2 AND ghostkey = ?3",
+            params![net.as_str(), script, ghostkey.to_vec()],
         )?;
-        Ok(n > 0)
+        if removed == 0 {
+            return Ok(None);
+        }
+        let remaining: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM script_interests WHERE network = ?1 AND script_pubkey = ?2",
+            params![net.as_str(), script],
+            |r| r.get(0),
+        )?;
+        Ok(Some(remaining as usize))
     }
 
-    pub fn purge_expired_challenges(&self, now_ms: i64, ttl_ms: i64) -> anyhow::Result<()> {
+    // --- inbox entries already acted on ------------------------------------
+
+    pub fn is_handled(&self, entry_key: &[u8; 32]) -> anyhow::Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM inbox_handled WHERE entry_key = ?1",
+                params![entry_key.to_vec()],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    pub fn mark_handled(&self, entry_key: &[u8; 32], entry_height: u32) -> anyhow::Result<()> {
         self.conn.execute(
-            "DELETE FROM challenges WHERE issued_ms <= ?1",
-            params![now_ms - ttl_ms],
+            "INSERT OR IGNORE INTO inbox_handled (entry_key, entry_height) VALUES (?1, ?2)",
+            params![entry_key.to_vec(), entry_height as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Forget entries dated below `floor`: the inbox has dropped them, so
+    /// they can never be presented again.
+    pub fn prune_handled_below(&self, floor: u32) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM inbox_handled WHERE entry_height < ?1",
+            params![floor as i64],
         )?;
         Ok(())
     }
@@ -720,28 +780,41 @@ mod tests {
     }
 
     #[test]
-    fn a_challenge_can_only_be_used_once() {
-        // The property that makes a captured authorization useless.
+    fn interest_is_counted_per_requester() {
         let s = store();
-        s.issue_challenge(b"nonce", 1000).unwrap();
-        assert!(s.consume_challenge(b"nonce", 1000, 60_000).unwrap());
-        assert!(
-            !s.consume_challenge(b"nonce", 1000, 60_000).unwrap(),
-            "a challenge must not be reusable"
+        let net = BitcoinNetwork::Signet;
+        s.add_interest(net, b"abc", &[1; 32], 0).unwrap();
+        s.add_interest(net, b"abc", &[2; 32], 0).unwrap();
+        // Asking twice is still one interest.
+        s.add_interest(net, b"abc", &[2; 32], 0).unwrap();
+        assert_eq!(s.remove_interest(net, b"abc", &[1; 32]).unwrap(), Some(1));
+        // Withdrawing an interest never held changes nothing, and says so.
+        assert_eq!(s.remove_interest(net, b"abc", &[9; 32]).unwrap(), None);
+        assert_eq!(s.remove_interest(net, b"abc", &[2; 32]).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn interest_is_per_network() {
+        let s = store();
+        s.add_interest(BitcoinNetwork::Signet, b"abc", &[1; 32], 0)
+            .unwrap();
+        s.add_interest(BitcoinNetwork::Bitcoin, b"abc", &[1; 32], 0)
+            .unwrap();
+        assert_eq!(
+            s.remove_interest(BitcoinNetwork::Signet, b"abc", &[1; 32])
+                .unwrap(),
+            Some(0)
         );
     }
 
     #[test]
-    fn an_expired_challenge_is_refused() {
+    fn handled_entries_are_forgotten_once_the_floor_passes_them() {
         let s = store();
-        s.issue_challenge(b"nonce", 1_000).unwrap();
-        assert!(!s.consume_challenge(b"nonce", 1_000_000, 60_000).unwrap());
-    }
-
-    #[test]
-    fn an_unknown_challenge_is_refused() {
-        let s = store();
-        assert!(!s.consume_challenge(b"never-issued", 0, 60_000).unwrap());
+        s.mark_handled(&[1; 32], 100).unwrap();
+        s.mark_handled(&[2; 32], 110).unwrap();
+        s.prune_handled_below(105).unwrap();
+        assert!(!s.is_handled(&[1; 32]).unwrap());
+        assert!(s.is_handled(&[2; 32]).unwrap());
     }
 
     #[test]

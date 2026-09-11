@@ -5,7 +5,9 @@ contracts, with a bridge that observes the chain and publishes signed
 observations, each carrying the transaction and block evidence behind it so
 readers can check what it says against those bytes.
 
-Nothing here is specific to any application, to Freenet.org, or to Ghost Keys.
+The observations are not specific to any application, to Freenet.org, or to
+Ghost Keys: a reader needs no credential. Asking a bridge to watch a script
+does need a Ghost Key (see "Service access" below).
 
 ## What this is
 
@@ -18,6 +20,10 @@ Bitcoin network -> Bitcoin Core (pruned) -> bridge -> Freenet contracts -> your 
 - **`BitcoinTipContract(network)`** — the public chain tip and recent blocks, so
   confirmation depth is computed once rather than duplicated per address, and an
   application's first screen can show live Bitcoin data with no credential.
+- **`BitcoinInboxContract(bridge)`**: the bridge's request inbox. A Ghost Key
+  holder asks the bridge to watch a script by appending a request sealed to
+  the bridge; the bridge acts on it and removes it. This is the bridge's only
+  interface: it has no network listener.
 - **`bitcoin-freenet-bridge`** — observes Bitcoin Core and publishes into those
   contracts. Anyone may run one.
 
@@ -50,24 +56,28 @@ states the boundary in full.
 
 ## Privacy
 
-There is **no watch registry**, and there will not be one. Freenet contracts are
-readable by anyone who knows the key and replicated indefinitely, so a registry
-of who wants which address synchronized would be a permanent, globally
-enumerable surveillance index.
-
 > A Bitcoin address becomes public only when application semantics require it.
 > Merely watching an address never makes it public.
 
-Watch requests go directly to a bridge over HTTP and are never replicated. What
-a bridge operator can still correlate is written up honestly in
+Freenet contracts are readable by anyone who knows the key and replicated
+indefinitely, so a contract listing who wants which address synchronized would
+be a permanent, globally enumerable surveillance index. The bridge's inbox is a
+public contract, so it is built not to be one: each request is sealed to the
+bridge, and the bridge removes it once read. The network sees that a given
+Ghost Key sent the bridge a request, and when, and never which scripts. The
+bridge itself learns which Ghost Key asked for which script and keeps that in
+its own database, never replicated. What each party learns is written up in
 [docs/privacy.md](docs/privacy.md).
 
 ## Service access is not Bitcoin semantics
 
-An operator decides who may ask it to do work. Freenet.org gates on Ghost Key
-eligibility, which is what makes a donation buy something concrete. That is one
-operator's policy: it lives in the bridge's config, never on the Freenet wire,
-and a bridge running `auth = open` produces byte-identical observations.
+A bridge decides who may ask it to do work. It takes requests only from Ghost
+Key holders: its inbox admits an entry only when it is signed by a key whose
+certificate chains to Freenet's Ghost Key master key, and every peer checks
+that before storing it. That is what makes a donation buy something concrete,
+and what stops the inbox being an open invitation to make the bridge scan
+arbitrary scripts. It gates requests only. Observations carry no Ghost Key,
+and reading them needs none.
 
 ```text
 service authorization    "May this caller ask THIS bridge to do work?"
@@ -86,10 +96,8 @@ These are constantly confused and must not be.
 ## Building
 
 ```bash
-cargo test                       # the merge laws, SPV, and the service layer
-cargo build --target wasm32-unknown-unknown \
-  -p bitcoin-address-contract -p bitcoin-tip-contract \
-  --features contract --release
+cargo make test                  # the merge laws, SPV, the inbox and the bridge
+./scripts/build-contracts.sh     # never `cargo build` a contract; see docs/deployment.md
 cargo build --release -p bitcoin-freenet-bridge
 ```
 
@@ -97,6 +105,4 @@ cargo build --release -p bitcoin-freenet-bridge
 
 A prototype with a working vertical slice. Real third-party signet payments are
 observed, published to Freenet, retrieved, and re-checked against their own
-evidence. See [docs/deployment.md](docs/deployment.md) for what is deployed and what is
-deliberately not (the bridge is loopback-only and must not be exposed without
-switching on Ghost Key authorization and rate limiting first).
+evidence. See [docs/deployment.md](docs/deployment.md) for what is deployed.

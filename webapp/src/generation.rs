@@ -41,6 +41,33 @@ use freenet_stdlib::prelude::ContractInstanceId;
 
 use crate::{config, keys};
 
+/// The contracts this page reads, which is fewer than the bridge publishes.
+///
+/// The bridge also publishes a pointer for its request inbox, but this page
+/// never sends the bridge anything, so it has no reason to spend a startup
+/// round trip resolving that pointer. A separate type makes asking this module
+/// for the inbox's generation a compile error rather than a runtime case.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Read {
+    Address,
+    Tip,
+}
+
+impl Read {
+    pub const ALL: [Read; 2] = [Read::Address, Read::Tip];
+
+    pub const fn artifact(self) -> Artifact {
+        match self {
+            Read::Address => Artifact::Address,
+            Read::Tip => Artifact::Tip,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        self.artifact().label()
+    }
+}
+
 /// How the code hash currently in use was arrived at.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Source {
@@ -138,12 +165,8 @@ impl Generations {
         };
 
         Generations {
-            address: slot_for(
-                &bridge,
-                Artifact::Address,
-                keys::embedded_address_code_hash(),
-            ),
-            tip: slot_for(&bridge, Artifact::Tip, keys::embedded_tip_code_hash()),
+            address: slot_for(&bridge, Read::Address, keys::embedded_address_code_hash()),
+            tip: slot_for(&bridge, Read::Tip, keys::embedded_tip_code_hash()),
             bridge: Some(bridge),
         }
     }
@@ -211,7 +234,7 @@ impl Generations {
     }
 
     fn deliver(&mut self, id: ContractInstanceId, feed: impl Fn(&mut PointerResolver)) -> bool {
-        for artifact in Artifact::ALL {
+        for artifact in Read::ALL {
             let embedded = embedded_hash(artifact);
             let slot = self.slot_mut(artifact);
             let Slot::Waiting {
@@ -236,10 +259,10 @@ impl Generations {
         false
     }
 
-    fn slot_mut(&mut self, artifact: Artifact) -> &mut Slot {
+    fn slot_mut(&mut self, artifact: Read) -> &mut Slot {
         match artifact {
-            Artifact::Address => &mut self.address,
-            Artifact::Tip => &mut self.tip,
+            Read::Address => &mut self.address,
+            Read::Tip => &mut self.tip,
         }
     }
 
@@ -248,7 +271,7 @@ impl Generations {
     /// Falls back to what this build embeds while still resolving, which only
     /// matters if something derives an address before settlement; the app
     /// deliberately does not.
-    pub fn code_hash(&self, artifact: Artifact) -> [u8; 32] {
+    pub fn code_hash(&self, artifact: Read) -> [u8; 32] {
         match self.slot(artifact) {
             Slot::Settled { code_hash, .. } => *code_hash,
             Slot::Waiting { .. } => embedded_hash(artifact),
@@ -257,7 +280,7 @@ impl Generations {
 
     /// Whether `artifact` has a usable address at all. False only for a
     /// withdrawal, where deriving would mean deriving from a tombstone.
-    pub fn usable(&self, artifact: Artifact) -> bool {
+    pub fn usable(&self, artifact: Read) -> bool {
         !matches!(
             self.slot(artifact),
             Slot::Settled {
@@ -267,14 +290,14 @@ impl Generations {
         )
     }
 
-    fn slot(&self, artifact: Artifact) -> &Slot {
+    fn slot(&self, artifact: Read) -> &Slot {
         match artifact {
-            Artifact::Address => &self.address,
-            Artifact::Tip => &self.tip,
+            Read::Address => &self.address,
+            Read::Tip => &self.tip,
         }
     }
 
-    fn source(&self, artifact: Artifact) -> Option<&Source> {
+    fn source(&self, artifact: Read) -> Option<&Source> {
         match self.slot(artifact) {
             Slot::Settled { source, .. } => Some(source),
             Slot::Waiting { .. } => None,
@@ -306,7 +329,7 @@ impl Generations {
             .map(|b| short(&b.0))
             .unwrap_or_else(|| "nobody".to_string());
 
-        for artifact in Artifact::ALL {
+        for artifact in Read::ALL {
             let Some(source) = self.source(artifact) else {
                 continue;
             };
@@ -396,14 +419,14 @@ pub struct Notice {
 }
 
 /// What this build ships for `artifact`, and would derive from unaided.
-fn embedded_hash(artifact: Artifact) -> [u8; 32] {
+fn embedded_hash(artifact: Read) -> [u8; 32] {
     match artifact {
-        Artifact::Address => keys::embedded_address_code_hash(),
-        Artifact::Tip => keys::embedded_tip_code_hash(),
+        Read::Address => keys::embedded_address_code_hash(),
+        Read::Tip => keys::embedded_tip_code_hash(),
     }
 }
 
-fn slot_for(bridge: &BridgeId, artifact: Artifact, embedded: [u8; 32]) -> Slot {
+fn slot_for(bridge: &BridgeId, artifact: Read, embedded: [u8; 32]) -> Slot {
     // A reader with no durable storage starts from `never_resolved`. It cannot
     // seed a build-time floor because it does not know the bridge's version at
     // build time — only its own code hash — and `PointerFloor::at` needs both.
@@ -412,7 +435,11 @@ fn slot_for(bridge: &BridgeId, artifact: Artifact, embedded: [u8; 32]) -> Slot {
     // stale display, not forgery: whatever generation is read, every claim in
     // it is signed by this same bridge and re-checked against its own Bitcoin
     // evidence before it reaches the screen.
-    match freenet_bitcoin_generation::resolver(bridge, artifact, PointerFloor::never_resolved()) {
+    match freenet_bitcoin_generation::resolver(
+        bridge,
+        artifact.artifact(),
+        PointerFloor::never_resolved(),
+    ) {
         Ok(mut resolver) => {
             let id = match resolver.next_action() {
                 freenet_migrate::Step::Get(id) => id,
@@ -511,7 +538,7 @@ mod tests {
         g.address
             .settle(keys::embedded_address_code_hash(), Source::Agreed);
 
-        assert_eq!(g.code_hash(Artifact::Tip), other, "must follow the bridge");
+        assert_eq!(g.code_hash(Read::Tip), other, "must follow the bridge");
         let notices = g.notices(None);
         assert_eq!(notices.len(), 1, "exactly the tip contract is out of step");
         assert_eq!(notices[0].severity, Severity::Stale);
@@ -560,8 +587,8 @@ mod tests {
             .settle(keys::embedded_address_code_hash(), Source::Agreed);
         g.tip
             .settle(keys::embedded_tip_code_hash(), Source::Withdrawn);
-        assert!(!g.usable(Artifact::Tip));
-        assert!(g.usable(Artifact::Address));
+        assert!(!g.usable(Read::Tip));
+        assert!(g.usable(Read::Address));
         assert_eq!(g.notices(None)[0].severity, Severity::Broken);
     }
 
