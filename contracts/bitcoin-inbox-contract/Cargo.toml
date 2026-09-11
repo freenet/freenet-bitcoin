@@ -1,0 +1,21 @@
+[package]
+name = "bitcoin-inbox-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A bridge's Ghost Key gated request inbox, as a Freenet contract"
+
+[dependencies]
+freenet-bitcoin-inbox = { workspace = true }
+freenet-stdlib = { workspace = true }
+ciborium = { workspace = true }
+serde = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["freenet-main-contract"]
+contract = ["freenet-stdlib/contract"]
+freenet-main-contract = []

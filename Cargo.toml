@@ -4,6 +4,8 @@ members = [
     "generation",
     "contracts/bitcoin-address-contract",
     "contracts/bitcoin-tip-contract",
+    "contracts/bitcoin-inbox-contract",
+    "inbox",
     "bridge",
     "webapp",
 ]
@@ -18,6 +20,7 @@ repository = "https://github.com/freenet/freenet-bitcoin"
 [workspace.dependencies]
 freenet-bitcoin-common = { path = "common" }
 freenet-bitcoin-generation = { path = "generation" }
+freenet-bitcoin-inbox = { path = "inbox" }
 
 # 0.8.5 is what freenet-core and River are on. The bump is not cosmetic: it is
 # required for freenet-migrate's runtime half, because freenet-stdlib's
@@ -39,6 +42,13 @@ blake3 = { version = "1", default-features = false }
 bs58 = "0.5"
 hex = "0.4"
 sha2 = { version = "0.10", default-features = false }
+
+# The inbox tests build Ghost Key certificate chains, which means generating
+# RSA keys, and unoptimized bignum arithmetic makes each one take seconds.
+# Dependencies only, and the dev profile only: contracts are built with the
+# release profile below, so this cannot change any contract's bytes.
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 opt-level = "z"

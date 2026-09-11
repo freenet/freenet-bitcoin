@@ -53,13 +53,23 @@ cargo build --target "$CONTRACT_TARGET" \
   -p bitcoin-address-contract -p bitcoin-tip-contract \
   --features contract --release --target-dir "$TARGET_DIR"
 
+# The inbox contract gets its own invocation. Cargo unifies dependency features
+# across every package in one command, and the inbox pulls in Ghost Key
+# verification (RSA, getrandom's `custom` backend) that the address and tip
+# contracts must never see: building all three together could change those
+# two contracts' bytes, and therefore their addresses, with no source change.
+cargo build --target "$CONTRACT_TARGET" \
+  -p bitcoin-inbox-contract \
+  --features contract --release --target-dir "$TARGET_DIR"
+
 OUT="$TARGET_DIR/$CONTRACT_TARGET/release"
 
 # Fail closed. An allow-list of what a path in these bytes may look like would
 # need to enumerate every shape a path can take; this instead names the roots
 # that are known to VARY and refuses if any of them survived. A root that
 # varies and is not listed here is the next instance of this bug.
-for f in "$OUT"/bitcoin_address_contract.wasm "$OUT"/bitcoin_tip_contract.wasm; do
+for f in "$OUT"/bitcoin_address_contract.wasm "$OUT"/bitcoin_tip_contract.wasm \
+  "$OUT"/bitcoin_inbox_contract.wasm; do
   for probe in "$CARGO_DIR" "$RUSTUP_DIR" "$REPO" "${HOME:-/nonexistent}"; do
     if grep -qaF -- "$probe" "$f"; then
       echo "REFUSING: $(basename "$f") contains the build-machine path '$probe'." >&2
@@ -79,7 +89,7 @@ for f in "$OUT"/bitcoin_address_contract.wasm "$OUT"/bitcoin_tip_contract.wasm; 
   fi
 done
 
-echo "contracts built, with no build-machine path in either:"
+echo "contracts built, with no build-machine path in any of them:"
 for f in "$OUT"/bitcoin_*_contract.wasm; do
   echo "  $(b3sum --no-names "$f")  $(basename "$f")"
 done
