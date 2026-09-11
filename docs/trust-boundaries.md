@@ -164,7 +164,7 @@ Keys. They receive an address and an amount and pay it with any wallet.
 | Copy another sender's sealed request into your own entry | A request is sealed to the sender's Ghost Key and the entry's height as well as to the bridge, so a copy does not open |
 | Replay an old Watch after the sender's Unwatch | Each request carries its sender's timestamp, sealed; the bridge keeps each requester's latest request per script and ignores anything older |
 | Present certificates in endless spellings to multiply RSA checks | Certificates are held in one canonical form, and a delta larger than the caps is refused before anything is verified |
-| Date a request into the future so it outlives every floor | An entry more than 18 blocks above the floor is refused, and the floor only rises |
+| Date a request into the future so it outlives every floor | An entry more than 18 blocks above the floor is dropped by every peer and never stored, and the floor only rises |
 | Bring back a request the bridge removed | A tombstone lasts until the floor passes the entry it removes; the bridge records what it acted on, so a request read twice is acted on once |
 | Make the bridge rescan the chain from the start | One request may rewind the scan at most 144 blocks, only for a script new to the bridge, and requests cause at most one rescan per network every 6 blocks. One Ghost Key may have at most 1000 scripts watched |
 | Write entries under a Ghost Key anyone can sign for | A certificate for a weak (low-order) key is refused, and signatures are verified strictly |

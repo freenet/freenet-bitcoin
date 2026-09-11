@@ -255,7 +255,7 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
         let Ok(tip) = client.tip() else { continue };
         let from = tip.height.saturating_sub(net_cfg.demo_backfill_blocks);
         match store.rewind_checkpoint_to(net_cfg.network, from) {
-            Ok(()) => tracing::info!(
+            Ok(_) => tracing::info!(
                 network = ?net_cfg.network,
                 from,
                 "rewound the chain cursor so the tip contract's recent-block window refills"
@@ -524,12 +524,22 @@ async fn observe_once(
     // reaches the tip it will stamp those retractions with rather than leaving
     // blocks for the next round to contradict them from. See `scan_ceiling`.
     let ceiling = reorg.scan_ceiling(tip.height, obs.cfg.max_reorg_depth);
+    //
+    // Each block moves the checkpoint forward from where this round last saw
+    // it, and only from there. A watch request that rewinds it during the round
+    // must not be written over, so the round stops, and the next one resumes
+    // from the rewound height with the new script in its watch list.
+    let mut at = store.checkpoint(obs.network())?.map(|a| a.height);
     for height in next..=ceiling {
         let hash = obs.chain.block_hash_at(height)?;
         let block = obs.chain.scan_block(&hash, &watched)?;
         obs.claims_from_block(store, signer, &block, &tip, &mut round)?;
         tip_entries.push(obs.tip_entry(signer, &block)?);
-        store.set_checkpoint(obs.network(), &block.anchor)?;
+        if !store.advance_checkpoint(obs.network(), at, &block.anchor)? {
+            tracing::info!(network = ?obs.network(), "the scan cursor was rewound during this round; the next round resumes from it");
+            break;
+        }
+        at = Some(block.anchor.height);
     }
 
     // Now that the rescan has said what is actually on the chain, retract only

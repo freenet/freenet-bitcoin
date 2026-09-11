@@ -100,8 +100,11 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // The observer and the inbox worker each hold a connection and both
-        // write. Without a timeout a write that meets the other's lock fails
-        // at once instead of waiting its turn.
+        // write, so a write that meets the other's lock has to wait its turn.
+        // This restates rusqlite's own default (5 s, set in `Connection::open`
+        // as of 0.40), which is why removing it changes nothing today; it is
+        // kept so the reliance is written down and survives a change of that
+        // default.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let s = Store { conn };
         s.migrate()?;
@@ -312,12 +315,39 @@ impl Store {
     /// Rewinding is safe because rescanning is idempotent: claims are keyed by
     /// digest, so re-observing a payment produces a claim the contract already
     /// holds. The cost of a rewind is bandwidth, never correctness.
-    pub fn rewind_checkpoint_to(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<()> {
-        self.conn.execute(
+    /// Returns whether the checkpoint moved.
+    pub fn rewind_checkpoint_to(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<bool> {
+        let n = self.conn.execute(
             "UPDATE chain_checkpoint SET height = ?2 WHERE network = ?1 AND height > ?2",
             params![net.as_str(), height as i64],
         )?;
-        Ok(())
+        Ok(n > 0)
+    }
+
+    /// Move the checkpoint forward to `to`, but only from `from`, the height
+    /// it held when the caller last read it. False when something moved it in
+    /// between, which here means a watch request rewound it: the caller stops,
+    /// and its next round starts from the rewound height instead of writing
+    /// over the rewind.
+    pub fn advance_checkpoint(
+        &self,
+        net: BitcoinNetwork,
+        from: Option<u32>,
+        to: &BlockAnchor,
+    ) -> anyhow::Result<bool> {
+        let n = match from {
+            Some(h) => self.conn.execute(
+                "UPDATE chain_checkpoint SET height = ?2, block_hash = ?3
+                 WHERE network = ?1 AND height = ?4",
+                params![net.as_str(), to.height as i64, to.hash.0.to_vec(), h as i64],
+            )?,
+            None => self.conn.execute(
+                "INSERT OR IGNORE INTO chain_checkpoint (network, height, block_hash)
+                 VALUES (?1, ?2, ?3)",
+                params![net.as_str(), to.height as i64, to.hash.0.to_vec()],
+            )?,
+        };
+        Ok(n > 0)
     }
 
     pub fn set_checkpoint(&self, net: BitcoinNetwork, a: &BlockAnchor) -> anyhow::Result<()> {
@@ -745,9 +775,11 @@ impl Store {
         }
         let was_watching = existing.is_some_and(|(w, _)| w);
 
-        // A withdrawal of something never asked for is recorded only so a
-        // delayed older Watch cannot land after it. Bounded per requester like
-        // watches are, or one requester could fill the table with them.
+        // A withdrawal is kept so a delayed older Watch cannot land after it.
+        // Each requester may hold a bounded number, like watches, or one could
+        // fill the table; a day's pruning clears them. The bound counts every
+        // withdrawal the requester holds, and at the bound a withdrawal of a
+        // script it never watched is simply not recorded.
         if !i.watching && existing.is_none() {
             let held: i64 = self.conn.query_row(
                 "SELECT COUNT(*) FROM script_interests WHERE ghostkey = ?1 AND watching = 0",
@@ -879,6 +911,39 @@ impl Store {
             "INSERT INTO inbox_meta (name, value) VALUES (?1, ?2)
              ON CONFLICT(name) DO UPDATE SET value = ?2",
             params![format!("rewind:{}", net.as_str()), tip as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The lowest height requests have asked `net` to be rescanned from, not
+    /// yet done.
+    pub fn pending_rescan(&self, net: BitcoinNetwork) -> anyhow::Result<Option<u32>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM inbox_meta WHERE name = ?1",
+                params![format!("rescan:{}", net.as_str())],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|v| v as u32))
+    }
+
+    /// Ask for `net` to be rescanned from `from`. Only the lowest height asked
+    /// for is kept, since one rescan from there covers every request.
+    pub fn request_rescan(&self, net: BitcoinNetwork, from: u32) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO inbox_meta (name, value) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET value = MIN(value, ?2)",
+            params![format!("rescan:{}", net.as_str()), from as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_pending_rescan(&self, net: BitcoinNetwork) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM inbox_meta WHERE name = ?1",
+            params![format!("rescan:{}", net.as_str())],
         )?;
         Ok(())
     }
@@ -1199,7 +1264,95 @@ mod tests {
             InterestChange::Watching
         );
         drop(s);
-        Store::open(&path).expect("and again, once migrated");
+        let s = Store::open(&path).expect("and again, once migrated");
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &[1u8; 32], true, 1), 10, 0)
+                .unwrap(),
+            InterestChange::Stale,
+            "what was recorded after migrating survives the next open"
+        );
+    }
+
+    #[test]
+    fn the_checkpoint_only_advances_from_where_its_writer_last_saw_it() {
+        let s = store();
+        let net = BitcoinNetwork::Signet;
+        let at = |h: u32| BlockAnchor {
+            height: h,
+            hash: BlockHash([h as u8; 32]),
+        };
+        assert!(s.advance_checkpoint(net, None, &at(100)).unwrap());
+        assert!(s.advance_checkpoint(net, Some(100), &at(101)).unwrap());
+        assert!(s.rewind_checkpoint_to(net, 50).unwrap());
+        assert!(
+            !s.advance_checkpoint(net, Some(101), &at(102)).unwrap(),
+            "a rewind happened in between"
+        );
+        assert_eq!(
+            s.checkpoint(net).unwrap().unwrap().height,
+            50,
+            "and the rewind stands"
+        );
+        assert!(
+            !s.rewind_checkpoint_to(net, 60).unwrap(),
+            "a rewind to above the cursor moves nothing, and says so"
+        );
+    }
+
+    #[test]
+    fn a_pending_rescan_keeps_the_lowest_height_asked_for() {
+        let s = store();
+        let net = BitcoinNetwork::Signet;
+        assert_eq!(s.pending_rescan(net).unwrap(), None);
+        s.request_rescan(net, 500).unwrap();
+        s.request_rescan(net, 400).unwrap();
+        s.request_rescan(net, 450).unwrap();
+        assert_eq!(s.pending_rescan(net).unwrap(), Some(400));
+        s.clear_pending_rescan(net).unwrap();
+        assert_eq!(s.pending_rescan(net).unwrap(), None);
+    }
+
+    /// The observer and the inbox worker write one database through two
+    /// connections. A write that meets the other's lock must wait its turn,
+    /// not fail.
+    ///
+    /// The waiting transaction reads before it writes, as `set_interest` does.
+    /// That is the case a deferred transaction gets wrong: its read pins a
+    /// snapshot the other connection's commit then makes stale, and its write
+    /// fails at once instead of waiting.
+    #[test]
+    fn a_write_waits_for_the_other_connections_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        let a = Store::open(&path).unwrap();
+        let b = Store::open(&path).unwrap();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            a.with_transaction(|| {
+                a.mark_handled(&[1; 32], 100)?;
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        locked_rx.recv().unwrap();
+        // b's write blocks inside SQLite, so the lock is released from
+        // another thread, well inside the busy timeout.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            release_tx.send(()).unwrap();
+        });
+        b.with_transaction(|| {
+            b.is_handled(&[1; 32])?;
+            b.mark_handled(&[2; 32], 100)
+        })
+        .expect("waits for the lock, then writes");
+        releaser.join().unwrap();
+        holder.join().unwrap();
+        assert!(b.is_handled(&[1; 32]).unwrap());
+        assert!(b.is_handled(&[2; 32]).unwrap());
     }
 
     #[test]

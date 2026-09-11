@@ -582,6 +582,27 @@ fn two_peers_converge_through_summaries_and_deltas() {
     assert_eq!(bytes(&a2), bytes(&merged(&a, &b)));
 }
 
+/// A sender records a floor broadcast as delivered when it queues it, so it
+/// can believe a peer holds a floor the peer never got. The entries it then
+/// sends must still be admitted there.
+#[test]
+fn a_delta_carries_the_floor_that_admits_its_entries() {
+    let sender = with_entries(110, &[entry(&ghostkeys()[0], 110 + WINDOW_BLOCKS, 1)]);
+    let believed = open_at(110).summarize();
+    let d = sender.delta(&believed).unwrap();
+    assert!(d.floor.is_some(), "the floor travels with the entry");
+    let mut peer = open_at(100);
+    peer.apply_delta(&params(), &d).unwrap();
+    assert_eq!(peer.entries.len(), 1);
+
+    let w = entry(&ghostkeys()[1], 110 + WINDOW_BLOCKS, 2);
+    let mut other = open_at(100);
+    other
+        .apply_delta(&params(), &InboxDelta::submission(sender.floor.clone(), w))
+        .unwrap();
+    assert_eq!(other.entries.len(), 1, "and a sender's own submission");
+}
+
 #[test]
 fn a_converged_peer_is_sent_nothing() {
     let s = with_entries(100, &[entry(&ghostkeys()[0], 104, 1)]);
@@ -670,6 +691,38 @@ fn one_certificate_spelled_two_ways_is_stored_once() {
 
 /// A low-order key signs for everyone. The all-zero key is one, and the
 /// notary would certify it if asked.
+/// A reader acting on entries one at a time must still leave out every entry
+/// that does not check.
+#[test]
+fn verified_entries_leaves_out_what_does_not_check() {
+    let g = ghostkeys();
+    let good = entry(&g[0], 104, 1);
+    let mut s = with_entries(100, std::slice::from_ref(&good));
+
+    let misfiled = entry(&g[1], 105, 2);
+    s.certificates
+        .insert(misfiled.entry.cert, misfiled.certificate_pem.clone());
+    s.entries
+        .insert(EntryKey([9u8; 32]), misfiled.entry.clone());
+
+    let uncertified = entry(&g[2], 106, 3);
+    s.entries
+        .insert(uncertified.entry.key(), uncertified.entry.clone());
+
+    let mut forged = entry(&g[3], 107, 4);
+    forged.entry.signature.0[0] ^= 1;
+    s.certificates
+        .insert(forged.entry.cert, forged.certificate_pem.clone());
+    s.entries.insert(forged.entry.key(), forged.entry.clone());
+
+    let kept: Vec<EntryKey> = s
+        .verified_entries(&params())
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(kept, vec![good.entry.key()]);
+}
+
 /// A certificate for `key`, signed by the test notary the way the real one
 /// signs: it certifies whatever key it is given.
 fn certify(key: ed25519_dalek::VerifyingKey) -> String {

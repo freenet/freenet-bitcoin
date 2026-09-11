@@ -40,7 +40,7 @@ use freenet_bitcoin_common::{from_cbor, to_cbor, BitcoinNetwork, BridgeId};
 use freenet_bitcoin_inbox::seal::unseal;
 use freenet_bitcoin_inbox::{
     Action, EntryKey, InboxDelta, InboxEntry, InboxParameters, InboxStateV1, SignedFloor,
-    SignedTombstone, FLOOR_LAG_BLOCKS,
+    SignedTombstone, FLOOR_LAG_BLOCKS, WINDOW_BLOCKS,
 };
 use freenet_stdlib::client_api::{
     ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse, WebApi,
@@ -115,6 +115,8 @@ pub struct Pass {
     pub delta: InboxDelta,
     /// Entries acted on for the first time.
     pub acted: usize,
+    /// A rescan a request asked for is waiting for its turn.
+    pub rescan_pending: bool,
 }
 
 pub struct Processor<'a> {
@@ -166,8 +168,12 @@ impl Processor<'_> {
         for (k, e) in entries {
             // Below a floor this bridge signed: a stale copy of the inbox. It
             // was either acted on already or dropped unread when that floor
-            // was set, and the floor sent below removes it.
-            if known.is_some_and(|f| e.mainnet_height < f) {
+            // was set, and the floor sent below removes it. Above that floor's
+            // window: no inbox this bridge serves admits it, and the checks on
+            // each entry do not cover the window, so it is left alone here.
+            if known.is_some_and(|f| {
+                e.mainnet_height < f || e.mainnet_height > f.saturating_add(WINDOW_BLOCKS)
+            }) {
                 continue;
             }
             if !self.store.is_handled(&k.0)? {
@@ -194,7 +200,39 @@ impl Processor<'_> {
                 pass.delta.floor = Some(SignedFloor::sign(self.key, t));
             }
         }
+        pass.rescan_pending = self.apply_pending_rescans(tips)?;
         Ok(pass)
+    }
+
+    /// Do the rescans requests have asked for, as far as the limit allows.
+    /// Returns whether any is still waiting.
+    fn apply_pending_rescans(&self, tips: &Tips) -> Result<bool> {
+        let mut waiting = false;
+        for &net in self.observed {
+            let Some(from) = self.store.pending_rescan(net)? else {
+                continue;
+            };
+            let Some(&tip) = tips.by_network.get(&net) else {
+                waiting = true;
+                continue;
+            };
+            // A tip below the last rescan's means the chain was reset or the
+            // node changed: the old stamp says nothing about now.
+            let due = self.store.last_rewind(net)?.is_none_or(|last| {
+                tip < last || tip >= last.saturating_add(REWIND_INTERVAL_BLOCKS)
+            });
+            if !due {
+                waiting = true;
+                continue;
+            }
+            // Only a rewind that moved the cursor uses up the budget.
+            if self.store.rewind_checkpoint_to(net, from)? {
+                self.store.set_last_rewind(net, tip)?;
+                tracing::info!(network = ?net, from, "rescanning for watches that asked for it");
+            }
+            self.store.clear_pending_rescan(net)?;
+        }
+        Ok(waiting)
     }
 
     /// Act on one entry. An error here is the store failing, and rolls back
@@ -276,22 +314,15 @@ impl Processor<'_> {
                     }
                 }
                 // A rescan moves the whole network's cursor back, delaying
-                // every watched script. So only a script new to the bridge
-                // earns one, and requests earn at most one per network every
-                // REWIND_INTERVAL_BLOCKS: repeated or alternating requests
-                // cannot keep the cursor behind.
+                // every watched script, so only a script new to the bridge asks
+                // for one. It is recorded rather than done here:
+                // `apply_pending_rescans` does the lowest one asked for, at most
+                // once per network every REWIND_INTERVAL_BLOCKS, so no
+                // request's backfill is lost to the limit, and repeated or
+                // alternating requests cannot keep the cursor behind.
                 if let (Some(from), Some(t)) = (scan_from, tip) {
                     if added > 0 && from < t {
-                        let due = self
-                            .store
-                            .last_rewind(net)?
-                            .is_none_or(|last| t >= last.saturating_add(REWIND_INTERVAL_BLOCKS));
-                        if due {
-                            self.store.rewind_checkpoint_to(net, from)?;
-                            self.store.set_last_rewind(net, t)?;
-                        } else {
-                            tracing::info!(network = ?net, "a watch's rescan was skipped: another was done within {REWIND_INTERVAL_BLOCKS} blocks");
-                        }
+                        self.store.request_rescan(net, from)?;
                     }
                 }
                 tracing::info!(network = ?net, scripts = req.scripts.len(), watching = changed, refused, "watch request read");
@@ -644,7 +675,7 @@ impl InboxWorker {
         };
         session
             .quiet
-            .after_pass(fingerprint, !pass.delta.is_empty());
+            .after_pass(fingerprint, !pass.delta.is_empty() || pass.rescan_pending);
         if pass.acted > 0 {
             tracing::info!(acted = pass.acted, "read the request inbox");
         }
@@ -1055,6 +1086,30 @@ mod tests {
         assert_eq!(pass.acted, 1);
         assert_eq!(watched(&store), vec![b"spk".to_vec()]);
         assert_eq!(pass.delta.tombstones.len(), 1);
+        assert_eq!(
+            store.watched(SIGNET).unwrap()[0].scan_from_height,
+            u32::MAX,
+            "no rescan was asked for, so no height is recorded"
+        );
+    }
+
+    /// Checked here because the per-entry checks do not cover the window.
+    #[test]
+    fn an_entry_above_the_window_is_not_acted_on() {
+        let store = Store::open_in_memory().unwrap();
+        let mut state = inbox(FLOOR, vec![]);
+        let far = entry(
+            &ghostkeys()[0],
+            FLOOR + WINDOW_BLOCKS + 5,
+            &request(Action::Watch, b"spk", 1),
+        );
+        state
+            .certificates
+            .insert(far.entry.cert, far.certificate_pem.clone());
+        state.entries.insert(far.entry.key(), far.entry.clone());
+        let pass = run(&store, &state, &tips());
+        assert_eq!(pass.acted, 0);
+        assert!(watched(&store).is_empty());
     }
 
     #[test]
@@ -1260,8 +1315,10 @@ mod tests {
         assert_eq!(watched(&store).len(), 2, "both scripts, on the retry");
     }
 
+    /// A rescan moves the whole network's cursor, so requests share a budget.
+    /// Nothing asked for may be lost to it.
     #[test]
-    fn a_rescan_is_earned_only_by_a_new_script_and_at_most_every_few_blocks() {
+    fn a_rescan_is_earned_only_by_a_new_script_and_waits_its_turn() {
         let store = Store::open_in_memory().unwrap();
         let checkpoint_at = |h: u32| {
             store
@@ -1274,57 +1331,73 @@ mod tests {
                 )
                 .unwrap()
         };
-        let backfill = |script: &[u8]| {
+        let backfill = |script: &[u8], from: u32| {
             let mut r = request(Action::Watch, script, 1);
-            r.scan_from_height = Some(0);
+            r.scan_from_height = Some(from);
             r
         };
         let height = || store.checkpoint(SIGNET).unwrap().unwrap().height;
+        let at_tip = |t: u32| {
+            let mut x = tips();
+            x.by_network.insert(SIGNET, t);
+            x
+        };
+        let watch = |g: &TestGhostkey, script: &[u8], from: u32, tip: u32| {
+            run(
+                &store,
+                &inbox(FLOOR, vec![entry(g, FLOOR + 1, &backfill(script, from))]),
+                &at_tip(tip),
+            )
+        };
         let g = ghostkeys();
+        let t0 = SIGNET_TIP;
 
-        checkpoint_at(SIGNET_TIP);
-        run(
-            &store,
-            &inbox(FLOOR, vec![entry(&g[0], FLOOR + 1, &backfill(b"s1"))]),
-            &tips(),
-        );
-        assert_eq!(height(), SIGNET_TIP - MAX_REQUEST_BACKFILL_BLOCKS);
-
-        checkpoint_at(SIGNET_TIP);
-        run(
-            &store,
-            &inbox(FLOOR, vec![entry(&g[1], FLOOR + 1, &backfill(b"s1"))]),
-            &tips(),
-        );
-        assert_eq!(height(), SIGNET_TIP, "already watched, so no rescan");
-
-        run(
-            &store,
-            &inbox(FLOOR, vec![entry(&g[2], FLOOR + 1, &backfill(b"s2"))]),
-            &tips(),
-        );
-        assert_eq!(height(), SIGNET_TIP, "new, but a rescan was just done");
-
-        let later_tip = SIGNET_TIP + REWIND_INTERVAL_BLOCKS;
-        let mut later = tips();
-        later.by_network.insert(SIGNET, later_tip);
-        checkpoint_at(later_tip);
-        run(
-            &store,
-            &inbox(FLOOR, vec![entry(&g[2], FLOOR + 2, &backfill(b"s1"))]),
-            &later,
-        );
+        checkpoint_at(t0);
+        watch(&g[0], b"s1", 0, t0);
         assert_eq!(
             height(),
-            later_tip,
-            "a rescan is due, but this script is already watched"
+            t0 - MAX_REQUEST_BACKFILL_BLOCKS,
+            "new, and none done lately"
         );
-        run(
+
+        // Too soon after that one: this request waits, it is not dropped.
+        checkpoint_at(t0 + 2);
+        let pass = watch(&g[1], b"s2", t0 - 50, t0 + 2);
+        assert_eq!(height(), t0 + 2);
+        assert!(pass.rescan_pending);
+
+        // Its turn comes, with nobody asking again.
+        checkpoint_at(t0 + REWIND_INTERVAL_BLOCKS);
+        let pass = run(
             &store,
-            &inbox(FLOOR, vec![entry(&g[0], FLOOR + 2, &backfill(b"s3"))]),
-            &later,
+            &inbox(FLOOR, vec![]),
+            &at_tip(t0 + REWIND_INTERVAL_BLOCKS),
         );
-        assert_eq!(height(), later_tip - MAX_REQUEST_BACKFILL_BLOCKS);
+        assert_eq!(height(), t0 - 50);
+        assert!(!pass.rescan_pending);
+
+        // A script already watched asks for nothing, even when one is due.
+        let t1 = t0 + 2 * REWIND_INTERVAL_BLOCKS;
+        checkpoint_at(t1);
+        watch(&g[2], b"s1", 0, t1);
+        assert_eq!(height(), t1, "already watched");
+        assert_eq!(store.pending_rescan(SIGNET).unwrap(), None);
+
+        // A rewind that moves nothing (the cursor is already lower) does not
+        // use up the budget...
+        checkpoint_at(t0 - 100);
+        watch(&g[2], b"s3", t1 - 10, t1);
+        assert_eq!(height(), t0 - 100);
+        // ...so the next request, one block later, still gets its rescan.
+        checkpoint_at(t1 + 1);
+        watch(&g[0], b"s4", t1 - 20, t1 + 1);
+        assert_eq!(height(), t1 - 20);
+
+        // A tip below the last rescan's means the chain was reset: the old
+        // stamp says nothing about now.
+        checkpoint_at(110);
+        watch(&g[1], b"s5", 50, 100);
+        assert_eq!(height(), 50);
     }
 
     /// The bridge's rules and the contract its node runs can disagree, as

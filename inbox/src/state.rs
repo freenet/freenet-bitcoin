@@ -79,6 +79,19 @@ impl InboxDelta {
     pub fn is_empty(&self) -> bool {
         self.floor.is_none() && self.entries.is_empty() && self.tombstones.is_empty()
     }
+
+    /// What a sender sends: its entry, with the floor it read from the inbox.
+    ///
+    /// A peer whose floor lags the sender's takes the floor first and then
+    /// the entry, so the entry is admitted rather than skipped as beyond that
+    /// peer's window.
+    pub fn submission(floor: Option<SignedFloor>, entry: WireEntry) -> Self {
+        InboxDelta {
+            floor,
+            entries: vec![entry],
+            tombstones: vec![],
+        }
+    }
 }
 
 /// Buckets in a summary digest.
@@ -321,7 +334,9 @@ impl InboxStateV1 {
     /// the sender's: every valid state's entries lie within its own floor's
     /// window, and a merge only raises the floor, so a whole state never
     /// carries one, but a delta can reach a peer before the floor that admits
-    /// it does. Refusing the whole delta for that would stall every later one.
+    /// it does. Deltas carry that floor with their records (see `delta` and
+    /// `submission`), so this is rare, and refusing the rest of the delta for
+    /// it would lose more than it protects.
     pub fn apply_delta(
         &mut self,
         params: &InboxParameters,
@@ -491,10 +506,10 @@ impl InboxStateV1 {
     /// What a peer with summary `old` is missing. `None` when nothing: a
     /// converged peer must be answered with zero bytes, on every heartbeat.
     pub fn delta(&self, old: &InboxSummary) -> Option<InboxDelta> {
-        let floor = match (self.floor_height(), old.floor) {
-            (Some(mine), Some(theirs)) if mine > theirs => self.floor.clone(),
-            (Some(_), None) => self.floor.clone(),
-            _ => None,
+        let floor_is_ahead = match (self.floor_height(), old.floor) {
+            (Some(mine), Some(theirs)) => mine > theirs,
+            (Some(_), None) => true,
+            _ => false,
         };
 
         let mine = Buckets::of(self.entries.keys());
@@ -513,6 +528,16 @@ impl InboxStateV1 {
             .map(|(_, t)| t.clone())
             .collect();
 
+        // The floor goes with any record sent, not only when this peer's is
+        // ahead by the summary. A peer that missed a floor broadcast looks
+        // current to a sender that recorded the broadcast as delivered, and
+        // would otherwise skip an entry dated in the window of the floor it
+        // missed, with nothing to prompt a repair.
+        let floor = if floor_is_ahead || !entries.is_empty() || !tombstones.is_empty() {
+            self.floor.clone()
+        } else {
+            None
+        };
         let d = InboxDelta {
             floor,
             entries,

@@ -51,6 +51,10 @@
 //! the floor passed it or the caps pushed it out before the bridge read it,
 //! the sender seals and sends it again.
 //!
+//! A sender sends its entry together with the floor it read
+//! ([`InboxDelta::submission`]), so a peer whose floor lags takes the floor
+//! first and then admits the entry.
+//!
 //! # The merge, and the one subtle part
 //!
 //! State merges by union of entries, union of tombstones and the higher floor,
