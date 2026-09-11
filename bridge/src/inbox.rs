@@ -1126,11 +1126,13 @@ mod tests {
     #[test]
     fn a_watchs_rescan_hint_moves_no_cursor() {
         let store = Store::open_in_memory().unwrap();
+        // Behind the tip, so recording the tip and recording the checkpoint
+        // differ.
         store
             .set_checkpoint(
                 SIGNET,
                 &BlockAnchor {
-                    height: SIGNET_TIP,
+                    height: SIGNET_TIP - 3,
                     hash: BlockHash([0; 32]),
                 },
             )
@@ -1147,7 +1149,7 @@ mod tests {
         );
         assert_eq!(
             store.checkpoint(SIGNET).unwrap().unwrap().height,
-            SIGNET_TIP
+            SIGNET_TIP - 3
         );
         assert_eq!(
             store.watched(SIGNET).unwrap()[0].scan_from_height,

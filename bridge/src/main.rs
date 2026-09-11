@@ -452,9 +452,9 @@ async fn observation_loop(
                 pointers_due = std::time::Instant::now() + pointer_wait(ok);
             }
         }
-        // A short sleep rather than a tight loop. `wait_for_new_block` inside
-        // `observe_once` does the real waiting; this only paces the retry when
-        // something failed.
+        // A short sleep rather than a tight loop. Once the observer has caught
+        // up, a round returns almost at once, so this is the polling interval:
+        // each network's tip is checked about every 2 seconds.
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }

@@ -289,22 +289,25 @@ height needs scanning. **The bridge does not act on it**
 (freenet/freenet-bitcoin#7). The HTTP service the inbox replaced did, by
 rewinding the scan cursor with no bound. The inbox's first PR tried several
 bounded versions, and each raced the observer, which is the only thing that
-should move the cursor, so none shipped. Neither Harvest client sets the hint.
+should move the cursor, so none shipped. Harvest does not send watches yet
+(freenet/harvest#59), so nothing in use relies on the hint.
 
 So a new script is watched from the observer's next round. A payment to it
 mined earlier is missed, and the bridge then publishes a `ScannedTo` height
 past that payment, so the webapp reports that a bridge looked and found no
 payments when the truth is that nobody looked. On a healthy bridge the gap is
-seconds, and Harvest sends its watch before the buyer has the address. It is
-wide in two cases:
+seconds, so a client should send its watch before it shows the address to
+whoever will pay it, and leave the hint unset. The gap is wide in two cases:
 
 - **The bridge's Freenet node is down, or the inbox worker is reconnecting,
   while Bitcoin Core is up.** The observer keeps scanning, the watch waits in
   the inbox, and nothing rewinds when it is read.
-- **The bridge restarts after downtime.** At startup the cursor is rewound
-  `demo_backfill_blocks` so the tip contract refills, which covers a payment
-  in that window only if the inbox worker registers the watch before the
-  observer catches up past it.
+- **The bridge restarts after downtime.** At startup, if the tip can be read,
+  the cursor is rewound to `demo_backfill_blocks` below it so the tip contract
+  refills. A payment in those blocks is still found if the inbox worker
+  registers its watch before the observer scans past it. Blocks older than
+  that window are not rescanned, so after longer downtime every payment mined
+  during it can be missed.
 
 #7 has the design a backfill needs, including publishing no `ScannedTo` below
 where a script's watch began.
