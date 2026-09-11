@@ -32,18 +32,24 @@
 //! reference chain means one floor, and the network stays sealed. The bridge
 //! keeps the floor [`FLOOR_LAG_BLOCKS`] behind the mainnet tip.
 //!
-//! A sender dates its entry at the top of the window: the inbox's current
-//! floor plus [`WINDOW_BLOCKS`], read from the inbox itself. Records rank
-//! newest first when the caps bind, so an entry dated any lower could be
-//! outranked by one dated higher. At the top of the window nobody can outrank
-//! it by height, only tie with it.
+//! A sender dates its entry with [`sender_height`]: the inbox's current floor,
+//! read from the inbox itself, plus [`WINDOW_BLOCKS`] less
+//! [`SENDER_SLACK_BLOCKS`]. Records rank newest first when the caps bind, so
+//! an entry dated near the top of the window is outranked by height only by
+//! the few blocks of slack. The slack is for peers whose floor is a block or
+//! two behind the sender's: to them the very top of the window lies beyond it,
+//! and they drop such an entry until their floor catches up.
 //!
 //! # What a sender does after sending
 //!
-//! The bridge sends no reply. A sender knows its request was read when the
-//! inbox holds a tombstone for its entry's key. If the entry disappears with
-//! no tombstone, because the floor passed it or the caps pushed it out before
-//! the bridge read it, the sender sends it again.
+//! The bridge sends no reply. A tombstone for the sender's entry key means the
+//! bridge has READ the request, not that it did what was asked: it tombstones a
+//! request it cannot open, one for a network it does not observe, and a Watch
+//! beyond its sender's limit of watched scripts, in the same way as one it
+//! acted on. What a Watch did shows up where it matters, in the address
+//! contract for the script. If the entry disappears with no tombstone, because
+//! the floor passed it or the caps pushed it out before the bridge read it,
+//! the sender seals and sends it again.
 //!
 //! # The merge, and the one subtle part
 //!
@@ -78,7 +84,7 @@ mod tests;
 pub use bytes::ByteBuf;
 pub use state::{InboxDelta, InboxStateV1, InboxSummary, WireEntry};
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use freenet_bitcoin_common::{from_cbor, to_cbor, BitcoinNetwork, BridgeId};
 use ghostkey_common::{ScopedPayload, SignatureRequestor};
 use ghostkey_lib::armorable::Armorable;
@@ -109,6 +115,17 @@ pub const FLOOR_LAG_BLOCKS: u32 = 6;
 /// rises: an entry inside the window stays inside it.
 pub const WINDOW_BLOCKS: u32 = 18;
 
+/// How far below the top of the window a sender dates its entry. See the
+/// module docs: enough for a peer whose floor lags by a block or two, and
+/// small, because anything dated in the slack outranks the entry by height.
+pub const SENDER_SLACK_BLOCKS: u32 = 2;
+
+/// The height a sender dates an entry with, given the floor it read from the
+/// inbox.
+pub fn sender_height(floor: u32) -> u32 {
+    floor.saturating_add(WINDOW_BLOCKS - SENDER_SLACK_BLOCKS)
+}
+
 /// Records (entries plus tombstones) the inbox holds at once.
 ///
 /// **This is also what censoring the inbox costs.** Filling it takes
@@ -125,9 +142,11 @@ pub const MAX_RECORDS: usize = 128;
 /// A Ghost Key decides who may write; this decides how much of the inbox one
 /// can occupy. Two, so filling the inbox takes as many Ghost Keys as its size
 /// allows. A tombstone keeps its entry's slot until the floor passes the
-/// entry, so a sender's third request in that time displaces its own oldest
-/// record, which loses nothing if the bridge has read it already. Send one
-/// request naming all your scripts rather than several.
+/// entry, so a sender holding two records competes with itself when it sends
+/// a third: requests dated at one height are ranked by entry key, so the third
+/// may displace either of the others or lose to them. Send one request naming
+/// all your scripts rather than several, and send the next one after an
+/// earlier one has been read.
 pub const MAX_RECORDS_PER_GHOSTKEY: usize = 2;
 
 /// Scripts one request may name. Enforced by senders and the bridge; the
@@ -256,6 +275,10 @@ pub struct InboxRequest {
     /// sender's requests about one script in the order they were made, which
     /// neither the entries' heights nor their arrival order can tell it.
     /// Untrusted, and only ever compared with the same sender's requests.
+    ///
+    /// It must strictly increase across one sender's requests: a sender making
+    /// two in one millisecond adds one to the second. On a tie the bridge
+    /// takes a withdrawal over a watch.
     pub made_at_ms: u64,
 }
 
@@ -404,7 +427,21 @@ pub fn verify_certificate(pem: &str, master: &MasterKey) -> Result<VerifyingKey,
         VerifyingKey::from_bytes(&master.0).map_err(|_| "master key is not a valid point")?;
     cert.verify(&Some(master))
         .map_err(|e| format!("certificate does not chain to the master key: {e:?}"))?;
+    check_ghostkey(&cert.verifying_key)?;
     Ok(cert.verifying_key)
+}
+
+/// Refuse a Ghost Key anyone could sign for.
+///
+/// The notary blind-signs whatever key a donor submits, so a certificate can
+/// certify a low-order point such as the all-zero key. Signatures under such a
+/// key can be forged by anyone, so its entries would be anyone's. Strict
+/// verification refuses those signatures too; this refuses the certificate.
+pub(crate) fn check_ghostkey(key: &VerifyingKey) -> Result<(), String> {
+    if key.is_weak() {
+        return Err("certificate certifies a weak key, which anyone can sign for".into());
+    }
+    Ok(())
 }
 
 /// Check one entry against the Ghost Key its (already verified) certificate
@@ -429,7 +466,7 @@ pub(crate) fn verify_entry(
         .try_into()
         .map_err(|_| "signature must be 64 bytes")?;
     certified
-        .verify(&entry.scoped_payload, &Signature::from_bytes(&sig))
+        .verify_strict(&entry.scoped_payload, &Signature::from_bytes(&sig))
         .map_err(|_| "the Ghost Key did not sign this entry")?;
 
     let scoped: ScopedPayload = from_cbor(&entry.scoped_payload)?;
@@ -477,7 +514,7 @@ fn tombstone_message(bridge: &BridgeId, entry: &EntryKey, height: u32, gk: &Ghos
 fn check_bridge_sig(bridge: &BridgeId, msg: &[u8], sig: &[u8]) -> Result<(), String> {
     let vk = VerifyingKey::from_bytes(&bridge.0).map_err(|_| "bridge id is not a valid key")?;
     let sig: [u8; 64] = sig.try_into().map_err(|_| "signature must be 64 bytes")?;
-    vk.verify(msg, &Signature::from_bytes(&sig))
+    vk.verify_strict(msg, &Signature::from_bytes(&sig))
         .map_err(|_| "not signed by this inbox's bridge".to_string())
 }
 

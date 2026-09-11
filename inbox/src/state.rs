@@ -316,10 +316,12 @@ impl InboxStateV1 {
     /// which an earlier check covered.
     ///
     /// All or nothing: a delta refused part-way leaves the state as it was.
-    /// An entry below the floor is dropped, never an error: a peer whose floor
-    /// was lower can legitimately send one. An entry above the window IS an
-    /// error, because no valid state can hold one: every state's entries lie
-    /// within its own floor's window, and a merge only raises the floor.
+    /// An entry outside the window is dropped, never an error. Below it, a
+    /// peer whose floor was lower sent it. Above it, this peer's floor lags
+    /// the sender's: every valid state's entries lie within its own floor's
+    /// window, and a merge only raises the floor, so a whole state never
+    /// carries one, but a delta can reach a peer before the floor that admits
+    /// it does. Refusing the whole delta for that would stall every later one.
     pub fn apply_delta(
         &mut self,
         params: &InboxParameters,
@@ -377,9 +379,13 @@ impl InboxStateV1 {
                 if next.entries.get(&key) == Some(&w.entry)
                     || next.tombstones.contains_key(&key)
                     || w.entry.mainnet_height < floor
+                    || w.entry.mainnet_height > floor.saturating_add(WINDOW_BLOCKS)
                 {
-                    // Held already, removed already, or below the floor:
-                    // nothing this entry could change, so nothing to check.
+                    // Held already, removed already, or outside this peer's
+                    // window: nothing this entry could change, so nothing to
+                    // check. Above the window means this peer's floor lags the
+                    // sender's; the entry comes again once it catches up, and
+                    // the rest of the delta is not refused on its account.
                     continue;
                 }
                 let pem = canonical_certificate(&w.certificate_pem)?;
@@ -396,14 +402,6 @@ impl InboxStateV1 {
                     }
                 };
                 verify_entry(&w.entry, &vk, params)?;
-                if w.entry.mainnet_height > floor.saturating_add(WINDOW_BLOCKS) {
-                    return Err(format!(
-                        "entry dated {} is beyond the window: the floor is {floor}, so the \
-                         latest acceptable height is {}",
-                        w.entry.mainnet_height,
-                        floor.saturating_add(WINDOW_BLOCKS)
-                    ));
-                }
                 next.certificates.insert(ck, pem);
                 next.entries.insert(key, w.entry.clone());
             }
@@ -412,6 +410,53 @@ impl InboxStateV1 {
         next.normalize();
         *self = next;
         Ok(())
+    }
+
+    /// Decode a state, refusing any encoding but its one canonical form.
+    ///
+    /// Peers decide they agree by comparing bytes, so a re-encoded copy of a
+    /// valid state (a byte string sent as an array, a non-minimal integer)
+    /// would sit beside the canonical one with an identical summary and never
+    /// be healed. Zero bytes is the state of an inbox nobody has written to.
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.is_empty() {
+            return Ok(Self::default());
+        }
+        let state: Self = from_cbor(bytes)?;
+        if freenet_bitcoin_common::to_cbor(&state)? != bytes {
+            return Err("inbox state is not in its canonical encoding".into());
+        }
+        Ok(state)
+    }
+
+    /// The entries whose certificate and signature check out, each on its own.
+    ///
+    /// For a reader that must act on entries even when the state as a whole
+    /// does not pass [`Self::verify`], as a bridge must when its compiled rules
+    /// and the contract its node runs disagree: one bad record, or a cap the
+    /// two builds count differently, must not stop it reading every good one.
+    /// Tombstoned entries are left out.
+    pub fn verified_entries(&self, params: &InboxParameters) -> Vec<(EntryKey, &InboxEntry)> {
+        let mut certified: BTreeMap<CertKey, Option<VerifyingKey>> = BTreeMap::new();
+        let mut out = Vec::new();
+        for (k, e) in &self.entries {
+            if e.key() != *k || self.tombstones.contains_key(k) {
+                continue;
+            }
+            let vk = *certified.entry(e.cert).or_insert_with(|| {
+                let pem = self.certificates.get(&e.cert)?;
+                if cert_key(pem) != e.cert {
+                    return None;
+                }
+                verify_certificate(pem, &params.ghostkey_master).ok()
+            });
+            if let Some(vk) = vk {
+                if verify_entry(e, &vk, params).is_ok() {
+                    out.push((*k, e));
+                }
+            }
+        }
+        out
     }
 
     /// Everything this state holds, as a delta.

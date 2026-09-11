@@ -319,7 +319,13 @@ enabling `txindex`.
   no reverse proxy to run. The inbox admits only Ghost Key signed entries,
   verified by every peer, and holds at most 2 requests per Ghost Key and 128 in
   all. The bridge adds its own limits: 1000 watched scripts per Ghost Key, and
-  a rescan of at most 144 blocks per request.
+  a rescan of at most 144 blocks, only for a script new to the bridge and at
+  most once per network every 6 blocks.
+- **A tombstone means read, not done.** The bridge removes every entry it
+  reads, including ones it cannot open, ones for a network it does not
+  observe, and a Watch beyond its sender's limit, whose extra scripts it
+  drops with a warning in the log. A sender learns what a Watch did from the
+  address contract, not from the inbox.
 - **What the inbox does not stop.** Whoever holds 64 Ghost Keys can fill it and
   keep other requests out for as long as they keep posting. That is the price
   of censoring a bridge's inbox, paid once in donations; see `MAX_RECORDS` in

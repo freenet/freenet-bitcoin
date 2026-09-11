@@ -272,28 +272,40 @@ fn a_floor_signed_by_anyone_but_the_bridge_is_refused() {
 // --- the window -----------------------------------------------------------------
 
 #[test]
-fn the_window_admits_its_top_edge_and_refuses_one_block_beyond() {
+fn the_window_admits_its_top_edge_and_drops_what_lies_beyond() {
     let gk = &ghostkeys()[0];
     let mut s = open_at(100);
     let top = entry(gk, 100 + WINDOW_BLOCKS, 1);
+    let beyond = entry(gk, 100 + WINDOW_BLOCKS + 1, 2);
     s.apply_delta(
         &params(),
         &InboxDelta {
-            entries: vec![top],
+            entries: vec![top.clone(), beyond.clone()],
             ..Default::default()
         },
     )
     .unwrap();
-    let beyond = entry(gk, 100 + WINDOW_BLOCKS + 1, 2);
-    assert!(s
-        .apply_delta(
-            &params(),
-            &InboxDelta {
-                entries: vec![beyond],
-                ..Default::default()
-            }
-        )
-        .is_err());
+    assert!(s.entries.contains_key(&top.entry.key()));
+    assert!(
+        !s.entries.contains_key(&beyond.entry.key()),
+        "dropped, and the rest of the delta still applied"
+    );
+    s.verify(&params()).unwrap();
+}
+
+/// A sender dates below the very top of the window so that a peer whose
+/// floor is a block or two behind still takes the entry.
+#[test]
+fn an_entry_dated_by_sender_height_reaches_a_peer_two_blocks_behind() {
+    let floor = 100;
+    let w = entry(&ghostkeys()[0], sender_height(floor), 1);
+    let behind = with_entries(floor - SENDER_SLACK_BLOCKS, std::slice::from_ref(&w));
+    assert!(behind.entries.contains_key(&w.entry.key()));
+    let further = with_entries(floor - SENDER_SLACK_BLOCKS - 1, std::slice::from_ref(&w));
+    assert!(
+        further.entries.is_empty(),
+        "three behind is past the slack, and waits for its floor"
+    );
 }
 
 #[test]
@@ -618,11 +630,12 @@ fn a_refused_delta_changes_nothing() {
     let mut s = open_at(100);
     let before = bytes(&s);
     let good = entry(&ghostkeys()[0], 104, 1);
-    // Beyond the window even of the floor this same delta raises.
-    let beyond = entry(&ghostkeys()[1], 101 + WINDOW_BLOCKS + 1, 2);
+    // Refused after the floor and the first entry were already taken in.
+    let mut forged = entry(&ghostkeys()[1], 105, 2);
+    forged.entry.signature.0[0] ^= 1;
     let d = InboxDelta {
         floor: Some(SignedFloor::sign(&bridge_sk(), 101)),
-        entries: vec![good, beyond],
+        entries: vec![good, forged],
         ..Default::default()
     };
     assert!(s.apply_delta(&params(), &d).is_err());
@@ -639,6 +652,95 @@ fn a_certificate_is_stored_in_its_one_form_however_it_was_sent() {
     let s = with_entries(100, &[w]);
     assert_eq!(s.certificates.values().next(), Some(&g.pem));
     s.verify(&params()).unwrap();
+}
+
+/// The spellings a sender can multiply are exactly what the canonical form
+/// collapses: two entries, one certificate spelled two ways, one stored copy.
+#[test]
+fn one_certificate_spelled_two_ways_is_stored_once() {
+    let g = &ghostkeys()[0];
+    let a = entry(g, 104, 1);
+    let mut b = entry(g, 105, 2);
+    b.certificate_pem = format!("a prefix\n{}", g.pem);
+    let s = with_entries(100, &[a, b]);
+    assert_eq!(s.entries.len(), 2);
+    assert_eq!(s.certificates.len(), 1);
+    s.verify(&params()).unwrap();
+}
+
+/// A low-order key signs for everyone. The all-zero key is one, and the
+/// notary would certify it if asked.
+/// A certificate for `key`, signed by the test notary the way the real one
+/// signs: it certifies whatever key it is given.
+fn certify(key: ed25519_dalek::VerifyingKey) -> String {
+    let a = authority();
+    let pair =
+        blind_rsa_signatures::KeyPair::new(a.notary_sk.public_key().unwrap(), a.notary_sk.clone());
+    let signature =
+        ghostkey_lib::util::unblinded_rsa_sign(&pair, &Armorable::to_bytes(&key).unwrap()).unwrap();
+    GhostkeyCertificateV1 {
+        notary: a.notary.clone(),
+        verifying_key: key,
+        signature,
+    }
+    .to_armored_string()
+    .unwrap()
+}
+
+/// The check below on the key alone is only worth something if the
+/// certificate check calls it; this goes through the certificate.
+#[test]
+fn a_certificate_for_a_weak_key_is_refused() {
+    let ordinary = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+    assert!(
+        verify_certificate(&certify(ordinary), &authority().master).is_ok(),
+        "the construction makes valid certificates"
+    );
+    let weak = ed25519_dalek::VerifyingKey::from_bytes(&[0u8; 32]).unwrap();
+    assert!(verify_certificate(&certify(weak), &authority().master).is_err());
+}
+
+#[test]
+fn a_weak_ghost_key_is_refused() {
+    let weak = ed25519_dalek::VerifyingKey::from_bytes(&[0u8; 32])
+        .expect("the all-zero key decodes, as a low-order point");
+    assert!(crate::check_ghostkey(&weak).is_err());
+    assert!(crate::check_ghostkey(&ghostkeys()[0].sk.verifying_key()).is_ok());
+}
+
+#[test]
+fn a_state_in_any_encoding_but_its_own_is_refused() {
+    fn first_bytes_as_array(v: &mut ciborium::Value) -> bool {
+        match v {
+            ciborium::Value::Bytes(b) => {
+                let arr = b
+                    .iter()
+                    .map(|x| ciborium::Value::Integer((*x).into()))
+                    .collect();
+                *v = ciborium::Value::Array(arr);
+                true
+            }
+            ciborium::Value::Array(a) => a.iter_mut().any(first_bytes_as_array),
+            ciborium::Value::Map(m) => m.iter_mut().any(|(_, x)| first_bytes_as_array(x)),
+            ciborium::Value::Tag(_, x) => first_bytes_as_array(x),
+            _ => false,
+        }
+    }
+    let s = with_entries(100, &[entry(&ghostkeys()[0], 104, 1)]);
+    let canonical = bytes(&s);
+    assert_eq!(InboxStateV1::decode_canonical(&canonical).unwrap(), s);
+    assert_eq!(
+        InboxStateV1::decode_canonical(&[]).unwrap(),
+        InboxStateV1::default()
+    );
+
+    let mut value: ciborium::Value = ciborium::de::from_reader(canonical.as_slice()).unwrap();
+    assert!(first_bytes_as_array(&mut value));
+    let mut respelled = Vec::new();
+    ciborium::ser::into_writer(&value, &mut respelled).unwrap();
+    let decoded: InboxStateV1 = freenet_bitcoin_common::from_cbor(&respelled).unwrap();
+    assert_eq!(decoded, s, "the same content, which a plain decode accepts");
+    assert!(InboxStateV1::decode_canonical(&respelled).is_err());
 }
 
 #[test]

@@ -366,6 +366,27 @@ const POINTER_REASSERT: std::time::Duration = std::time::Duration::from_secs(30 
 /// How soon to try again after a pointer failed to publish.
 const POINTER_RETRY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
+/// How long until pointers are published again, given whether the last
+/// attempt published all of them.
+fn pointer_wait(all_published: bool) -> std::time::Duration {
+    if all_published {
+        POINTER_REASSERT
+    } else {
+        POINTER_RETRY
+    }
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_pointer_is_retried_sooner_than_a_healthy_one_is_reasserted() {
+        assert_eq!(pointer_wait(false), std::time::Duration::from_secs(5 * 60));
+        assert_eq!(pointer_wait(true), std::time::Duration::from_secs(30 * 60));
+    }
+}
+
 /// Publish every generation pointer, logging each failure. True when all
 /// published.
 ///
@@ -417,7 +438,6 @@ async fn observation_loop(
     // missing until a restart, and a reader resolving through it finds no
     // inbox, or reads an old generation of the other contracts. Republishing
     // an unchanged record is harmless.
-    let pointer_wait = |ok: bool| if ok { POINTER_REASSERT } else { POINTER_RETRY };
     let mut pointers_due = std::time::Instant::now() + pointer_wait(pointers_ok);
 
     loop {

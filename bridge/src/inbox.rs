@@ -70,6 +70,10 @@ pub const MAX_REQUEST_BACKFILL_BLOCKS: u32 = 144;
 /// and the work of scanning every block against it, without limit.
 pub const MAX_WATCHES_PER_GHOSTKEY: usize = 1000;
 
+/// Least number of blocks between two rescans that requests cause on one
+/// network. See where it is used, in `Processor::act`.
+pub const REWIND_INTERVAL_BLOCKS: u32 = 6;
+
 /// How often the inbox is read even when no notification arrives.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -125,22 +129,40 @@ pub struct Processor<'a> {
 
 impl Processor<'_> {
     pub fn pass(&self, state: &InboxStateV1, tips: &Tips, now_ms: i64) -> Result<Pass> {
-        state
-            .verify(self.params)
-            .map_err(|e| anyhow!("the inbox state does not verify: {e}"))?;
-
-        // The highest floor known to be in force: the one this state carries,
-        // or a higher one this bridge signed that has not reached this copy.
-        let known = state.floor_height().max(self.store.signed_floor()?);
+        // The floor this copy carries, if this bridge's key signed it, is
+        // recorded before anything is pruned by it. Otherwise a later, older
+        // copy could present entries whose record was pruned here.
+        let state_floor = state
+            .floor
+            .as_ref()
+            .filter(|f| f.verify(&self.params.bridge).is_ok())
+            .map(|f| f.height);
+        if let Some(f) = state_floor {
+            self.store.set_signed_floor(f)?;
+        }
+        // The highest floor known to be in force, from this copy or any other.
+        let known = self.store.signed_floor()?;
         if let Some(floor) = known {
             self.store.prune_handled_below(floor)?;
         }
         self.store
             .prune_withdrawals_before(now_ms - WITHDRAWAL_MEMORY_MS)?;
 
+        // Each entry is checked on its own rather than the state as a whole.
+        // The node already ran the contract's own checks; these catch a bad
+        // record without letting it, or a rule this build and the contract
+        // disagree on, stop the bridge reading every good one.
+        let mut entries: Vec<(EntryKey, &InboxEntry)> = state.verified_entries(self.params);
+        let unverified = state.entries.len().saturating_sub(entries.len());
+        if unverified > 0 {
+            tracing::warn!(
+                unverified,
+                "inbox entries that do not verify, or are already removed, were skipped"
+            );
+        }
+        entries.sort_by_key(|(k, e)| (e.mainnet_height, *k));
+
         let mut pass = Pass::default();
-        let mut entries: Vec<(&EntryKey, &InboxEntry)> = state.entries.iter().collect();
-        entries.sort_by_key(|(k, e)| (e.mainnet_height, **k));
         for (k, e) in entries {
             // Below a floor this bridge signed: a stale copy of the inbox. It
             // was either acted on already or dropped unread when that floor
@@ -159,7 +181,7 @@ impl Processor<'_> {
             // that was lost sends the same bytes.
             pass.delta
                 .tombstones
-                .push(SignedTombstone::for_entry(self.key, *k, e));
+                .push(SignedTombstone::for_entry(self.key, k, e));
         }
 
         let target = match tips.mainnet() {
@@ -167,7 +189,7 @@ impl Processor<'_> {
             None => known,
         };
         if let Some(t) = target {
-            if state.floor_height().is_none_or(|cur| t > cur) {
+            if state_floor.is_none_or(|cur| t > cur) {
                 self.store.set_signed_floor(t)?;
                 pass.delta.floor = Some(SignedFloor::sign(self.key, t));
             }
@@ -177,7 +199,8 @@ impl Processor<'_> {
 
     /// Act on one entry. An error here is the store failing, and rolls back
     /// the entry; anything wrong with the entry itself is logged and the entry
-    /// is removed like any other, so it stops holding its sender's slot.
+    /// is removed like any other, so it stops holding its sender's slot. The
+    /// tombstone therefore says the entry was read, not what came of it.
     fn act(&self, e: &InboxEntry, tips: &Tips, now_ms: i64) -> Result<()> {
         let body = match e.body() {
             Ok(b) => b,
@@ -214,6 +237,10 @@ impl Processor<'_> {
                     let earliest = t.saturating_sub(MAX_REQUEST_BACKFILL_BLOCKS);
                     req.scan_from_height.unwrap_or(t).clamp(earliest, t)
                 });
+                if tip.is_none() && req.scan_from_height.is_some() {
+                    tracing::warn!(network = ?net, "a watch asked for a rescan, but this network's tip is unknown, so none is done");
+                }
+                let mut added = 0usize;
                 for script in &req.scripts {
                     let i = Interest {
                         network: net,
@@ -227,24 +254,44 @@ impl Processor<'_> {
                         .set_interest(&i, self.max_watches_per_ghostkey, now_ms)?
                     {
                         InterestChange::Watching => {
-                            self.store.add_watch(
+                            // The column records the earliest height anyone
+                            // asked to scan from; with no tip, nobody asked
+                            // for any, which only `u32::MAX` says.
+                            let existed = self.store.add_watch(
                                 &WatchedScript {
                                     network: net,
                                     script_pubkey: script.0.clone(),
-                                    scan_from_height: scan_from.unwrap_or(0),
+                                    scan_from_height: scan_from.unwrap_or(u32::MAX),
                                     is_public_demo: false,
                                 },
                                 now_ms,
                             )?;
                             changed += 1;
+                            if !existed {
+                                added += 1;
+                            }
                         }
                         InterestChange::OverCap => refused += 1,
                         _ => {}
                     }
                 }
+                // A rescan moves the whole network's cursor back, delaying
+                // every watched script. So only a script new to the bridge
+                // earns one, and requests earn at most one per network every
+                // REWIND_INTERVAL_BLOCKS: repeated or alternating requests
+                // cannot keep the cursor behind.
                 if let (Some(from), Some(t)) = (scan_from, tip) {
-                    if changed > 0 && from < t {
-                        self.store.rewind_checkpoint_to(net, from)?;
+                    if added > 0 && from < t {
+                        let due = self
+                            .store
+                            .last_rewind(net)?
+                            .is_none_or(|last| t >= last.saturating_add(REWIND_INTERVAL_BLOCKS));
+                        if due {
+                            self.store.rewind_checkpoint_to(net, from)?;
+                            self.store.set_last_rewind(net, t)?;
+                        } else {
+                            tracing::info!(network = ?net, "a watch's rescan was skipped: another was done within {REWIND_INTERVAL_BLOCKS} blocks");
+                        }
                     }
                 }
                 tracing::info!(network = ?net, scripts = req.scripts.len(), watching = changed, refused, "watch request read");
@@ -529,7 +576,7 @@ impl InboxWorker {
         let key = self.contract_key()?;
         let mut session = Session {
             chains: HashMap::new(),
-            last_processed: None,
+            quiet: QuietCache::default(),
         };
 
         let mut driver = Driver::default();
@@ -573,11 +620,8 @@ impl InboxWorker {
         bytes: &[u8],
     ) -> Result<()> {
         let tips = session.tips(&self.networks);
-        // Nothing new: the same state against the same tip decides the same
-        // thing, and verifying it again would cost an RSA check per
-        // certificate for nothing.
-        let fingerprint = (*blake3::hash(bytes).as_bytes(), tips.mainnet());
-        if session.last_processed == Some(fingerprint) {
+        let fingerprint = QuietCache::fingerprint(bytes, &tips);
+        if session.quiet.is_quiet(&fingerprint) {
             return Ok(());
         }
         let state: InboxStateV1 = if bytes.is_empty() {
@@ -598,7 +642,9 @@ impl InboxWorker {
                 return Ok(());
             }
         };
-        session.last_processed = Some(fingerprint);
+        session
+            .quiet
+            .after_pass(fingerprint, !pass.delta.is_empty());
         if pass.acted > 0 {
             tracing::info!(acted = pass.acted, "read the request inbox");
         }
@@ -651,13 +697,39 @@ impl InboxWorker {
     }
 }
 
+/// A state's bytes, by hash, and the mainnet tip it was read against.
+pub type Fingerprint = ([u8; 32], Option<u32>);
+
+/// Which state needs no processing again.
+///
+/// Only a pass that had nothing to send is remembered. One that sent
+/// tombstones or a floor may have had them refused after sending, so its state
+/// is processed again, and they are sent again, until a pass finds nothing
+/// left to send. Processing a settled state again would cost an RSA check per
+/// certificate for nothing.
+#[derive(Debug, Default)]
+pub struct QuietCache(Option<Fingerprint>);
+
+impl QuietCache {
+    pub fn fingerprint(bytes: &[u8], tips: &Tips) -> Fingerprint {
+        (*blake3::hash(bytes).as_bytes(), tips.mainnet())
+    }
+
+    pub fn is_quiet(&self, fp: &Fingerprint) -> bool {
+        self.0.as_ref() == Some(fp)
+    }
+
+    pub fn after_pass(&mut self, fp: Fingerprint, sent_something: bool) {
+        self.0 = if sent_something { None } else { Some(fp) };
+    }
+}
+
 /// What one connection keeps between messages.
 struct Session {
     /// A Bitcoin Core client per network, made once and remade after a
     /// failure.
     chains: HashMap<BitcoinNetwork, ChainClient>,
-    /// The last state processed and the mainnet tip it was processed against.
-    last_processed: Option<([u8; 32], Option<u32>)>,
+    quiet: QuietCache,
 }
 
 impl Session {
@@ -800,7 +872,13 @@ mod tests {
         s
     }
 
-    fn run_with(store: &Store, state: &InboxStateV1, tips: &Tips, cap: usize) -> Pass {
+    fn try_run(
+        store: &Store,
+        state: &InboxStateV1,
+        tips: &Tips,
+        cap: usize,
+        now_ms: i64,
+    ) -> Result<Pass> {
         let params = params();
         let key = bridge_key();
         Processor {
@@ -810,8 +888,15 @@ mod tests {
             observed: OBSERVED,
             max_watches_per_ghostkey: cap,
         }
-        .pass(state, tips, 0)
-        .unwrap()
+        .pass(state, tips, now_ms)
+    }
+
+    fn run_with(store: &Store, state: &InboxStateV1, tips: &Tips, cap: usize) -> Pass {
+        try_run(store, state, tips, cap, 0).unwrap()
+    }
+
+    fn run_at(store: &Store, state: &InboxStateV1, tips: &Tips, now_ms: i64) -> Pass {
+        try_run(store, state, tips, MAX_WATCHES_PER_GHOSTKEY, now_ms).unwrap()
     }
 
     fn run(store: &Store, state: &InboxStateV1, tips: &Tips) -> Pass {
@@ -1108,6 +1193,189 @@ mod tests {
             3,
         );
         assert_eq!(watched(&store).len(), 3);
+    }
+
+    /// Every other test runs at time zero, where the day's memory of a
+    /// withdrawal can never lapse. This one moves the clock.
+    #[test]
+    fn a_withdrawal_is_remembered_for_a_day_and_then_forgotten() {
+        const HOUR_MS: i64 = 3_600_000;
+        let t0 = 1_700_000_000_000i64;
+        let store = Store::open_in_memory().unwrap();
+        let a = &ghostkeys()[0];
+        let unwatch = entry(a, FLOOR + 1, &request(Action::Unwatch, b"spk", 20));
+        run_at(&store, &inbox(FLOOR, vec![unwatch]), &tips(), t0);
+
+        let older_watch = entry(a, FLOOR + 1, &request(Action::Watch, b"spk", 10));
+        run_at(
+            &store,
+            &inbox(FLOOR, vec![older_watch]),
+            &tips(),
+            t0 + HOUR_MS,
+        );
+        assert!(
+            watched(&store).is_empty(),
+            "within the day, the later withdrawal outranks it"
+        );
+
+        let resent = entry(a, FLOOR + 1, &request(Action::Watch, b"spk", 10));
+        run_at(
+            &store,
+            &inbox(FLOOR, vec![resent]),
+            &tips(),
+            t0 + 25 * HOUR_MS,
+        );
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "a day later the withdrawal is forgotten"
+        );
+    }
+
+    /// The rollback that matters is the one inside a real pass: a Watch that
+    /// fails on its second script must leave no trace of its first, or the
+    /// retry would find that interest recorded and skip the script.
+    #[test]
+    fn a_store_failure_part_way_through_a_watch_leaves_nothing_half_done() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .execute_for_test(
+                "CREATE TRIGGER boom BEFORE INSERT ON watched_scripts
+                 WHEN NEW.script_pubkey = X'626f6f6d'
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+        let mut req = request(Action::Watch, b"fine", 1);
+        req.scripts = vec![ByteBuf(b"fine".to_vec()), ByteBuf(b"boom".to_vec())];
+        let w = entry(&ghostkeys()[0], FLOOR + 1, &req);
+        let state = inbox(FLOOR, vec![w.clone()]);
+
+        assert!(try_run(&store, &state, &tips(), MAX_WATCHES_PER_GHOSTKEY, 0).is_err());
+        assert!(watched(&store).is_empty());
+        assert!(!store.is_handled(&w.entry.key().0).unwrap());
+
+        store.execute_for_test("DROP TRIGGER boom").unwrap();
+        let pass = run(&store, &state, &tips());
+        assert_eq!(pass.acted, 1);
+        assert_eq!(watched(&store).len(), 2, "both scripts, on the retry");
+    }
+
+    #[test]
+    fn a_rescan_is_earned_only_by_a_new_script_and_at_most_every_few_blocks() {
+        let store = Store::open_in_memory().unwrap();
+        let checkpoint_at = |h: u32| {
+            store
+                .set_checkpoint(
+                    SIGNET,
+                    &BlockAnchor {
+                        height: h,
+                        hash: BlockHash([0; 32]),
+                    },
+                )
+                .unwrap()
+        };
+        let backfill = |script: &[u8]| {
+            let mut r = request(Action::Watch, script, 1);
+            r.scan_from_height = Some(0);
+            r
+        };
+        let height = || store.checkpoint(SIGNET).unwrap().unwrap().height;
+        let g = ghostkeys();
+
+        checkpoint_at(SIGNET_TIP);
+        run(
+            &store,
+            &inbox(FLOOR, vec![entry(&g[0], FLOOR + 1, &backfill(b"s1"))]),
+            &tips(),
+        );
+        assert_eq!(height(), SIGNET_TIP - MAX_REQUEST_BACKFILL_BLOCKS);
+
+        checkpoint_at(SIGNET_TIP);
+        run(
+            &store,
+            &inbox(FLOOR, vec![entry(&g[1], FLOOR + 1, &backfill(b"s1"))]),
+            &tips(),
+        );
+        assert_eq!(height(), SIGNET_TIP, "already watched, so no rescan");
+
+        run(
+            &store,
+            &inbox(FLOOR, vec![entry(&g[2], FLOOR + 1, &backfill(b"s2"))]),
+            &tips(),
+        );
+        assert_eq!(height(), SIGNET_TIP, "new, but a rescan was just done");
+
+        let later_tip = SIGNET_TIP + REWIND_INTERVAL_BLOCKS;
+        let mut later = tips();
+        later.by_network.insert(SIGNET, later_tip);
+        checkpoint_at(later_tip);
+        run(
+            &store,
+            &inbox(FLOOR, vec![entry(&g[2], FLOOR + 2, &backfill(b"s1"))]),
+            &later,
+        );
+        assert_eq!(
+            height(),
+            later_tip,
+            "a rescan is due, but this script is already watched"
+        );
+        run(
+            &store,
+            &inbox(FLOOR, vec![entry(&g[0], FLOOR + 2, &backfill(b"s3"))]),
+            &later,
+        );
+        assert_eq!(height(), later_tip - MAX_REQUEST_BACKFILL_BLOCKS);
+    }
+
+    /// The bridge's rules and the contract its node runs can disagree, as
+    /// when one is upgraded before the other. A state the bridge would not
+    /// accept as a whole must still have its good entries served.
+    #[test]
+    fn entries_are_served_even_when_the_state_fails_verification_as_a_whole() {
+        let store = Store::open_in_memory().unwrap();
+        let g = &ghostkeys()[0];
+        let es: Vec<WireEntry> = [b"a", b"b", b"c"]
+            .iter()
+            .enumerate()
+            .map(|(i, s)| entry(g, FLOOR + 1, &request(Action::Watch, *s, i as u64 + 1)))
+            .collect();
+        let mut state = inbox(FLOOR, es[..2].to_vec());
+        state.entries.insert(es[2].entry.key(), es[2].entry.clone());
+        assert!(
+            state.verify(&params()).is_err(),
+            "three records for one Ghost Key"
+        );
+        let pass = run(&store, &state, &tips());
+        assert_eq!(pass.acted, 3);
+        assert_eq!(watched(&store).len(), 3);
+    }
+
+    #[test]
+    fn a_floor_read_back_from_the_inbox_is_remembered() {
+        let store = Store::open_in_memory().unwrap();
+        let mut no_mainnet = tips();
+        no_mainnet.by_network.remove(&BitcoinNetwork::Bitcoin);
+        run(&store, &inbox(FLOOR + 5, vec![]), &no_mainnet);
+        assert_eq!(store.signed_floor().unwrap(), Some(FLOOR + 5));
+    }
+
+    #[test]
+    fn a_state_is_passed_over_only_after_a_pass_that_sent_nothing() {
+        let mut q = QuietCache::default();
+        let fp = QuietCache::fingerprint(b"state", &tips());
+        assert!(!q.is_quiet(&fp));
+        q.after_pass(fp, true);
+        assert!(
+            !q.is_quiet(&fp),
+            "it sent something, which the node may have refused"
+        );
+        q.after_pass(fp, false);
+        assert!(q.is_quiet(&fp));
+        let mut moved = tips();
+        moved
+            .by_network
+            .insert(BitcoinNetwork::Bitcoin, MAINNET_TIP + 1);
+        assert!(!q.is_quiet(&QuietCache::fingerprint(b"state", &moved)));
     }
 
     // --- the driver ------------------------------------------------------------

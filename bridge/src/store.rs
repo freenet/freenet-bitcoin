@@ -44,7 +44,11 @@ pub struct Store {
 /// The requester recorded for a script someone watched before anyone asked
 /// for it through the inbox. No certificate certifies this key, so no request
 /// can ever withdraw it.
-pub const OPERATOR_INTEREST: [u8; 32] = [0; 32];
+///
+/// Zero bytes long: every requester is identified by a 32-byte Ghost Key, so
+/// no request can ever name this one. (An earlier version used the all-zero
+/// key, which a certificate can certify.)
+pub const OPERATOR_INTEREST: &[u8] = &[];
 
 /// One requester's request about one script.
 #[derive(Clone, Copy, Debug)]
@@ -95,6 +99,10 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // The observer and the inbox worker each hold a connection and both
+        // write. Without a timeout a write that meets the other's lock fails
+        // at once instead of waiting its turn.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let s = Store { conn };
         s.migrate()?;
         Ok(s)
@@ -109,6 +117,17 @@ impl Store {
     }
 
     fn migrate(&self) -> anyhow::Result<()> {
+        // `script_interests` first shipped with one `since_ms` column and no
+        // record of withdrawals, on a branch that never ran against a real
+        // database. Such a table holds nothing worth keeping and would stop
+        // the index below, so it is replaced.
+        if self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('script_interests') WHERE name = 'since_ms'")?
+            .exists([])?
+        {
+            self.conn.execute_batch("DROP TABLE script_interests;")?;
+        }
         self.conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS chain_checkpoint (
@@ -716,10 +735,29 @@ impl Store {
                 |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)?)),
             )
             .optional()?;
-        if existing.is_some_and(|(_, prev)| request_ms <= prev) {
-            return Ok(InterestChange::Stale);
+        if let Some((prev_watching, prev)) = existing {
+            // Same millisecond: a withdrawal wins over a watch, so a Watch and
+            // an Unwatch that tie end unwatched whichever arrives first.
+            let newer = request_ms > prev || (request_ms == prev && prev_watching && !i.watching);
+            if !newer {
+                return Ok(InterestChange::Stale);
+            }
         }
         let was_watching = existing.is_some_and(|(w, _)| w);
+
+        // A withdrawal of something never asked for is recorded only so a
+        // delayed older Watch cannot land after it. Bounded per requester like
+        // watches are, or one requester could fill the table with them.
+        if !i.watching && existing.is_none() {
+            let held: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM script_interests WHERE ghostkey = ?1 AND watching = 0",
+                params![gk],
+                |r| r.get(0),
+            )?;
+            if held as usize >= max_per_ghostkey {
+                return Ok(InterestChange::Unchanged);
+            }
+        }
 
         if i.watching && !was_watching {
             let held: i64 = self.conn.query_row(
@@ -785,7 +823,8 @@ impl Store {
 
     // --- inbox bookkeeping --------------------------------------------------
 
-    /// The highest floor this bridge has signed for its inbox.
+    /// The highest floor this bridge's key has signed for its inbox, whether
+    /// this bridge sent it or read it back from the inbox.
     pub fn signed_floor(&self) -> anyhow::Result<Option<u32>> {
         Ok(self
             .conn
@@ -809,12 +848,46 @@ impl Store {
     }
 
     /// Run `f` as one SQLite transaction: everything it writes lands, or none
-    /// of it does.
+    /// of it does. Taken as a write transaction from the start, so it waits
+    /// for the observer's lock (see the busy timeout in `open`) rather than
+    /// failing when it first writes.
     pub fn with_transaction<T>(&self, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let out = f()?;
         tx.commit()?;
         Ok(out)
+    }
+
+    /// The tip of `net` when a request last made the bridge rescan it.
+    pub fn last_rewind(&self, net: BitcoinNetwork) -> anyhow::Result<Option<u32>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM inbox_meta WHERE name = ?1",
+                params![format!("rewind:{}", net.as_str())],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|v| v as u32))
+    }
+
+    pub fn set_last_rewind(&self, net: BitcoinNetwork, tip: u32) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO inbox_meta (name, value) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET value = ?2",
+            params![format!("rewind:{}", net.as_str()), tip as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Run arbitrary SQL, for tests that need to arrange a failure.
+    #[cfg(test)]
+    pub fn execute_for_test(&self, sql: &str) -> anyhow::Result<()> {
+        self.conn.execute_batch(sql)?;
+        Ok(())
     }
 
     // --- inbox entries already acted on ------------------------------------
@@ -1040,6 +1113,93 @@ mod tests {
         });
         assert!(r.is_err());
         assert!(!s.is_handled(&[1; 32]).unwrap());
+    }
+
+    #[test]
+    fn a_withdrawal_beats_a_watch_made_in_the_same_millisecond() {
+        let gk = [1u8; 32];
+        let s = store();
+        s.set_interest(&interest(b"abc", &gk, true, 5), 10, 0)
+            .unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &gk, false, 5), 10, 0)
+                .unwrap(),
+            InterestChange::Withdrawn { last: true },
+            "the Unwatch read second still applies"
+        );
+        let s = store();
+        s.set_interest(&interest(b"abc", &gk, false, 5), 10, 0)
+            .unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &gk, true, 5), 10, 0)
+                .unwrap(),
+            InterestChange::Stale,
+            "the Watch read second does not"
+        );
+    }
+
+    #[test]
+    fn withdrawals_of_scripts_never_watched_are_bounded_per_requester() {
+        let s = store();
+        let gk = [1u8; 32];
+        for script in [b"s1", b"s2", b"s3"] {
+            s.set_interest(&interest(script, &gk, false, 5), 2, 0)
+                .unwrap();
+        }
+        assert_eq!(
+            s.set_interest(&interest(b"s2", &gk, true, 1), 2, 0)
+                .unwrap(),
+            InterestChange::Stale,
+            "the second withdrawal was recorded"
+        );
+        assert_eq!(
+            s.set_interest(&interest(b"s3", &gk, true, 1), 2, 0)
+                .unwrap(),
+            InterestChange::Watching,
+            "the third was over the bound and was not"
+        );
+    }
+
+    /// The operator's interest is marked by a key no request can carry. The
+    /// all-zero key can be certified, so it is just another requester.
+    #[test]
+    fn the_all_zero_key_is_an_ordinary_requester_not_the_operator() {
+        let s = store();
+        s.add_watch(&watch(b"old", 0, false), 0).unwrap();
+        let zero = [0u8; 32];
+        s.set_interest(&interest(b"old", &zero, true, 1), 10, 0)
+            .unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"old", &zero, false, 2), 10, 0)
+                .unwrap(),
+            InterestChange::Withdrawn { last: false },
+            "the operator still wants it"
+        );
+    }
+
+    #[test]
+    fn a_database_from_the_first_inbox_commit_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE script_interests (
+                     network TEXT NOT NULL, script_pubkey BLOB NOT NULL,
+                     ghostkey BLOB NOT NULL, since_ms INTEGER NOT NULL,
+                     PRIMARY KEY (network, script_pubkey, ghostkey));
+                 INSERT INTO script_interests VALUES ('signet', X'00', X'01', 0);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &[1u8; 32], true, 1), 10, 0)
+                .unwrap(),
+            InterestChange::Watching
+        );
+        drop(s);
+        Store::open(&path).expect("and again, once migrated");
     }
 
     #[test]
