@@ -93,6 +93,11 @@ impl ChainClient {
         ))
     }
 
+    /// How many peers the node has.
+    pub fn peers(&self) -> Result<u32> {
+        Ok(self.rpc.get_connection_count()? as u32)
+    }
+
     pub fn in_initial_block_download(&self) -> Result<bool> {
         Ok(self.rpc.get_blockchain_info()?.initial_block_download)
     }

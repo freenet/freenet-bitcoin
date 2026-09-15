@@ -121,10 +121,23 @@ fn watch_cutoff(scanned: u32, deep: u32) -> Option<u32> {
 /// checkpoint. The checkpoint is rewound at every start and trails the tip
 /// while the observer catches up, and the tip trails the headers while the
 /// node does, so a Watch read then would otherwise start in the past and end
-/// before its day. `None` when none is known.
+/// before its day. `None` unless the node is live (see [`Tips::is_live`]):
+/// without a reading, the checkpoint is where the observer stopped when the
+/// node went away, which may be long past, and a watch not started never
+/// ends, so it waits for one.
 fn watch_start(tips: &Tips, net: BitcoinNetwork, checkpoint: Option<u32>) -> Option<u32> {
+    if !tips.is_live(net) {
+        return None;
+    }
     let tip = tips.by_network.get(&net).copied();
-    let headers = tips.headers.get(&net).copied();
+    // Headers need only proof of work, which is cheap on the test networks,
+    // where a peer could feed thousands it never backs with blocks and make
+    // every new watch wait weeks. Off mainnet they count for at most a day
+    // ahead of the tip; mainnet headers cost real work.
+    let headers = tips.headers.get(&net).copied().map(|h| match (net, tip) {
+        (BitcoinNetwork::Bitcoin, _) | (_, None) => h,
+        (_, Some(t)) => h.min(t.saturating_add(WATCH_LIFETIME_BLOCKS)),
+    });
     [tip, headers, checkpoint].into_iter().flatten().max()
 }
 
@@ -155,12 +168,23 @@ pub struct Tips {
     /// The height of the highest header each network's node holds, fetched
     /// or not: its tip, or above it while the node catches up.
     pub headers: HashMap<BitcoinNetwork, u32>,
+    /// How many peers each network's node has. A node with none knows of
+    /// nothing newer than its own tip.
+    pub peers: HashMap<BitcoinNetwork, u32>,
 }
 
 impl Tips {
     /// The Bitcoin mainnet tip, which the inbox is dated by.
     pub fn mainnet(&self) -> Option<u32> {
         self.by_network.get(&BitcoinNetwork::Bitcoin).copied()
+    }
+
+    /// Whether `net`'s node could be read and has peers, so its tip and
+    /// headers say where the chain is now. What this cannot see is the
+    /// moment after the node restarts, before its peers have sent the
+    /// headers it missed.
+    pub fn is_live(&self, net: BitcoinNetwork) -> bool {
+        self.by_network.contains_key(&net) && self.peers.get(&net).is_some_and(|&p| p > 0)
     }
 }
 
@@ -458,8 +482,9 @@ impl Processor<'_> {
         scanned: u32,
         deep: u32,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let start = watch_start(tips, net, Some(scanned)).unwrap_or(scanned);
-        self.store.start_unstarted_watches(net, start)?;
+        if let Some(start) = watch_start(tips, net, Some(scanned)) {
+            self.store.start_unstarted_watches(net, start)?;
+        }
         match watch_cutoff(scanned, deep) {
             Some(cutoff) => self.store.watches_started_by(net, cutoff),
             None => Ok(Vec::new()),
@@ -501,7 +526,8 @@ impl Processor<'_> {
                 // `scan_from_height` hint is not acted on yet:
                 // freenet/freenet-bitcoin#7 has why, and the design it needs.
                 // The height recorded with the watch is informational, the tip
-                // when it began, or `u32::MAX` when no tip was known.
+                // when it began, the checkpoint without one, or `u32::MAX`
+                // with neither.
                 // One read, contained: a checkpoint that cannot be read costs
                 // this request its heights, not the whole pass.
                 let checkpoint = match self.store.checkpoint(net) {
@@ -987,7 +1013,11 @@ pub fn opening_floor(signed: Option<u32>, mainnet_tip: u32) -> u32 {
 /// A state's bytes, by hash; every network's tip it was read against, since
 /// whether a watch may end depends on its own network's tip; and whether the
 /// floor was held, so the first pass after the hold is not passed over.
-pub type Fingerprint = ([u8; 32], Vec<(BitcoinNetwork, u32)>, bool);
+pub type Fingerprint = (
+    [u8; 32],
+    Vec<(BitcoinNetwork, u32, Option<u32>, bool)>,
+    bool,
+);
 
 /// Which state needs no processing again.
 ///
@@ -1002,8 +1032,14 @@ pub struct QuietCache(Option<Fingerprint>);
 
 impl QuietCache {
     pub fn fingerprint(bytes: &[u8], tips: &Tips, held: bool) -> Fingerprint {
-        let mut t: Vec<(BitcoinNetwork, u32)> =
-            tips.by_network.iter().map(|(n, h)| (*n, *h)).collect();
+        // Everything a pass can turn on: each network's tip, the headers its
+        // node holds and whether it is live, which decide where and whether
+        // a watch starts.
+        let mut t: Vec<(BitcoinNetwork, u32, Option<u32>, bool)> = tips
+            .by_network
+            .iter()
+            .map(|(n, h)| (*n, *h, tips.headers.get(n).copied(), tips.is_live(*n)))
+            .collect();
         t.sort();
         (*blake3::hash(bytes).as_bytes(), t, held)
     }
@@ -1047,6 +1083,14 @@ impl Session {
                 Ok((a, headers)) => {
                     tips.by_network.insert(n.network, a.height);
                     tips.headers.insert(n.network, headers);
+                    match client.peers() {
+                        Ok(p) => {
+                            tips.peers.insert(n.network, p);
+                        }
+                        Err(e) => {
+                            tracing::warn!(network = ?n.network, "cannot read the peer count: {e}")
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(network = ?n.network, "cannot read the chain tip: {e}");
@@ -1135,6 +1179,7 @@ mod tests {
                 (BitcoinNetwork::Bitcoin, MAINNET_TIP),
                 (SIGNET, SIGNET_TIP),
             ]),
+            peers: HashMap::from([(BitcoinNetwork::Bitcoin, 8), (SIGNET, 8)]),
             ..Default::default()
         }
     }
@@ -1548,20 +1593,121 @@ mod tests {
         assert!(watched(&store).is_empty());
     }
 
-    /// A renewal read while the observer is behind, and no tip is known,
-    /// must not move the watch's start back and so shorten it.
+    /// A renewal read while the observer and the node both report heights
+    /// below the watch's start must not move it back and so shorten it.
     #[test]
     fn a_renewal_never_moves_a_watchs_start_back() {
         let store = Store::open_in_memory().unwrap();
         let a = &ghostkeys()[0];
         watch_at(&store, a, 1, T0);
         checkpoint_at(&store, SIGNET_TIP - WATCH_LIFETIME_BLOCKS);
-        let mut no_signet = tips();
-        no_signet.by_network.remove(&SIGNET);
+        let mut behind = tips();
+        behind
+            .by_network
+            .insert(SIGNET, SIGNET_TIP - WATCH_LIFETIME_BLOCKS);
         let renewal = entry(a, FLOOR + 1, &request(Action::Watch, b"spk", 2));
-        run_at(&store, &inbox(FLOOR, vec![renewal]), &no_signet, T0);
+        run_at(&store, &inbox(FLOOR, vec![renewal]), &behind, T0);
         checkpoint_at(&store, SIGNET_TIP + 5);
         run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+    }
+
+    /// With the node unreadable, the checkpoint is where the observer stopped
+    /// when the node went away. A Watch read then waits to start until the
+    /// node can be read again, and a watch not started never ends.
+    #[test]
+    fn a_watch_read_while_its_node_is_unreachable_starts_once_it_is_back() {
+        let store = Store::open_in_memory().unwrap();
+        checkpoint_at(&store, SIGNET_TIP - WATCH_LIFETIME_BLOCKS);
+        let mut unreachable = tips();
+        unreachable.by_network.remove(&SIGNET);
+        let w = entry(
+            &ghostkeys()[0],
+            FLOOR + 1,
+            &request(Action::Watch, b"spk", 1),
+        );
+        run_at(&store, &inbox(FLOOR, vec![w]), &unreachable, T0);
+        checkpoint_at(&store, SIGNET_TIP + WATCH_LIFETIME_BLOCKS + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &unreachable, T0);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "not started, so not ended"
+        );
+        // Back, with the node's tip above the observer's checkpoint: the
+        // count starts at the tip.
+        let back_at = SIGNET_TIP + 200;
+        let mut back = tips();
+        back.by_network.insert(SIGNET, back_at);
+        run_at(&store, &inbox(FLOOR, vec![]), &back, T0);
+        checkpoint_at(&store, back_at + WATCH_LIFETIME_BLOCKS + 4);
+        run_at(&store, &inbox(FLOOR, vec![]), &back, T0);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "counted from the node's tip, not the checkpoint"
+        );
+        checkpoint_at(&store, back_at + WATCH_LIFETIME_BLOCKS + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &back, T0);
+        assert!(watched(&store).is_empty());
+    }
+
+    /// A renewal read with no height known clears its watch's start, so the
+    /// count starts again once one is known, which can only lengthen it.
+    #[test]
+    fn a_renewal_read_with_no_height_known_starts_its_count_again() {
+        let store = Store::open_in_memory().unwrap();
+        let a = &ghostkeys()[0];
+        watch_at(&store, a, 1, T0);
+        let mut unreachable = tips();
+        unreachable.by_network.remove(&SIGNET);
+        let renewal = entry(a, FLOOR + 1, &request(Action::Watch, b"spk", 2));
+        run_at(&store, &inbox(FLOOR, vec![renewal]), &unreachable, T0);
+        checkpoint_at(&store, SIGNET_TIP + WATCH_LIFETIME_BLOCKS + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &unreachable, T0);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "the old start was cleared, not kept"
+        );
+    }
+
+    /// On a test network a peer can feed headers it never backs with blocks;
+    /// they count for at most a day ahead of the tip.
+    #[test]
+    fn a_test_network_node_fed_headers_starts_a_watch_at_most_a_day_ahead() {
+        let store = Store::open_in_memory().unwrap();
+        checkpoint_at(&store, SIGNET_TIP);
+        let mut fed = tips();
+        fed.headers.insert(SIGNET, SIGNET_TIP + 1000);
+        let w = entry(
+            &ghostkeys()[0],
+            FLOOR + 1,
+            &request(Action::Watch, b"spk", 1),
+        );
+        run_at(&store, &inbox(FLOOR, vec![w]), &fed, T0);
+        let start = SIGNET_TIP + WATCH_LIFETIME_BLOCKS;
+        checkpoint_at(&store, start + WATCH_LIFETIME_BLOCKS + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0);
+        assert!(watched(&store).is_empty());
+    }
+
+    /// A node with no peers knows of nothing newer than its own tip, which
+    /// may be long past.
+    #[test]
+    fn a_watch_read_while_its_node_has_no_peers_is_not_started() {
+        let store = Store::open_in_memory().unwrap();
+        checkpoint_at(&store, SIGNET_TIP);
+        let mut isolated = tips();
+        isolated.peers.insert(SIGNET, 0);
+        let w = entry(
+            &ghostkeys()[0],
+            FLOOR + 1,
+            &request(Action::Watch, b"spk", 1),
+        );
+        run_at(&store, &inbox(FLOOR, vec![w]), &isolated, T0);
+        checkpoint_at(&store, SIGNET_TIP + WATCH_LIFETIME_BLOCKS + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &isolated, T0);
         assert_eq!(watched(&store), vec![b"spk".to_vec()]);
     }
 
@@ -2114,6 +2260,18 @@ mod tests {
             !q.is_quiet(&QuietCache::fingerprint(b"state", &tips(), true)),
             "the pass that ends the hold must not be passed over"
         );
+        let mut headers_moved = tips();
+        headers_moved.headers.insert(SIGNET, SIGNET_TIP + 10);
+        assert!(
+            !q.is_quiet(&QuietCache::fingerprint(b"state", &headers_moved, false)),
+            "a watch may now start higher"
+        );
+        let mut isolated = tips();
+        isolated.peers.insert(SIGNET, 0);
+        assert!(
+            !q.is_quiet(&QuietCache::fingerprint(b"state", &isolated, false)),
+            "whether a watch may start at all"
+        );
     }
 
     #[test]
@@ -2245,6 +2403,10 @@ mod tests {
         assert!(
             watched(&store).contains(&b"spk".to_vec()),
             "the failed expiry changed nothing"
+        );
+        assert!(
+            watched(&store).contains(&b"other".to_vec()),
+            "the Watch was still acted on"
         );
     }
 

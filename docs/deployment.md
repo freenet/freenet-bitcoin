@@ -289,7 +289,11 @@ contract id as `serving the request inbox`.
   the bridge knows it when it reads the Watch, the highest of Bitcoin Core's
   tip, the headers it holds and the observer's scan, so a Watch read while
   either is catching up after downtime does not start in the past, and a
-  renewal never moves a watch's start back. The count is of
+  renewal never moves a watch's start back. It starts only while Bitcoin
+  Core can be read and has peers; a Watch read otherwise starts when it next
+  can, and a watch not started never ends. What remains is the moment after
+  Bitcoin Core restarts, before its peers have sent the headers it missed: a
+  Watch read then starts at its old tip. The count is of
   blocks the observer has scanned, so no clock enters: however long the
   bridge or Bitcoin Core was down, or cut off from its peers, a watch ends
   only once every block of its life has been scanned for it (#11 is the known

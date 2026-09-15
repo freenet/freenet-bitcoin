@@ -298,9 +298,9 @@ impl Store {
                 watching       INTEGER NOT NULL,
                 request_ms     INTEGER NOT NULL,
                 recorded_ms    INTEGER NOT NULL,
-                -- The observer's scan height when the latest Watch was
-                -- acted on, from which a watch's life is counted in blocks;
-                -- NULL until the observer has scanned anything.
+                -- The height a watch's life is counted from, in blocks (see
+                -- inbox::watch_start); NULL until one is known, and cleared
+                -- when the watch ends.
                 start_height   INTEGER,
                 PRIMARY KEY (network, script_pubkey, ghostkey)
             );
@@ -998,7 +998,7 @@ impl Store {
         now_ms: i64,
     ) -> anyhow::Result<bool> {
         self.conn.execute(
-            "UPDATE script_interests SET watching = 0, recorded_ms = ?4
+            "UPDATE script_interests SET watching = 0, recorded_ms = ?4, start_height = NULL
              WHERE network = ?1 AND script_pubkey = ?2 AND ghostkey = ?3 AND watching = 1",
             params![net.as_str(), script, ghostkey, now_ms],
         )?;
