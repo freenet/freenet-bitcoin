@@ -279,21 +279,25 @@ contract id as `serving the request inbox`.
   each script (`script_interests`), and a script stops being scanned only when
   the last requester withdraws. A watch registered before the inbox existed has
   no requester on record, so no unwatch ends it.
-- **A watch lasts about a day, counted in blocks**: 144 blocks scanned after
-  the Watch that last asked for it (`WATCH_LIFETIME_BLOCKS`), and then until
-  the last of them is `deep_confirmations` deep (six by default), when it
-  ends as if its requester had withdrawn it. Watching costs an update to the
-  script's address contract every block, and a client typically watches an
-  address for one payment. A client that still wants the script sends the
-  Watch again, with a newer timestamp, well before then. The count starts at the present as
-  the bridge knows it when it reads the Watch, the highest of Bitcoin Core's
-  tip, the headers it holds and the observer's scan, so a Watch read while
-  either is catching up after downtime does not start in the past, and a
-  renewal never moves a watch's start back. It starts only while Bitcoin
-  Core can be read and has peers; a Watch read otherwise starts when it next
-  can, and a watch not started never ends. What remains is the moment after
-  Bitcoin Core restarts, before its peers have sent the headers it missed: a
-  Watch read then starts at its old tip. The count is of
+- **A watch lasts about a day** after the Watch that last asked for it
+  (`WATCH_LIFETIME_MS`), and then ends as if its requester had withdrawn it.
+  Watching costs an update to the script's address contract every block, and
+  a client typically watches an address for one payment. A client that still
+  wants the script sends the Watch again, with a newer timestamp, well before
+  the day is out. The day is measured by the timestamps of blocks the
+  observer has scanned, not by any clock of the bridge's: a watch ends once
+  the block `deep_confirmations - 1` below the observer's position is dated a
+  day after the Watch, counted from the later of the sender's timestamp and
+  the time the bridge read it (the sender's counts for at most a week ahead).
+  A block may be dated at most two hours ahead, so every block mined within
+  22 hours of the Watch has been scanned for it by then, however long the
+  bridge or Bitcoin Core was down (#11 is the known exception, a reorg round
+  that fails part-way, and a reorg deeper than `deep_confirmations` can still
+  bring in a payment after a watch has ended). Nor does a watch end while a
+  payment to it is less than `deep_confirmations` deep, while the floor is
+  held, or while a request from its own requester waits on the removal
+  budget, since that may be its renewal (only while that request is still in
+  the inbox: one the caps push out or the floor passes no longer counts). The count is of
   blocks the observer has scanned, so no clock enters: however long the
   bridge or Bitcoin Core was down, or cut off from its peers, a watch ends
   only once every block of its life has been scanned for it (#11 is the known

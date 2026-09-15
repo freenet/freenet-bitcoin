@@ -137,23 +137,21 @@ impl Store {
         {
             self.conn.execute_batch("DROP TABLE script_interests;")?;
         }
-        // `script_interests` first had no `start_height`, when watches ran out
-        // by the clock. A watch without one starts counting at the next
-        // expiry pass (`start_unstarted_watches`), so the column is added
-        // empty rather than the table replaced.
-        let interests_exist = self
+        // `seen_blocks` first had no `block_time_ms`, when watches ran out
+        // by other rules. A block without one ends no watch, and the observer
+        // records the time of every block it scans from now on, so the column
+        // is added empty.
+        let seen_exist = self
             .conn
-            .prepare("SELECT 1 FROM pragma_table_info('script_interests')")?
+            .prepare("SELECT 1 FROM pragma_table_info('seen_blocks')")?
             .exists([])?;
-        let interests_have_start = self
+        let seen_have_time = self
             .conn
-            .prepare(
-                "SELECT 1 FROM pragma_table_info('script_interests') WHERE name = 'start_height'",
-            )?
+            .prepare("SELECT 1 FROM pragma_table_info('seen_blocks') WHERE name = 'block_time_ms'")?
             .exists([])?;
-        if interests_exist && !interests_have_start {
+        if seen_exist && !seen_have_time {
             self.conn
-                .execute_batch("ALTER TABLE script_interests ADD COLUMN start_height INTEGER;")?;
+                .execute_batch("ALTER TABLE seen_blocks ADD COLUMN block_time_ms INTEGER;")?;
         }
         // `inbox_handled` first had no requester column. Its rows are still
         // good (they are what removals are built from), so the column is added
@@ -198,6 +196,9 @@ impl Store {
                 network    TEXT NOT NULL,
                 height     INTEGER NOT NULL,
                 block_hash BLOB NOT NULL,
+                -- The block header's timestamp, from which watch expiry
+                -- reads the time; NULL for blocks recorded before it was kept.
+                block_time_ms INTEGER,
                 PRIMARY KEY (network, height)
             );
 
@@ -298,10 +299,6 @@ impl Store {
                 watching       INTEGER NOT NULL,
                 request_ms     INTEGER NOT NULL,
                 recorded_ms    INTEGER NOT NULL,
-                -- The height a watch's life is counted from, in blocks (see
-                -- inbox::watch_start); NULL until one is known, and cleared
-                -- when the watch ends.
-                start_height   INTEGER,
                 PRIMARY KEY (network, script_pubkey, ghostkey)
             );
             CREATE INDEX IF NOT EXISTS script_interests_by_ghostkey
@@ -471,18 +468,35 @@ impl Store {
 
     // --- seen blocks (reorg detection) -------------------------------------
 
+    /// Record a block the observer has scanned, with its header's
+    /// timestamp (`None` where it is not known), which watch expiry reads.
     pub fn record_block(
         &self,
         net: BitcoinNetwork,
         height: u32,
         hash: &BlockHash,
+        time_ms: Option<i64>,
     ) -> anyhow::Result<()> {
         self.conn.execute(
-            "INSERT INTO seen_blocks (network, height, block_hash) VALUES (?1, ?2, ?3)
-             ON CONFLICT(network, height) DO UPDATE SET block_hash = ?3",
-            params![net.as_str(), height as i64, hash.0.to_vec()],
+            "INSERT INTO seen_blocks (network, height, block_hash, block_time_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(network, height) DO UPDATE SET block_hash = ?3, block_time_ms = ?4",
+            params![net.as_str(), height as i64, hash.0.to_vec(), time_ms],
         )?;
         Ok(())
+    }
+
+    /// The timestamp recorded with the block at `height`, if any.
+    pub fn block_time_ms(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT block_time_ms FROM seen_blocks WHERE network = ?1 AND height = ?2",
+                params![net.as_str(), height as i64],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     pub fn block_at(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<Option<BlockHash>> {
@@ -913,74 +927,37 @@ impl Store {
         Ok(n as usize)
     }
 
-    /// Requesters on `net` whose latest request is a Watch that started at
-    /// or below `height`, as (script, Ghost Key): the watches that have run
-    /// out, given the cutoff `inbox::watch_cutoff` computes. Operator
-    /// interests never run out and are left out, as are watches not started.
-    pub fn watches_started_by(
+    /// Requesters on `net` whose latest request is a Watch whose day began at
+    /// or before `began_by_ms`, as (script, Ghost Key): the watches that have
+    /// run out. A watch's day begins at the later of its sender's timestamp,
+    /// counted at most `ahead_max_ms` past the bridge's, and the time the
+    /// bridge read it. Operator interests never run out and are left out.
+    pub fn watches_run_out(
         &self,
         net: BitcoinNetwork,
-        height: u32,
+        began_by_ms: i64,
+        ahead_max_ms: i64,
     ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut stmt = self.conn.prepare(
             "SELECT script_pubkey, ghostkey FROM script_interests
-             WHERE network = ?1 AND watching = 1 AND start_height <= ?2 AND ghostkey != ?3
+             WHERE network = ?1 AND watching = 1 AND ghostkey != ?2
+               AND MAX(MIN(request_ms, recorded_ms + ?4), recorded_ms) <= ?3
              ORDER BY script_pubkey, ghostkey",
         )?;
         let rows = stmt
             .query_map(
-                params![net.as_str(), height as i64, OPERATOR_INTEREST.to_vec()],
+                params![
+                    net.as_str(),
+                    OPERATOR_INTEREST.to_vec(),
+                    began_by_ms,
+                    ahead_max_ms
+                ],
                 |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
             )?
             // A row that fails to read fails the expiry, which is logged and
             // tried again, rather than vanishing without a word.
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
-    }
-
-    /// Start one requester's watch counting from `height` (see
-    /// `inbox::watch_start`), never moving an existing start back: a renewal
-    /// read while the observer is behind must not shorten the watch it
-    /// renews. With no height known (`None`) the start is cleared, and the
-    /// count starts again at the next expiry pass, which can only lengthen
-    /// it. Call with the `set_interest` it follows, which leaves this column
-    /// alone.
-    pub fn start_watch(
-        &self,
-        net: BitcoinNetwork,
-        script: &[u8],
-        ghostkey: &[u8],
-        height: Option<u32>,
-    ) -> anyhow::Result<()> {
-        self.conn.execute(
-            "UPDATE script_interests
-             SET start_height = CASE WHEN ?4 IS NULL THEN NULL
-                                     ELSE MAX(COALESCE(start_height, ?4), ?4) END
-             WHERE network = ?1 AND script_pubkey = ?2 AND ghostkey = ?3",
-            params![net.as_str(), script, ghostkey, height.map(i64::from)],
-        )?;
-        Ok(())
-    }
-
-    /// Start counting, from `height`, every watch on `net` not yet started:
-    /// one acted on before the observer had scanned anything, or recorded
-    /// before watches were counted in blocks. Reads first, so a pass with
-    /// nothing to start takes no write lock.
-    pub fn start_unstarted_watches(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<()> {
-        let any: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM script_interests
-             WHERE network = ?1 AND watching = 1 AND start_height IS NULL AND ghostkey != ?2)",
-            params![net.as_str(), OPERATOR_INTEREST.to_vec()],
-            |r| r.get(0),
-        )?;
-        if any {
-            self.conn.execute(
-                "UPDATE script_interests SET start_height = ?2
-                 WHERE network = ?1 AND watching = 1 AND start_height IS NULL AND ghostkey != ?3",
-                params![net.as_str(), height as i64, OPERATOR_INTEREST.to_vec()],
-            )?;
-        }
-        Ok(())
     }
 
     /// End one requester's watch because it ran out, returning whether
@@ -998,7 +975,7 @@ impl Store {
         now_ms: i64,
     ) -> anyhow::Result<bool> {
         self.conn.execute(
-            "UPDATE script_interests SET watching = 0, recorded_ms = ?4, start_height = NULL
+            "UPDATE script_interests SET watching = 0, recorded_ms = ?4
              WHERE network = ?1 AND script_pubkey = ?2 AND ghostkey = ?3 AND watching = 1",
             params![net.as_str(), script, ghostkey, now_ms],
         )?;
@@ -1207,9 +1184,11 @@ mod tests {
     #[test]
     fn a_watch_row_that_cannot_be_read_fails_the_expiry() {
         let s = store();
-        s.execute_for_test("INSERT INTO script_interests VALUES ('signet', X'00', 7, 1, 0, 0, 0);")
+        s.execute_for_test("INSERT INTO script_interests VALUES ('signet', X'00', 7, 1, 0, 0);")
             .unwrap();
-        assert!(s.watches_started_by(BitcoinNetwork::Signet, 1).is_err());
+        assert!(s
+            .watches_run_out(BitcoinNetwork::Signet, i64::MAX, 0)
+            .is_err());
     }
 
     fn watch(script: &[u8], from: u32, demo: bool) -> WatchedScript {
@@ -1521,34 +1500,28 @@ mod tests {
         );
     }
 
-    /// A `script_interests` table from before watches were counted in blocks
-    /// gains the column empty, so its watches start counting at the next
-    /// expiry pass.
+    /// A `seen_blocks` table from before blocks carried their time gains the
+    /// column empty, and those blocks end no watch.
     #[test]
-    fn interests_from_before_block_counting_gain_an_empty_start() {
+    fn seen_blocks_from_before_block_times_gain_an_empty_time() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bridge.sqlite");
         {
             let c = Connection::open(&path).unwrap();
             c.execute_batch(
-                "CREATE TABLE script_interests (
-                     network TEXT NOT NULL, script_pubkey BLOB NOT NULL,
-                     ghostkey BLOB NOT NULL, watching INTEGER NOT NULL,
-                     request_ms INTEGER NOT NULL, recorded_ms INTEGER NOT NULL,
-                     PRIMARY KEY (network, script_pubkey, ghostkey));
-                 INSERT INTO script_interests VALUES ('signet', X'00', X'01', 1, 1, 0);",
+                "CREATE TABLE seen_blocks (
+                     network TEXT NOT NULL, height INTEGER NOT NULL,
+                     block_hash BLOB NOT NULL, PRIMARY KEY (network, height));
+                 INSERT INTO seen_blocks VALUES ('signet', 100, X'00');",
             )
             .unwrap();
         }
         let s = Store::open(&path).unwrap();
         let net = BitcoinNetwork::Signet;
-        assert!(
-            s.watches_started_by(net, u32::MAX).unwrap().is_empty(),
-            "not started yet"
-        );
-        s.start_unstarted_watches(net, 100).unwrap();
-        assert!(s.watches_started_by(net, 99).unwrap().is_empty());
-        assert_eq!(s.watches_started_by(net, 100).unwrap().len(), 1);
+        assert_eq!(s.block_time_ms(net, 100).unwrap(), None);
+        s.record_block(net, 101, &BlockHash([1; 32]), Some(1_000))
+            .unwrap();
+        assert_eq!(s.block_time_ms(net, 101).unwrap(), Some(1_000));
     }
 
     /// Only outputs still moved out of their block put a script in doubt,
@@ -1793,7 +1766,8 @@ mod tests {
         let s = store();
         let net = BitcoinNetwork::Signet;
         for h in 0..200u32 {
-            s.record_block(net, h, &BlockHash([h as u8; 32])).unwrap();
+            s.record_block(net, h, &BlockHash([h as u8; 32]), None)
+                .unwrap();
         }
         s.prune_blocks(net, 199, 50).unwrap();
         assert!(s.block_at(net, 100).unwrap().is_none());

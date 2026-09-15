@@ -435,7 +435,12 @@ impl Observer {
         watched: &[Vec<u8>],
         round: &mut RoundClaims,
     ) -> Result<()> {
-        store.record_block(self.cfg.network, block.anchor.height, &block.anchor.hash)?;
+        store.record_block(
+            self.cfg.network,
+            block.anchor.height,
+            &block.anchor.hash,
+            Some(i64::from(block.time) * 1000),
+        )?;
 
         for found in &block.found {
             if !watched.contains(&found.script_pubkey)
@@ -903,6 +908,11 @@ mod tests {
         obs.claims_from_block(&store, &signer, &block, &tip, &[], &mut round)
             .unwrap();
 
+        assert_eq!(
+            store.block_time_ms(obs.network(), 104).unwrap(),
+            Some(1_700_000_000_000),
+            "each scanned block is recorded with its time, which watch expiry reads"
+        );
         assert!(round.was_reconfirmed(&OutPoint { txid, vout: 0 }));
         assert!(
             !round.was_reconfirmed(&OutPoint { txid, vout: 1 }),
