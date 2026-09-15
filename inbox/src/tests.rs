@@ -649,6 +649,36 @@ fn a_removal_frees_its_entrys_place_under_either_cap() {
     s.verify(&params()).unwrap();
 }
 
+/// Superseded batches stay signed and public, so a peer must not verify one
+/// that a batch it holds already covers. A corrupted signature shows it was
+/// not verified, and the state shows it changed nothing.
+#[test]
+fn a_batch_already_covered_is_passed_over_without_being_checked() {
+    let (x, y) = (
+        entry(&ghostkeys()[0], 102, 1),
+        entry(&ghostkeys()[1], 102, 2),
+    );
+    let mut s = open_at(100);
+    apply_removals(&mut s, vec![removal(102, &[&x, &y])]).unwrap();
+    let before = bytes(&s);
+    let mut stale = removal(102, &[&x]);
+    stale.signature.0[0] ^= 1;
+    apply_removals(&mut s, vec![stale]).unwrap();
+    assert_eq!(bytes(&s), before);
+}
+
+/// Certificates are public, so a state carrying ones no entry uses must be
+/// refused before any of them costs an RSA check. This one would fail its
+/// RSA-backed check, so the error shows which check came first.
+#[test]
+fn verify_refuses_an_unused_certificate_before_checking_any() {
+    let mut s = with_entries(100, &[entry(&ghostkeys()[0], 103, 1)]);
+    let weak = certify(ed25519_dalek::VerifyingKey::from_bytes(&[0u8; 32]).unwrap());
+    s.certificates.insert(cert_key(&weak), weak);
+    let err = s.verify(&params()).unwrap_err();
+    assert!(err.contains("no entry uses"), "{err}");
+}
+
 // --- the merge, on exact bytes -------------------------------------------------------
 
 /// Entries from `gks`, `per_key` each, dated across the window above 100,
@@ -859,6 +889,72 @@ fn state_bytes_do_not_depend_on_arrival_order() {
     assert_eq!(
         bytes(&with_entries(100, &es)),
         bytes(&with_entries(100, &rev))
+    );
+}
+
+/// As above, but closer to how peers really meet: enough Ghost Keys that the
+/// inbox-wide cap binds as well as the per-key one (with four only the
+/// per-key cap ever does), peers at different floors, and peers exchanging
+/// summaries and deltas rather than whole states. Fewer rounds, since every
+/// entry costs an RSA check.
+#[test]
+fn above_both_caps_summary_and_delta_exchange_settles_on_one_full_inbox() {
+    let (entries, batches) = pool(&ghostkeys()[..100], MAX_ENTRIES_PER_GHOSTKEY + 1);
+    let mut rng = StdRng::seed_from_u64(0xf1_11);
+    let mut filled = false;
+    // One direction of an exchange: `to` asks `from` for what it lacks.
+    let pull = |to: &mut InboxStateV1, from: &InboxStateV1| {
+        if let Some(d) = from.delta(&to.summarize()) {
+            to.apply_delta(&params(), &d).unwrap();
+        }
+    };
+    for round in 0..3 {
+        let mut peers: Vec<InboxStateV1> = (0..3)
+            .map(|_| {
+                let mut s = open_at(100 + rng.gen_range(0..2));
+                let mut records: Vec<Result<&WireEntry, &RemovalBatch>> = entries
+                    .iter()
+                    .filter(|_| rng.gen_bool(0.8))
+                    .map(Ok)
+                    .collect();
+                records.extend(batches.iter().filter(|_| rng.gen_bool(0.15)).map(Err));
+                records.shuffle(&mut rng);
+                for r in records {
+                    match r {
+                        Ok(w) => add_entries(&mut s, vec![w.clone()]),
+                        Err(b) => apply_removals(&mut s, vec![b.clone()]).unwrap(),
+                    }
+                }
+                s
+            })
+            .collect();
+        filled |= peers.iter().any(|p| p.entries.len() == MAX_ENTRIES);
+
+        let mut settled = false;
+        for _ in 0..20 {
+            let before: Vec<Vec<u8>> = peers.iter().map(bytes).collect();
+            for i in 0..peers.len() {
+                for j in 0..peers.len() {
+                    if i != j {
+                        let from = peers[j].clone();
+                        pull(&mut peers[i], &from);
+                    }
+                }
+            }
+            if peers.iter().map(bytes).collect::<Vec<_>>() == before {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "exchange did not settle, round {round}");
+        for p in &peers {
+            assert_eq!(bytes(p), bytes(&peers[0]), "round {round}");
+        }
+        peers[0].verify(&params()).unwrap();
+    }
+    assert!(
+        filled,
+        "the inbox-wide cap never bound, so this tested nothing new"
     );
 }
 

@@ -174,6 +174,56 @@ impl ReorgOutcome {
     }
 }
 
+/// The scripts one round scans blocks for: the watch list, and the script of
+/// every outpoint the reorg orphaned.
+///
+/// A watch can end between a payment's confirmation and a reorg that moves
+/// it: its requester withdrew it, or it ran out. Scanning the replacement
+/// blocks only for watched scripts would then miss the payment where it was
+/// re-mined, and `Observer::retraction_claims` would sign a retraction for a
+/// payment still on the chain, which nothing later corrects because nobody
+/// scans that script any more. Scanning the orphans' scripts as well finds it.
+///
+/// For the scan only: a script scanned here because of an orphan is not
+/// watched, and must not be given a scan watermark, which would claim
+/// coverage of blocks nobody scanned for it.
+pub fn scan_set(watched: &[Vec<u8>], orphaned: &[OrphanedOutpoint]) -> Vec<Vec<u8>> {
+    let mut scan = watched.to_vec();
+    for (script, _) in orphaned {
+        if !scan.contains(script) {
+            scan.push(script.clone());
+        }
+    }
+    scan
+}
+
+#[cfg(test)]
+mod scan_set_tests {
+    use super::*;
+    use freenet_bitcoin_common::Txid;
+
+    fn orphan(script: &[u8], vout: u32) -> OrphanedOutpoint {
+        (
+            script.to_vec(),
+            OutPoint {
+                txid: Txid([1; 32]),
+                vout,
+            },
+        )
+    }
+
+    #[test]
+    fn a_round_after_a_reorg_scans_the_orphans_scripts_too_once_each() {
+        let watched = vec![b"a".to_vec()];
+        let scan = scan_set(
+            &watched,
+            &[orphan(b"a", 0), orphan(b"gone", 0), orphan(b"gone", 1)],
+        );
+        assert_eq!(scan, vec![b"a".to_vec(), b"gone".to_vec()]);
+        assert_eq!(scan_set(&watched, &[]), watched, "no reorg, no change");
+    }
+}
+
 /// What one round of observation produced, ready to publish.
 pub struct Observations {
     pub tip: BlockAnchor,

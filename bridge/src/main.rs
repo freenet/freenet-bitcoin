@@ -29,7 +29,7 @@ use bitcoin_freenet_bridge::{
     config::BridgeConfig,
     freenet::{ContractWasm, FreenetPublisher},
     inbox::InboxWorker,
-    observer::{Observer, RoundClaims},
+    observer::{scan_set, Observer, RoundClaims},
     signer::Signer,
     store::{Store, WatchedScript},
 };
@@ -505,6 +505,9 @@ async fn observe_once(
         reorg.resume_from = tip.height;
     }
     let next = reorg.resume_from;
+    // Blocks are scanned for the orphans' scripts too, watched or not; the
+    // watermarks below stay with `watched`. See `scan_set`.
+    let scan = scan_set(&watched, &reorg.orphaned);
 
     // A tip entry for EVERY block scanned, not only the last.
     //
@@ -526,7 +529,7 @@ async fn observe_once(
     let ceiling = reorg.scan_ceiling(tip.height, obs.cfg.max_reorg_depth);
     for height in next..=ceiling {
         let hash = obs.chain.block_hash_at(height)?;
-        let block = obs.chain.scan_block(&hash, &watched)?;
+        let block = obs.chain.scan_block(&hash, &scan)?;
         obs.claims_from_block(store, signer, &block, &tip, &mut round)?;
         tip_entries.push(obs.tip_entry(signer, &block)?);
         store.set_checkpoint(obs.network(), &block.anchor)?;

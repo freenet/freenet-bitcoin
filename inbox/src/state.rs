@@ -200,6 +200,24 @@ impl InboxStateV1 {
         self.removals.values().any(|b| b.prefixes().any(|q| q == p))
     }
 
+    /// Drop every batch another batch covers. Of any set of batches, the ones
+    /// nothing covers are the same whichever order they arrived in.
+    fn drop_covered(&mut self) {
+        let covered: Vec<BatchKey> = self
+            .removals
+            .iter()
+            .filter(|(k, b)| {
+                self.removals
+                    .iter()
+                    .any(|(other, c)| other != *k && b.covered_by(c))
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for k in covered {
+            self.removals.remove(&k);
+        }
+    }
+
     /// Prefixes named across all batches, counting a prefix once per batch
     /// that names it. What [`MAX_REMOVED`] bounds.
     fn removed_count(&self) -> usize {
@@ -219,17 +237,16 @@ impl InboxStateV1 {
         floor.verify(&params.bridge)?;
         let floor = floor.height;
 
-        let mut certified: BTreeMap<CertKey, VerifyingKey> = BTreeMap::new();
-        for (k, pem) in &self.certificates {
-            if cert_key(pem) != *k {
-                return Err("certificate filed under a key that is not its digest".into());
-            }
-            if canonical_certificate(pem)? != *pem {
-                return Err("certificate is not in its canonical form".into());
-            }
-            certified.insert(*k, verify_certificate(pem, &params.ghostkey_master)?);
+        // Everything structural first, and the certificates' RSA checks last,
+        // once their number is known to be bounded by the entries. Every
+        // certificate is public, so a state carrying many that nothing uses
+        // would otherwise cost each peer an RSA check apiece before failing.
+        if self.entries.len() > MAX_ENTRIES {
+            return Err(format!(
+                "inbox holds {} entries, cap is {MAX_ENTRIES}",
+                self.entries.len()
+            ));
         }
-
         if self.removals.len() > MAX_REMOVAL_BATCHES {
             return Err(format!(
                 "inbox holds {} removal batches, cap is {MAX_REMOVAL_BATCHES}",
@@ -237,7 +254,7 @@ impl InboxStateV1 {
             ));
         }
         for (k, b) in &self.removals {
-            b.verify(&params.bridge)?;
+            b.check_shape()?;
             if b.key() != *k {
                 return Err("removal batch filed under a key that is not its digest".into());
             }
@@ -261,6 +278,9 @@ impl InboxStateV1 {
                 "inbox names {removed_count} removed entries, cap is {MAX_REMOVED}"
             ));
         }
+        for b in self.removals.values() {
+            b.verify(&params.bridge)?;
+        }
         let removed = self.removed();
 
         let mut referenced: BTreeSet<CertKey> = BTreeSet::new();
@@ -269,10 +289,9 @@ impl InboxStateV1 {
             if e.key() != *k {
                 return Err("entry filed under a key that is not its digest".into());
             }
-            let vk = certified
-                .get(&e.cert)
-                .ok_or("entry references a certificate the state does not hold")?;
-            verify_entry(e, vk, params)?;
+            if !self.certificates.contains_key(&e.cert) {
+                return Err("entry references a certificate the state does not hold".into());
+            }
             if e.mainnet_height < floor {
                 return Err("entry below the floor: state is not in normal form".into());
             }
@@ -294,11 +313,20 @@ impl InboxStateV1 {
         if referenced.len() != self.certificates.len() {
             return Err("state holds a certificate no entry uses".into());
         }
-        if self.entries.len() > MAX_ENTRIES {
-            return Err(format!(
-                "inbox holds {} entries, cap is {MAX_ENTRIES}",
-                self.entries.len()
-            ));
+
+        // The expensive half: at most one RSA check per entry.
+        let mut certified: BTreeMap<CertKey, VerifyingKey> = BTreeMap::new();
+        for (k, pem) in &self.certificates {
+            if cert_key(pem) != *k {
+                return Err("certificate filed under a key that is not its digest".into());
+            }
+            if canonical_certificate(pem)? != *pem {
+                return Err("certificate is not in its canonical form".into());
+            }
+            certified.insert(*k, verify_certificate(pem, &params.ghostkey_master)?);
+        }
+        for e in self.entries.values() {
+            verify_entry(e, &certified[&e.cert], params)?;
         }
         Ok(())
     }
@@ -334,19 +362,7 @@ impl InboxStateV1 {
 
         self.entries.retain(|_, e| e.mainnet_height >= floor);
         self.removals.retain(|_, b| b.height >= floor);
-        let covered: Vec<BatchKey> = self
-            .removals
-            .iter()
-            .filter(|(k, b)| {
-                self.removals
-                    .iter()
-                    .any(|(other, c)| other != *k && b.covered_by(c))
-            })
-            .map(|(k, _)| *k)
-            .collect();
-        for k in covered {
-            self.removals.remove(&k);
-        }
+        self.drop_covered();
 
         let removed = self.removed();
         self.entries
@@ -395,7 +411,9 @@ impl InboxStateV1 {
         // Bounded before anything is verified. Each record is checked on its
         // own, so without this a delta's cost would follow its size rather
         // than the caps; removals are public, so anyone could otherwise send
-        // thousands of copies of one.
+        // thousands of copies of one. (Decoding the delta, which happens
+        // before this, costs time in proportion to its size, which only the
+        // node's own message limit bounds.)
         if delta.entries.len() > MAX_ENTRIES || delta.removals.len() > MAX_REMOVAL_BATCHES {
             return Err(format!(
                 "a delta may carry at most {MAX_ENTRIES} entries and \
@@ -431,8 +449,17 @@ impl InboxStateV1 {
                 if next.removals.get(&key) == Some(b)
                     || b.height < floor
                     || b.height > floor.saturating_add(WINDOW_BLOCKS)
+                    || next
+                        .removals
+                        .iter()
+                        .any(|(held, c)| *held != key && b.covered_by(c))
                 {
-                    // Held already, or outside this peer's window; see above.
+                    // Held already, outside this peer's window (see above), or
+                    // covered by a batch already held, which would drop it
+                    // again: nothing it could change, so nothing to verify.
+                    // Every superseded batch stays validly signed and public,
+                    // so without the last test anyone could make each peer
+                    // verify them again and again.
                     continue;
                 }
                 b.verify(&params.bridge)?;
@@ -444,6 +471,12 @@ impl InboxStateV1 {
                     next.removals.insert(key, b.clone());
                 }
             }
+            // Before the removed set is built from them below: batches the
+            // floor has passed, and batches another covers, go now rather
+            // than at `normalize`, so an entry is skipped as removed only on
+            // the strength of a batch the result keeps.
+            next.removals.retain(|_, b| b.height >= floor);
+            next.drop_covered();
         }
 
         if !delta.entries.is_empty() {

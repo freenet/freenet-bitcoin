@@ -52,7 +52,14 @@
 //! disappears without being removed, because the floor passed it or the caps
 //! pushed it out before the bridge read it, the sender seals and sends it
 //! again. The floor passes an unread entry about half an hour after it is
-//! sent (see [`WINDOW_BLOCKS`]).
+//! sent (see [`WINDOW_BLOCKS`]). A sender whose copy of the inbox lags the
+//! real floor by three blocks or more dates below it and is dropped at once,
+//! so a sender should read the floor just before sending.
+//!
+//! **A Watch lasts a day.** The bridge ends a watch 24 hours after the last
+//! Watch that asked for it, unless a payment to the script is still being
+//! buried. A sender that still wants the script sends the Watch again, with a
+//! newer `made_at_ms`, before the day is out.
 //!
 //! A sender sends its entry together with the floor it read
 //! ([`InboxDelta::submission`]), so a peer whose floor lags takes the floor
@@ -78,12 +85,16 @@
 //!   and the ranking are each independent of order, and nothing is discarded.
 //! * **Two peers that exchange state agree afterwards**, because the normal
 //!   form is a function of the records present and the floor alone. An entry
-//!   one peer discarded comes back from any peer that kept it; one that no
-//!   peer kept is gone for everyone.
+//!   one peer discarded comes back from any peer that kept it, if it still
+//!   fits under the caps there; one that no peer kept is gone for everyone.
+//!   Until the peers agree, a peer whose caps refuse an entry is sent it
+//!   again on each exchange.
 //!
-//! The caps overflow only when more requests are waiting than the inbox
-//! holds, which is a flood, and in a flood some requests are dropped whatever
-//! the rule. A sender whose entry vanished without being removed sends again.
+//! The caps overflow when more requests are waiting than they allow: more
+//! than [`MAX_ENTRIES`] in all, which is a flood, or a third from one Ghost
+//! Key before the bridge has read its first two. Either way some request is
+//! dropped whatever the rule, and a sender whose entry vanished without
+//! being removed sends it again.
 
 #![deny(unsafe_code)]
 
@@ -181,22 +192,33 @@ pub const MAX_ENTRIES_PER_GHOSTKEY: usize = 2;
 /// Eight rather than thirty-two, because a removal is kept for every entry
 /// the bridge reads until the floor passes it. A sender who wanted its own
 /// entry's removal to take someone else's pending entry with it would need an
-/// entry whose key shares these 8 bytes with that one: about 2^64 tries,
-/// against a bridge that reads a pending entry within seconds.
+/// entry whose key shares these 8 bytes with a pending one. With up to
+/// [`MAX_ENTRIES`] pending entries to aim at, that is about 2^57 tries, each a
+/// signature and a hash, against entries that live about half an hour. Two
+/// of an attacker's own entries colliding, about 2^32 tries, harms nobody
+/// else. A removal matches a prefix whatever height its entry is dated,
+/// which only matters after such a collision.
 pub const REMOVED_PREFIX_BYTES: usize = 8;
 
 /// Removed entries the inbox may name, across all its removal batches.
 ///
 /// A hard bound on state size: 64 KiB of prefixes. Only the bridge signs
-/// removals, and it keeps itself to [`REMOVAL_BUDGET`], half of this, so a peer
-/// whose floor lags the bridge's a little still holds a valid state.
+/// removals, and it keeps itself to [`REMOVAL_BUDGET`], half of this. A lagging
+/// peer does not need the slack, because every batch travels with the floor
+/// it was signed under; what the slack absorbs is a bridge that lost its
+/// database within one window and so signed a second, unrelated set of
+/// batches for the same heights. Two such losses in one window can exceed
+/// this bound, and peers then refuse the bridge's deltas until the floor
+/// passes the old batches, about half an hour.
 pub const MAX_REMOVED: usize = 8192;
 
 /// How many entries the bridge reads before the floor must move on.
 ///
 /// The bridge removes whatever it reads, and stops reading once the removals
 /// the floor has not yet passed reach this; new requests then wait for the
-/// floor. Reaching it takes this many requests within about half an hour.
+/// floor. The bridge also gives each Ghost Key only a share of it (a 64th,
+/// `REMOVAL_SHARE_PER_GHOSTKEY` in the bridge), so reaching it takes 64
+/// Ghost Keys each sending 64 requests within about half an hour.
 pub const REMOVAL_BUDGET: usize = MAX_REMOVED / 2;
 
 /// Removal batches the inbox may hold.
@@ -329,7 +351,9 @@ pub fn production_master() -> MasterKey {
 /// What a request asks the bridge to do.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
-    /// Start, or keep, synchronizing these scripts.
+    /// Start, or keep, synchronizing these scripts, for a day from when the
+    /// bridge reads it. Send it again, with a newer `made_at_ms`, to keep a
+    /// script watched longer.
     Watch,
     /// Stop wanting these scripts synchronized. Removes only the sender's own
     /// interest: the bridge stops scanning a script when nobody still wants it.
@@ -596,10 +620,10 @@ fn check_bridge_sig(bridge: &BridgeId, msg: &[u8], sig: &[u8]) -> Result<(), Str
 ///
 /// Ed25519 signing is deterministic, so a bridge that signs one height twice
 /// produces one record. The merge still orders two different signatures for
-/// one height (the smaller wins), and likewise for tombstones, so a bridge
-/// that ever signed non-deterministically would not break convergence by
-/// merging. It would break it through summaries, which carry the floor's
-/// height and a tombstone's key but not the signature, so such a pair would
+/// one height (the smaller wins), and likewise for removal batches, so a
+/// bridge that ever signed non-deterministically would not break convergence
+/// by merging. It would break it through summaries, which carry the floor's
+/// height and a removal batch's key but not the signature, so such a pair would
 /// never be reconciled. Bridges must sign deterministically.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct SignedFloor {
@@ -692,7 +716,10 @@ impl RemovalBatch {
     }
 
     /// This batch's identity: its height and what it removes. Not the
-    /// signature, which a bridge signing deterministically never varies.
+    /// signature, which a bridge signing deterministically never varies, and
+    /// which it must leave out: [`Self::covered_by`] holds both ways between
+    /// batches with the same content, so one content filed under two keys
+    /// would have each drop the other.
     pub fn key(&self) -> BatchKey {
         let mut h = blake3::Hasher::new_derive_key(BATCH_KEY_DOMAIN);
         h.update(&self.height.to_le_bytes());

@@ -268,7 +268,9 @@ contract id as `serving the request inbox`.
   inbox stays closed, and the bridge says so at startup.
 - **The floor waits two minutes after the bridge connects to its node**
   (`FLOOR_HOLD_MS`), so a node that was down has time to catch up with the
-  inbox before the floor moves past requests other peers were holding.
+  inbox before the floor moves past requests other peers were holding. An
+  inbox the node has lost is opened again at the highest floor the bridge
+  has signed, not the tip's.
 - **`bitcoin_inbox_contract.wasm` must be in the contract directory**, beside
   the other two. `scripts/deploy.sh` installs it.
 - **`listen` and `auth` are ignored.** They configured the HTTP service the
@@ -281,7 +283,13 @@ contract id as `serving the request inbox`.
   (`WATCH_LIFETIME_MS`), and then ends as if its requester had withdrawn it.
   Watching costs an update to the script's address contract every block, and
   a client typically watches an address for one payment. A client that still
-  wants the script sends the Watch again, with a newer timestamp. Where a
+  wants the script sends the Watch again, with a newer timestamp. A watch
+  ends only once the observer has scanned its network up to the tip, so
+  downtime never leaves blocks from its day unscanned, and not while the
+  floor is held or requests wait on the removal budget, since one of them may
+  be its renewal. A reorg's rescan also covers the scripts of the payments it
+  orphaned, watched or not, so a payment moved to another block is found
+  again rather than retracted. Where a
   payment to the script has been seen and is not yet `deep_confirmations`
   deep, the watch lasts until it is: after a reorg the observer rescans only
   watched scripts, so ending the watch sooner could have it retract a payment
@@ -298,7 +306,9 @@ contract id as `serving the request inbox`.
 - **Reading stops at the removal budget** (`REMOVAL_BUDGET`, 4096 entries).
   Every entry read is removed, and removals last until the floor passes them,
   about half an hour. Past the budget, new requests wait in the inbox for the
-  floor, and the bridge logs `the removal budget is spent`.
+  floor, and the bridge logs that they do. Each Ghost Key gets a 64th of the
+  budget (`REMOVAL_SHARE_PER_GHOSTKEY`), so one sender cannot spend it for
+  everyone; a sender past its share waits the same way while others are read.
 
 ### Backfilling history on a pruned node
 
@@ -362,8 +372,8 @@ enabling `txindex`.
   address contract, not from the inbox.
 - **What the inbox does not stop.** Whoever holds 64 Ghost Keys can hold every
   place in it, for as long as they keep sending faster than the bridge reads,
-  and whoever can send 4096 requests within about half an hour spends the
-  removal budget, after which new requests wait for the floor. See
+  and 64 Ghost Keys each sending 64 requests within about half an hour spend
+  the removal budget, after which new requests wait for the floor. See
   `MAX_ENTRIES` and `REMOVAL_BUDGET` in `inbox/src/lib.rs` for why neither is
   raised freely: more entries mean more certificates for every peer to check,
   and more removals mean a larger state.

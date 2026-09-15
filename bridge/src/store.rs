@@ -131,6 +131,24 @@ impl Store {
         {
             self.conn.execute_batch("DROP TABLE script_interests;")?;
         }
+        // `inbox_handled` first had no requester column. Its rows are still
+        // good (they are what removals are built from), so the column is added
+        // rather than the table replaced; old rows count against the whole
+        // budget and no Ghost Key's share. Added before the batch below,
+        // whose index needs it.
+        let handled_exists = self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('inbox_handled')")?
+            .exists([])?;
+        let handled_has_requester = self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('inbox_handled') WHERE name = 'ghostkey'")?
+            .exists([])?;
+        if handled_exists && !handled_has_requester {
+            self.conn.execute_batch(
+                "ALTER TABLE inbox_handled ADD COLUMN ghostkey BLOB NOT NULL DEFAULT X'';",
+            )?;
+        }
         self.conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS chain_checkpoint (
@@ -261,6 +279,11 @@ impl Store {
             CREATE INDEX IF NOT EXISTS script_interests_by_ghostkey
                 ON script_interests (ghostkey, watching);
 
+            -- Watch expiry asks, for each watch that ran out, whether a
+            -- payment to its script is still being buried.
+            CREATE INDEX IF NOT EXISTS observed_outputs_by_script
+                ON observed_outputs (network, script_pubkey);
+
             -- The inbox's own bookkeeping. Today only `signed_floor`, the
             -- highest floor this bridge has signed: entries below it are never
             -- acted on, even if a stale copy of the inbox presents them again.
@@ -269,16 +292,21 @@ impl Store {
                 value  INTEGER NOT NULL
             );
 
-            -- Inbox entries already acted on. A tombstone can fail to land,
-            -- and without this record a Watch whose tombstone was lost would
+            -- Inbox entries already acted on, from which each removal batch
+            -- is built. A removal can fail to land,
+            -- and without this record a Watch whose removal was lost would
             -- be acted on again after the same requester's later Unwatch had
             -- been, bringing back an interest they withdrew. Pruned once the
             -- inbox floor passes an entry, because the inbox drops the entry
             -- itself from then on.
             CREATE TABLE IF NOT EXISTS inbox_handled (
                 entry_key     BLOB PRIMARY KEY,
-                entry_height  INTEGER NOT NULL
+                entry_height  INTEGER NOT NULL,
+                -- Who sent it, so no one sender spends the removal budget.
+                ghostkey      BLOB NOT NULL DEFAULT X''
             );
+            CREATE INDEX IF NOT EXISTS inbox_handled_by_ghostkey
+                ON inbox_handled (ghostkey);
 
             -- Left behind by the HTTP request service this bridge used to run.
             DROP TABLE IF EXISTS challenges;
@@ -863,6 +891,10 @@ impl Store {
     /// Whether a payment to `script` has been seen that the chain has not yet
     /// buried `deep` blocks below `tip`: confirmed fewer than `deep` deep, or
     /// moved out of its block by a reorg and not yet seen again.
+    ///
+    /// A payment a reorg removed for good, double-spent rather than re-mined,
+    /// stays in the second case forever, and keeps its watch alive. That
+    /// errs towards watching: it costs updates, never a missed payment.
     pub fn has_shallow_output(
         &self,
         net: BitcoinNetwork,
@@ -953,12 +985,29 @@ impl Store {
             .unwrap_or(false))
     }
 
-    pub fn mark_handled(&self, entry_key: &[u8; 32], entry_height: u32) -> anyhow::Result<()> {
+    pub fn mark_handled(
+        &self,
+        entry_key: &[u8; 32],
+        entry_height: u32,
+        ghostkey: &[u8],
+    ) -> anyhow::Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO inbox_handled (entry_key, entry_height) VALUES (?1, ?2)",
-            params![entry_key.to_vec(), entry_height as i64],
+            "INSERT OR IGNORE INTO inbox_handled (entry_key, entry_height, ghostkey)
+             VALUES (?1, ?2, ?3)",
+            params![entry_key.to_vec(), entry_height as i64, ghostkey],
         )?;
         Ok(())
+    }
+
+    /// Entries read from one Ghost Key that the floor has not yet passed: its
+    /// part of [`Store::handled_count`].
+    pub fn handled_count_for(&self, ghostkey: &[u8]) -> anyhow::Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM inbox_handled WHERE ghostkey = ?1",
+            params![ghostkey],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// Forget entries dated below `floor`: the inbox has dropped them, so
@@ -974,6 +1023,11 @@ impl Store {
     /// Entries read that the floor has not yet passed, which is how many
     /// removals the inbox still has to hold for this bridge. Accurate once
     /// [`Store::prune_handled_below`] has run for the current floor.
+    ///
+    /// Can undercount what the network holds: it is pruned to the highest
+    /// floor this bridge signed, which may not have landed yet, and a restored
+    /// database starts again from nothing. The bridge's budget is half the
+    /// bound peers enforce to leave room for exactly that.
     pub fn handled_count(&self) -> anyhow::Result<usize> {
         let n: i64 = self
             .conn
@@ -1212,7 +1266,7 @@ mod tests {
     fn a_failed_transaction_leaves_nothing_behind() {
         let s = store();
         let r: anyhow::Result<()> = s.with_transaction(|| {
-            s.mark_handled(&[1; 32], 100)?;
+            s.mark_handled(&[1; 32], 100, &[])?;
             anyhow::bail!("the step after it failed")
         });
         assert!(r.is_err());
@@ -1312,6 +1366,34 @@ mod tests {
         );
     }
 
+    /// A database whose `inbox_handled` predates the requester column keeps
+    /// its rows, which removals are built from, and gains the column.
+    #[test]
+    fn handled_entries_from_before_their_requester_was_recorded_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE inbox_handled (
+                     entry_key BLOB PRIMARY KEY, entry_height INTEGER NOT NULL);
+                 INSERT INTO inbox_handled VALUES (X'01', 7);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        s.mark_handled(&[2u8; 32], 7, &[9u8; 32]).unwrap();
+        assert_eq!(s.handled_count().unwrap(), 2);
+        assert_eq!(s.handled_count_for(&[9u8; 32]).unwrap(), 1);
+        assert_eq!(
+            s.handled_at(7).unwrap(),
+            vec![[2u8; 32]],
+            "the old key is not 32 bytes"
+        );
+        drop(s);
+        Store::open(&path).expect("and again, once migrated");
+    }
+
     /// The observer and the inbox worker write one database through two
     /// connections. A write that meets the other's lock must wait its turn,
     /// not fail.
@@ -1330,7 +1412,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn(move || {
             a.with_transaction(|| {
-                a.mark_handled(&[1; 32], 100)?;
+                a.mark_handled(&[1; 32], 100, &[])?;
                 locked_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 Ok(())
@@ -1346,7 +1428,7 @@ mod tests {
         });
         b.with_transaction(|| {
             b.is_handled(&[1; 32])?;
-            b.mark_handled(&[2; 32], 100)
+            b.mark_handled(&[2; 32], 100, &[])
         })
         .expect("waits for the lock, then writes");
         releaser.join().unwrap();
@@ -1358,8 +1440,8 @@ mod tests {
     #[test]
     fn handled_entries_are_forgotten_once_the_floor_passes_them() {
         let s = store();
-        s.mark_handled(&[1; 32], 100).unwrap();
-        s.mark_handled(&[2; 32], 110).unwrap();
+        s.mark_handled(&[1; 32], 100, &[]).unwrap();
+        s.mark_handled(&[2; 32], 110, &[]).unwrap();
         s.prune_handled_below(105).unwrap();
         assert!(!s.is_handled(&[1; 32]).unwrap());
         assert!(s.is_handled(&[2; 32]).unwrap());
