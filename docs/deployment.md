@@ -285,36 +285,27 @@ contract id as `serving the request inbox`.
   a client typically watches an address for one payment. A client that still
   wants the script sends the Watch again, with a newer timestamp, well before
   the day is out. The day is measured by the timestamps of blocks the
-  observer has scanned, not by any clock of the bridge's: a watch ends once
-  the block `deep_confirmations - 1` below the observer's position is dated a
-  day after the Watch, counted from the later of the sender's timestamp and
-  the time the bridge read it (the sender's counts for at most a week ahead).
-  A block may be dated at most two hours ahead, so every block mined within
-  22 hours of the Watch has been scanned for it by then, however long the
-  bridge or Bitcoin Core was down (#11 is the known exception, a reorg round
-  that fails part-way, and a reorg deeper than `deep_confirmations` can still
-  bring in a payment after a watch has ended). Nor does a watch end while a
-  payment to it is less than `deep_confirmations` deep, while the floor is
-  held, or while a request from its own requester waits on the removal
-  budget, since that may be its renewal (only while that request is still in
-  the inbox: one the caps push out or the floor passes no longer counts). The count is of
-  blocks the observer has scanned, so no clock enters: however long the
-  bridge or Bitcoin Core was down, or cut off from its peers, a watch ends
-  only once every block of its life has been scanned for it (#11 is the known
-  exception, a reorg round that fails part-way, and a reorg deeper than
-  `deep_confirmations` can still bring in a payment after a watch has ended).
-  Nor does a watch end while a payment to it is less than
-  `deep_confirmations` deep, while the floor is held, or while a request from
-  its own requester waits on the removal budget, since that may be its
-  renewal (only while that request is still in the inbox: one the caps push
-  out or the floor passes no longer counts). Every scan also covers the scripts of
-  payments a reorg moved out of their block and that have not been seen
-  again, watched or not, so such a payment is found where it was re-mined
-  rather than left retracted. Where a
-  payment to the script has been seen and is not yet `deep_confirmations`
-  deep, the watch lasts until it is, erring towards watching while a reorg
-  could still move the payment; a moved payment is found again by the scan
-  of scripts in doubt either way. Watches registered before the inbox
+  observer has scanned: a watch ends once the block `deep_confirmations - 1`
+  below the observer's position is dated a day after the Watch, counted from
+  the later of the sender's timestamp and the time the bridge read it (the
+  sender's counts for at most a week past that). The time read is the
+  bridge's clock, or the newest block the observer has recorded where that
+  is later, so only a time read more than a week behind could shorten a
+  watch. Bitcoin Core 27 and later refuse a block dated more than two hours
+  ahead of the host's clock, so with that clock right every block published
+  within 22 hours of the Watch has been scanned for it by then, however long
+  the bridge or Bitcoin Core was down (#11 is the known exception, a reorg
+  round that fails part-way, and a reorg of `deep_confirmations` blocks or
+  more can still bring in a payment after a watch has ended). The bridge
+  keeps the last 1000 blocks it scanned, so a `deep_confirmations` above
+  about 1000 ends no watch. Nor does a watch end while a payment to it is
+  less than `deep_confirmations` deep, while the floor is held, or while a
+  request from its own requester waits on the removal budget, since that may
+  be its renewal (only while that request is still in the inbox: one the
+  caps push out or the floor passes no longer counts). Every scan also covers
+  the scripts of payments a reorg moved out of their block and that have not
+  been seen again, watched or not, so such a payment is found where it was
+  re-mined rather than left retracted. Watches registered before the inbox
   existed never end this way.
 - **Acted-on entries are recorded** (`inbox_handled`) until the floor passes
   them, so an entry whose removal failed to land is removed again rather than

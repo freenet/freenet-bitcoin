@@ -100,20 +100,23 @@ pub const REMOVAL_SHARE_PER_GHOSTKEY: usize = REMOVAL_BUDGET / 64;
 /// someone remembers to withdraw it. A Watch sent again, with a newer
 /// timestamp as every request must have, starts the day again.
 ///
-/// Measured by the timestamps of blocks the observer has scanned, not by any
-/// clock of the bridge's: a watch ends once a block it has scanned is dated a
-/// day after the Watch (see [`Processor::expire_watches`]). A block may be
-/// dated at most two hours ahead of the nodes that accept it, so by then
-/// every block mined within 22 hours of the Watch has been scanned for it,
-/// however long the bridge or its node was down.
+/// Measured by the timestamps of blocks the observer has scanned: a watch
+/// ends once a block it has scanned is dated a day after the Watch (see
+/// [`Processor::expire_watches`]). A block may be dated at most two hours
+/// ahead of the nodes that accept it, so by then every block published
+/// within 22 hours of the Watch has been scanned for it, however long the
+/// bridge or its node was down. The bridge's clock enters only in dating
+/// when it read the Watch (see [`REQUEST_AHEAD_MAX_MS`]).
 pub const WATCH_LIFETIME_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// How far ahead of the bridge's own clock a Watch's timestamp may count.
+/// How far past the time the bridge read it a Watch's timestamp may count.
 ///
 /// A watch counts its day from the later of its sender's timestamp and the
 /// time the bridge read it, so a sender whose clock is behind cannot shorten
-/// it. This bounds a sender whose clock is far ahead, whose watch would
-/// otherwise never end.
+/// it. The time read is the bridge's clock, or the newest block the observer
+/// has recorded where that is later. This bounds a sender whose clock is far
+/// ahead, whose watch would otherwise never end; so only a time read more
+/// than this far behind the sender's could shorten a watch.
 pub const REQUEST_AHEAD_MAX_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 /// How long after connecting to its node the bridge waits before raising the
@@ -501,6 +504,18 @@ impl Processor<'_> {
                     }
                 };
                 let tip = tips.by_network.get(&net).copied().or(checkpoint);
+                // The time the Watch was read, which its day counts from, is
+                // never taken as earlier than the newest block the observer
+                // has recorded: a bridge whose clock is far behind would
+                // otherwise date it long past, and its watch would end on the
+                // next pass. This can only lengthen a watch.
+                let read_ms = match self.store.latest_block_time_ms(net) {
+                    Ok(t) => t.map_or(now_ms, |t| t.max(now_ms)),
+                    Err(err) => {
+                        tracing::warn!(network = ?net, "reading the newest block's time failed: {err:#}");
+                        now_ms
+                    }
+                };
                 if req.scan_from_height.is_some() {
                     tracing::debug!(network = ?net, "a watch's rescan hint was not acted on (freenet-bitcoin#7)");
                 }
@@ -514,7 +529,7 @@ impl Processor<'_> {
                     };
                     match self
                         .store
-                        .set_interest(&i, self.max_watches_per_ghostkey, now_ms)?
+                        .set_interest(&i, self.max_watches_per_ghostkey, read_ms)?
                     {
                         InterestChange::Watching => {
                             self.store.add_watch(
@@ -968,9 +983,12 @@ pub fn opening_floor(signed: Option<u32>, mainnet_tip: u32) -> u32 {
     signed.unwrap_or(mainnet_tip.saturating_sub(FLOOR_LAG_BLOCKS))
 }
 
-/// A state's bytes, by hash; every network's tip it was read against, since
-/// whether a watch may end depends on its own network's tip; and whether the
-/// floor was held, so the first pass after the hold is not passed over.
+/// A state's bytes, by hash; every network's tip it was read against, so each
+/// new block brings a pass and with it the chance for watches to end (expiry
+/// reads the observer's checkpoint and block times, which follow the tips; a
+/// checkpoint that moves while the tips stand still waits for the next block,
+/// which only lengthens a watch); and whether the floor was held, so the
+/// first pass after the hold is not passed over.
 pub type Fingerprint = ([u8; 32], Vec<(BitcoinNetwork, u32)>, bool);
 
 /// Which state needs no processing again.
@@ -1518,6 +1536,30 @@ mod tests {
         assert!(watched(&store).is_empty());
     }
 
+    /// A bridge whose clock is far behind dates a Watch no earlier than the
+    /// newest block it has recorded, so the watch still lasts its day.
+    #[test]
+    fn a_bridge_clock_far_behind_counts_from_the_newest_block_scanned() {
+        let store = Store::open_in_memory().unwrap();
+        scanned_to(&store, SIGNET, SIGNET_TIP, T0);
+        let w = entry(
+            &ghostkeys()[0],
+            FLOOR + 1,
+            &request(Action::Watch, b"spk", 1),
+        );
+        run_at(&store, &inbox(FLOOR, vec![w]), &tips(), 0);
+        scanned_to(&store, SIGNET, height_at(T0 + 23 * HOUR), T0 + 23 * HOUR);
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), 0);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "a day from the newest block"
+        );
+        scanned_to(&store, SIGNET, height_at(T0 + 25 * HOUR), T0 + 25 * HOUR);
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), 0);
+        assert!(watched(&store).is_empty());
+    }
+
     /// A block recorded without its time, as before blocks carried one, ends
     /// no watch.
     #[test]
@@ -1567,6 +1609,76 @@ mod tests {
             "the first ended, the second was kept"
         );
         assert!(pass.gated, "the kept watch is tried again");
+    }
+
+    /// Run expiry alone with the given configured depths.
+    fn expire_with_deep(store: &Store, deep: &HashMap<BitcoinNetwork, u32>, now_ms: i64) {
+        let params = params();
+        let key = bridge_key();
+        Processor {
+            params: &params,
+            key: &key,
+            store,
+            observed: OBSERVED,
+            max_watches_per_ghostkey: MAX_WATCHES_PER_GHOSTKEY,
+            deep_confirmations: deep,
+            floor_hold_until: None,
+        }
+        .expire_watches(now_ms, &BTreeSet::new())
+        .unwrap();
+    }
+
+    /// A network missing from the configured depths keeps every watch, and a
+    /// depth of one decides by the checkpoint's own block.
+    #[test]
+    fn the_deciding_block_follows_the_configured_depth() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        // The checkpoint's block is a day on; the ones below it are not.
+        scanned_to(&store, SIGNET, SIGNET_TIP + 200, T0 + WATCH_LIFETIME_MS);
+        let unconfigured = HashMap::from([(BitcoinNetwork::Bitcoin, 6)]);
+        expire_with_deep(&store, &unconfigured, T0);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "no depth configured: kept"
+        );
+        let six = HashMap::from([(BitcoinNetwork::Bitcoin, 6), (SIGNET, 6)]);
+        expire_with_deep(&store, &six, T0);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "six deep: the block five below decides"
+        );
+        let one = HashMap::from([(BitcoinNetwork::Bitcoin, 6), (SIGNET, 1)]);
+        expire_with_deep(&store, &one, T0);
+        assert!(
+            watched(&store).is_empty(),
+            "one deep: the checkpoint's own block decides"
+        );
+    }
+
+    /// Mainnet is tried first, so its deciding block's time, unreadable,
+    /// must not keep signet's watch from ending.
+    #[test]
+    fn a_block_time_that_cannot_be_read_stops_expiry_on_its_network_alone() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        scanned_to(
+            &store,
+            BitcoinNetwork::Bitcoin,
+            MAINNET_TIP + 500,
+            T0 + 25 * HOUR,
+        );
+        store
+            .execute_for_test(
+                "UPDATE seen_blocks SET block_time_ms = 'not a time' WHERE network = 'bitcoin'",
+            )
+            .unwrap();
+        caught_up(&store);
+        let pass = run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0 + 25 * HOUR);
+        assert!(watched(&store).is_empty(), "signet's watch ended");
+        assert!(pass.gated, "mainnet's expiry is tried again");
     }
 
     #[test]

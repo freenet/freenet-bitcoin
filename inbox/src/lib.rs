@@ -375,9 +375,9 @@ pub fn production_master() -> MasterKey {
 /// What a request asks the bridge to do.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
-    /// Start, or keep, synchronizing these scripts, for a day from when the
-    /// bridge reads it. Send it again, with a newer `made_at_ms`, to keep a
-    /// script watched longer.
+    /// Start, or keep, synchronizing these scripts for a day of block time
+    /// from the later of `made_at_ms` and when the bridge reads it. Send it
+    /// again, with a newer `made_at_ms`, to keep a script watched longer.
     Watch,
     /// Stop wanting these scripts synchronized. Removes only the sender's own
     /// interest: the bridge stops scanning a script when nobody still wants it.

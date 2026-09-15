@@ -499,6 +499,20 @@ impl Store {
             .flatten())
     }
 
+    /// The timestamp of the highest block recorded with one, if any.
+    pub fn latest_block_time_ms(&self, net: BitcoinNetwork) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT block_time_ms FROM seen_blocks
+                 WHERE network = ?1 AND block_time_ms IS NOT NULL
+                 ORDER BY height DESC LIMIT 1",
+                params![net.as_str()],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?)
+    }
+
     pub fn block_at(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<Option<BlockHash>> {
         let row = self
             .conn
@@ -1522,6 +1536,21 @@ mod tests {
         s.record_block(net, 101, &BlockHash([1; 32]), Some(1_000))
             .unwrap();
         assert_eq!(s.block_time_ms(net, 101).unwrap(), Some(1_000));
+    }
+
+    /// A reorg forgets the blocks above its fork, and their times with them,
+    /// so a replaced block ends no watch.
+    #[test]
+    fn a_reorg_forgets_the_times_of_the_blocks_it_replaces() {
+        let s = store();
+        let net = BitcoinNetwork::Signet;
+        for h in 100..=110u32 {
+            s.record_block(net, h, &BlockHash([h as u8; 32]), Some(i64::from(h)))
+                .unwrap();
+        }
+        s.forget_blocks_above(net, 105).unwrap();
+        assert_eq!(s.block_time_ms(net, 105).unwrap(), Some(105));
+        assert_eq!(s.block_time_ms(net, 106).unwrap(), None);
     }
 
     /// Only outputs still moved out of their block put a script in doubt,
