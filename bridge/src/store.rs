@@ -87,6 +87,32 @@ pub struct WatchedScript {
     pub is_public_demo: bool,
 }
 
+/// The time a bridge upgrading from one that ended no watch by block time
+/// reads the watches it already holds at.
+///
+/// The host clock alone dates it, since no block carries a time at that
+/// moment. A clock reading before 1970 fails the upgrade rather than granting
+/// those watches nothing in silence.
+/// Whether the day from the upgrade is worth anything.
+///
+/// A host clock reading no later than watches this bridge already recorded
+/// grants them nothing, and they end as soon as blocks carry their times. The
+/// clock is the only signal at that moment, so this cannot be repaired here;
+/// it is reported so the operator knows to check the clock.
+fn upgrade_grace_lands(now_ms: i64, newest_recorded_ms: Option<i64>) -> bool {
+    newest_recorded_ms.is_none_or(|newest| now_ms > newest)
+}
+
+fn upgrade_read_time(now: std::time::SystemTime) -> anyhow::Result<i64> {
+    match now.duration_since(std::time::UNIX_EPOCH) {
+        Ok(since) => Ok(since.as_millis() as i64),
+        Err(e) => Err(anyhow::anyhow!(
+            "the host clock reads before 1970, so the watches this bridge already \
+             held cannot be given their day: {e}"
+        )),
+    }
+}
+
 impl Store {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(dir) = path.parent() {
@@ -177,15 +203,19 @@ impl Store {
                 .prepare("SELECT 1 FROM pragma_table_info('script_interests')")?
                 .exists([])?;
             if interests_exist {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "the host clock reads before 1970, so the watches this bridge \
-                             already held cannot be given their day: {e}"
-                        )
-                    })?;
+                let now_ms = upgrade_read_time(std::time::SystemTime::now())?;
+                let newest: Option<i64> = self.conn.query_row(
+                    "SELECT MAX(recorded_ms) FROM script_interests WHERE watching = 1",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if !upgrade_grace_lands(now_ms, newest) {
+                    tracing::error!(
+                        "the host clock reads no later than watches this bridge already \
+                         recorded, so they get no day from this upgrade and may end at \
+                         once: check the clock"
+                    );
+                }
                 self.conn.execute(
                     "UPDATE script_interests SET recorded_ms = MAX(recorded_ms, ?1)
                      WHERE watching = 1",
@@ -413,9 +443,18 @@ impl Store {
     /// Rewinding is safe because rescanning is idempotent: claims are keyed by
     /// digest, so re-observing a payment produces a claim the contract already
     /// holds. The cost of a rewind is bandwidth, never correctness.
+    /// Never below the oldest block record kept: at a height nothing was
+    /// recorded for, `find_fork_point` reads agreement, the round takes that
+    /// for a reorg, and every payment above it is retracted although nothing
+    /// moved. A `demo_backfill_blocks` past the window kept asks for that at
+    /// every start, and so does a node restored from an older snapshot or
+    /// resynced from scratch.
     pub fn rewind_checkpoint_to(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<()> {
         self.conn.execute(
-            "UPDATE chain_checkpoint SET height = ?2 WHERE network = ?1 AND height > ?2",
+            "UPDATE chain_checkpoint
+             SET height = MIN(height, MAX(?2, COALESCE(
+                 (SELECT MIN(height) FROM seen_blocks WHERE network = ?1), ?2)))
+             WHERE network = ?1 AND height > ?2",
             params![net.as_str(), height as i64],
         )?;
         Ok(())
@@ -580,7 +619,8 @@ impl Store {
     }
 
     /// How many blocks below the observer's checkpoint keep their records, and
-    /// so the deepest `deep_confirmations` that can still end a watch.
+    /// so, less one, the deepest `deep_confirmations` that can still end a
+    /// watch.
     pub const BLOCKS_KEPT: u32 = 1000;
 
     /// Drop block records more than `keep` blocks below the observer's
@@ -1591,6 +1631,90 @@ mod tests {
             .unwrap();
         assert_eq!(s.block_time_ms(net, 101).unwrap(), Some(1_000));
         assert_eq!(s.latest_block_time_ms(net).unwrap(), Some(1_000));
+    }
+
+    /// A rewind stops at the oldest block record kept: below that, a round
+    /// reads a reorg nothing moved and retracts every payment above it.
+    #[test]
+    fn a_rewind_stops_at_the_oldest_block_kept() {
+        let s = store();
+        let net = BitcoinNetwork::Signet;
+        for h in 900..=1000u32 {
+            s.record_block(net, h, &BlockHash([1; 32]), Some(i64::from(h)))
+                .unwrap();
+        }
+        let at = |h: u32| BlockAnchor {
+            height: h,
+            hash: BlockHash([1; 32]),
+        };
+        s.set_checkpoint(net, &at(1000)).unwrap();
+        s.rewind_checkpoint_to(net, 950).unwrap();
+        assert_eq!(
+            s.checkpoint(net).unwrap().unwrap().height,
+            950,
+            "within the blocks kept"
+        );
+        s.rewind_checkpoint_to(net, 100).unwrap();
+        assert_eq!(
+            s.checkpoint(net).unwrap().unwrap().height,
+            900,
+            "stopped at the oldest block kept"
+        );
+        s.rewind_checkpoint_to(net, 980).unwrap();
+        assert_eq!(
+            s.checkpoint(net).unwrap().unwrap().height,
+            900,
+            "a rewind never moves the checkpoint forward"
+        );
+    }
+
+    /// The day from the upgrade lands only where the clock reads later than
+    /// the watches already recorded.
+    #[test]
+    fn a_clock_no_later_than_the_watches_recorded_grants_them_nothing() {
+        assert!(upgrade_grace_lands(1_000, None), "nothing recorded");
+        assert!(upgrade_grace_lands(1_001, Some(1_000)));
+        assert!(!upgrade_grace_lands(1_000, Some(1_000)), "no later");
+        assert!(!upgrade_grace_lands(999, Some(1_000)), "behind");
+    }
+
+    /// A host clock before 1970 fails the upgrade rather than granting the
+    /// watches it holds nothing in silence.
+    #[test]
+    fn a_host_clock_before_1970_fails_the_upgrade() {
+        let before = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert!(upgrade_read_time(before).is_err());
+        assert_eq!(
+            upgrade_read_time(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2)).unwrap(),
+            2_000
+        );
+    }
+
+    /// The deepest `deep_confirmations` a configuration may name still reads a
+    /// block that survives pruning.
+    #[test]
+    fn the_deepest_depth_allowed_still_reads_a_block_that_is_kept() {
+        let s = store();
+        let net = BitcoinNetwork::Signet;
+        let top = 500_000u32;
+        for h in (top - Store::BLOCKS_KEPT)..=top {
+            s.record_block(net, h, &BlockHash([1; 32]), Some(i64::from(h)))
+                .unwrap();
+        }
+        s.set_checkpoint(
+            net,
+            &BlockAnchor {
+                height: top,
+                hash: BlockHash([1; 32]),
+            },
+        )
+        .unwrap();
+        s.prune_blocks(net, Store::BLOCKS_KEPT).unwrap();
+        let deciding = top - (Store::BLOCKS_KEPT + 1 - 1);
+        assert!(
+            s.block_time_ms(net, deciding).unwrap().is_some(),
+            "the deepest depth allowed reads a block pruning drops"
+        );
     }
 
     /// A bridge upgraded from one that ended no watch by block time gives
