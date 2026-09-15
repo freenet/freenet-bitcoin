@@ -1101,7 +1101,8 @@ impl Store {
         // A row that fails to read is logged and left out, not made to fail
         // the pass: failing would stop the bridge reading anything until the
         // floor passed the row, while leaving it out costs only that entry's
-        // removal, and the entry is not acted on twice.
+        // removal. The entry is then read and acted on again, which changes
+        // nothing: its request is no newer than the one on record.
         let keys = stmt
             .query_map(params![entry_height as i64], |r| r.get::<_, Vec<u8>>(0))?
             .filter_map(|row| match row.map(<[u8; 32]>::try_from) {
@@ -1130,6 +1131,18 @@ mod tests {
 
     fn store() -> Store {
         Store::open_in_memory().unwrap()
+    }
+
+    /// A watch row that cannot be read fails the expiry, which is logged and
+    /// tried again, rather than being passed over as if it were not there.
+    #[test]
+    fn a_watch_row_that_cannot_be_read_fails_the_expiry() {
+        let s = store();
+        s.execute_for_test("INSERT INTO script_interests VALUES ('signet', X'00', 7, 1, 0, 0);")
+            .unwrap();
+        assert!(s
+            .watches_recorded_before(BitcoinNetwork::Signet, 1)
+            .is_err());
     }
 
     fn watch(script: &[u8], from: u32, demo: bool) -> WatchedScript {

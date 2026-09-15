@@ -336,7 +336,11 @@ impl InboxStateV1 {
         // pair real certificates with entries of their own and make every
         // peer run each certificate's RSA check before refusing the state.
         for e in self.entries.values() {
-            names_claimed_key(&self.certificates[&e.cert], e)?;
+            let pem = self
+                .certificates
+                .get(&e.cert)
+                .ok_or("entry references a certificate the state does not hold")?;
+            names_claimed_key(pem, e)?;
             verify_entry_signature(e, params)?;
         }
 

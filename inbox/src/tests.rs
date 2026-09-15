@@ -1225,6 +1225,51 @@ fn a_forged_entry_fails_before_its_certificate_is_checked() {
     assert!(err.contains("did not sign"), "{err}");
 }
 
+/// A certificate for the attacker's own key, carrying someone else's notary
+/// signature: it names the key that signs the entry, so only its RSA check
+/// refuses it. A message of such entries costs one RSA check however many it
+/// carries, since validation stops at the first that fails.
+#[test]
+fn fabricated_certificates_cost_one_rsa_check_per_message() {
+    let rsa = || RSA_CHECKS.with(|c| c.get());
+    let fakes: Vec<WireEntry> = (0..3u8)
+        .map(|i| {
+            let sk = SigningKey::from_bytes(&[20 + i; 32]);
+            let mut cert = GhostkeyCertificateV1::from_armored_string(&ghostkeys()[0].pem).unwrap();
+            cert.verifying_key = sk.verifying_key();
+            let gk = Gk {
+                sk,
+                pem: cert.to_armored_string().unwrap(),
+            };
+            entry(&gk, 104, i)
+        })
+        .collect();
+
+    let before = rsa();
+    let err = open_at(100)
+        .apply_delta(
+            &params(),
+            &InboxDelta {
+                entries: fakes.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(err.contains("does not chain"), "{err}");
+    assert_eq!(rsa() - before, 1, "apply_delta");
+
+    let mut s = open_at(100);
+    for w in &fakes {
+        s.certificates
+            .insert(w.entry.cert, w.certificate_pem.clone());
+        s.entries.insert(w.entry.key(), w.entry.clone());
+    }
+    let before = rsa();
+    let err = s.verify(&params()).unwrap_err();
+    assert!(err.contains("does not chain"), "{err}");
+    assert_eq!(rsa() - before, 1, "verify");
+}
+
 /// An entry signed by a key nobody certified, carrying someone else's real
 /// certificate. Its signature checks out under the key it claims, so only
 /// reading the certificate shows the mismatch, and every path that reads

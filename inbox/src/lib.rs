@@ -60,7 +60,9 @@
 //! Watch that asked for it, unless a payment to the script is still being
 //! buried. A sender that still wants the script sends the Watch again, with a
 //! newer `made_at_ms`, well before the day is out: a renewal still on its way
-//! to the bridge's node when the day ends does not save the watch.
+//! to the bridge's node when the day ends does not save the watch. (The day
+//! must also pass by the chain's own clock, so a watch lasts a few hours
+//! longer in practice.)
 //!
 //! A sender sends its entry together with the floor it read
 //! ([`InboxDelta::submission`]), so a peer whose floor lags takes the floor
@@ -135,10 +137,14 @@ use serde::{Deserialize, Serialize};
 // in an RSA signature: 344 us natively per certificate (2026-09-10), more in
 // WASM. Certificates are stored once and shared, and a certificate's check is
 // spent only on an entry that claims the key it names and is signed under it,
-// so the worst case is one distinct genuine Ghost Key per entry. An attacker
-// without Ghost Keys can reach it only by replaying genuine entries, which are
-// public while they wait; a fabricated certificate costs one RSA check per
-// message, since validation stops at the first that fails.
+// so a state costs at most one check per distinct genuine certificate in it,
+// and a refused message at most one: validation stops at the first that
+// fails, which is how a fabricated certificate costs its sender one check.
+// That bounds the cost; it does not make the worst case cost an attacker
+// anything. Genuine entries are public, a floor stays valid once signed, so
+// entries from any window can be assembled into a valid state, and the node
+// validates the whole state after every update, even one that changes
+// nothing.
 // ---------------------------------------------------------------------------
 
 /// How far behind the mainnet tip the bridge keeps its floor, in blocks.
