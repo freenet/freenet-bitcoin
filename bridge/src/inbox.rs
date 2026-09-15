@@ -105,9 +105,10 @@ pub const REMOVAL_SHARE_PER_GHOSTKEY: usize = REMOVAL_BUDGET / 64;
 /// [`Processor::expire_watches`]). A block may be dated at most two hours
 /// ahead of the nodes that accept it, so by then every block published
 /// after the bridge read the Watch and within 22 hours of it has been
-/// scanned for it, however long the bridge or its node was down. The bridge's clock enters only through the
-/// time it read the Watch, which a clock behind cannot make earlier than the
-/// newest block scanned (see [`REQUEST_AHEAD_MAX_MS`]).
+/// scanned for it, however long the bridge or its node was down. The
+/// bridge's clock enters only through the time it read the Watch, which a
+/// clock behind cannot make earlier than the newest block scanned (see
+/// [`REQUEST_AHEAD_MAX_MS`]).
 pub const WATCH_LIFETIME_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// How far past the time the bridge read it a Watch's timestamp may count.
@@ -733,6 +734,15 @@ impl Driver {
     }
 }
 
+/// When the floor hold ends, armed by the first connection and never armed
+/// again.
+///
+/// A node that drops the connection every few minutes would otherwise hold
+/// the floor, and with it stop every watch ending, for as long as it flapped.
+pub fn arm_floor_hold(armed: Option<Instant>, now: Instant) -> Option<Instant> {
+    Some(armed.unwrap_or(now + Duration::from_millis(FLOOR_HOLD_MS as u64)))
+}
+
 /// The wait before the next connection attempt, given the last wait and how
 /// long the session that just ended lasted. A session that ran for a while
 /// was working, so the wait starts again from one second.
@@ -806,9 +816,10 @@ impl InboxWorker {
         }
 
         let mut backoff = Duration::from_secs(1);
+        let mut floor_hold_until = None;
         loop {
             let started = Instant::now();
-            if let Err(e) = self.session().await {
+            if let Err(e) = self.session(&mut floor_hold_until).await {
                 tracing::warn!("request inbox connection ended: {e:#}");
             }
             backoff = next_backoff(backoff, started.elapsed());
@@ -817,7 +828,7 @@ impl InboxWorker {
     }
 
     /// One connection's worth of serving. Returns only with an error.
-    async fn session(&self) -> Result<()> {
+    async fn session(&self, floor_hold_until: &mut Option<Instant>) -> Result<()> {
         let (stream, _) = tokio_tungstenite::connect_async(&self.ws_url)
             .await
             .with_context(|| format!("connecting to the Freenet node at {}", self.ws_url))?;
@@ -836,9 +847,10 @@ impl InboxWorker {
             observed: &observed,
             max_watches_per_ghostkey: MAX_WATCHES_PER_GHOSTKEY,
             deep_confirmations: &deep,
-            floor_hold_until: Some(
-                Instant::now() + std::time::Duration::from_millis(FLOOR_HOLD_MS as u64),
-            ),
+            floor_hold_until: {
+                *floor_hold_until = arm_floor_hold(*floor_hold_until, Instant::now());
+                *floor_hold_until
+            },
         };
         let key = self.contract_key()?;
         let mut session = Session {
@@ -1589,6 +1601,65 @@ mod tests {
             vec![b"spk".to_vec()],
             "a day from the clock"
         );
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert!(watched(&store).is_empty());
+    }
+
+    /// The floor hold is armed by the first connection only. A node that
+    /// dropped it every few minutes would otherwise hold the floor, and stop
+    /// every watch ending, for as long as it flapped.
+    #[test]
+    fn the_floor_hold_is_not_armed_again_by_a_reconnection() {
+        let first = Instant::now();
+        let armed = arm_floor_hold(None, first);
+        assert_eq!(
+            armed,
+            Some(first + std::time::Duration::from_millis(FLOOR_HOLD_MS as u64))
+        );
+        let later = first + std::time::Duration::from_secs(600);
+        assert_eq!(arm_floor_hold(armed, later), armed, "a reconnection");
+    }
+
+    /// Catching up far behind the node's tip, the blocks the observer has
+    /// scanned keep their times, so the block that decides is still there and
+    /// the watch ends. Pruned from the tip instead, they would all be gone.
+    #[test]
+    fn a_watch_ends_while_the_observer_is_far_behind_the_tip() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        let scanned = height_at(T0 + 25 * HOUR);
+        scanned_to(&store, SIGNET, scanned, T0 + 25 * HOUR);
+        // A row from far above, as a rewind or an abandoned branch leaves.
+        store
+            .record_block(
+                SIGNET,
+                scanned + 2000,
+                &BlockHash([9; 32]),
+                Some(T0 + 60 * HOUR),
+            )
+            .unwrap();
+        store.prune_blocks(SIGNET, Store::BLOCKS_KEPT).unwrap();
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0);
+        assert!(
+            watched(&store).is_empty(),
+            "the deciding block was pruned from under the watch"
+        );
+    }
+
+    /// A Watch read before the bridge has scanned a block counts from the
+    /// clock: there is no block time to floor it with.
+    #[test]
+    fn a_watch_read_before_any_block_was_scanned_counts_from_the_clock() {
+        let store = Store::open_in_memory().unwrap();
+        let w = entry(
+            &ghostkeys()[0],
+            FLOOR + 1,
+            &request(Action::Watch, b"spk", 1),
+        );
+        run_at(&store, &inbox(FLOOR, vec![w]), &tips(), T0);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()], "recorded");
+        tick(&store, &tips(), T0 + 23 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
         tick(&store, &tips(), T0 + 25 * HOUR);
         assert!(watched(&store).is_empty());
     }

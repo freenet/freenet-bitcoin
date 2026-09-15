@@ -303,7 +303,10 @@ contract id as `serving the request inbox`.
   above about 1000 ends no watch. A network's first scan starts at its tip,
   so a Watch read before then is not scanned for the blocks before it (#7).
   Only mined blocks are scanned: a client waiting on a payment keeps
-  renewing until it is buried. Nor does a watch end while a payment to it is
+  renewing until it is buried. The day a watch inherited from an older
+  bridge gets is dated by the host's clock alone, since no block carries a
+  time yet at that moment, so a clock behind by more than a day at the
+  upgrade grants less than a day: check it before upgrading. Nor does a watch end while a payment to it is
   less than `deep_confirmations` deep, while the floor is held, or while a
   request from its own requester waits on the removal budget, since that may
   be its renewal (only while that request is still in the inbox: one the

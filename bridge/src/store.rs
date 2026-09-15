@@ -156,6 +156,22 @@ impl Store {
             // watches ended at all promised its requesters none. So each
             // watch it held is read again now, and has a day from the upgrade
             // rather than ending as soon as the blocks carry their times.
+            //
+            // The clock alone dates this, without the floor `Processor::act`
+            // puts under it: every block time is NULL at this moment, since
+            // the column has just been added, so there is nothing to floor it
+            // with. A host clock behind by more than a day at the upgrade
+            // therefore grants less than a day, or none. It is the one place
+            // the design's "a clock behind cannot shorten a watch" does not
+            // hold, it happens once, and `docs/deployment.md` says so. A
+            // clock before 1970 fails the migration rather than passing 0 and
+            // granting nothing in silence.
+            //
+            // The missing column stands for "the last binary ended no watch
+            // by block time": true of `main` and of every commit of this
+            // branch before the block-time rule. A database written by one
+            // that already had it keeps its own times, having ended watches
+            // by them already.
             let interests_exist = self
                 .conn
                 .prepare("SELECT 1 FROM pragma_table_info('script_interests')")?
@@ -163,7 +179,13 @@ impl Store {
             if interests_exist {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis() as i64);
+                    .map(|d| d.as_millis() as i64)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "the host clock reads before 1970, so the watches this bridge \
+                             already held cannot be given their day: {e}"
+                        )
+                    })?;
                 self.conn.execute(
                     "UPDATE script_interests SET recorded_ms = MAX(recorded_ms, ?1)
                      WHERE watching = 1",
@@ -518,6 +540,11 @@ impl Store {
     }
 
     /// The timestamp of the highest block recorded with one, if any.
+    ///
+    /// Deliberately not bounded by the observer's checkpoint: a rewind or a
+    /// reorg can leave rows above it, and reading one only raises the time a
+    /// Watch is read, which lengthens a watch. Anything that could shorten one
+    /// must read [`Store::block_time_ms`] at a height it has scanned instead.
     pub fn latest_block_time_ms(&self, net: BitcoinNetwork) -> anyhow::Result<Option<i64>> {
         Ok(self
             .conn
@@ -551,6 +578,10 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// How many blocks below the observer's checkpoint keep their records, and
+    /// so the deepest `deep_confirmations` that can still end a watch.
+    pub const BLOCKS_KEPT: u32 = 1000;
 
     /// Drop block records more than `keep` blocks below the observer's
     /// checkpoint, so the table does not grow without bound over years of
@@ -1591,6 +1622,66 @@ mod tests {
             .watches_run_out(BitcoinNetwork::Signet, before_the_upgrade, 0)
             .unwrap()
             .is_empty());
+    }
+
+    /// The day from the upgrade never moves a watch's read time back.
+    #[test]
+    fn the_upgrade_never_moves_a_watch_read_time_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        let ahead = 4_000_000_000_000i64;
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(&main_era_schema(ahead)).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert!(
+            s.watches_run_out(BitcoinNetwork::Signet, ahead - 1, 0)
+                .unwrap()
+                .is_empty(),
+            "a read time already ahead was lowered to the clock"
+        );
+    }
+
+    /// The day is granted once: were it granted at every open, a bridge
+    /// restarted often would never end a watch.
+    #[test]
+    fn the_upgrade_grants_its_day_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(&main_era_schema(1)).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        s.execute_for_test("UPDATE script_interests SET recorded_ms = 1")
+            .unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.watches_run_out(BitcoinNetwork::Signet, 1_700_000_000_000, 0)
+                .unwrap()
+                .len(),
+            1,
+            "the second open granted another day"
+        );
+    }
+
+    /// A database as `main` left it: `seen_blocks` without its times, and one
+    /// watched script recorded at `recorded_ms`.
+    fn main_era_schema(recorded_ms: i64) -> String {
+        format!(
+            "CREATE TABLE seen_blocks (
+                 network TEXT NOT NULL, height INTEGER NOT NULL,
+                 block_hash BLOB NOT NULL, PRIMARY KEY (network, height));
+             CREATE TABLE script_interests (
+                 network TEXT NOT NULL, script_pubkey BLOB NOT NULL,
+                 ghostkey BLOB NOT NULL, watching INTEGER NOT NULL,
+                 request_ms INTEGER NOT NULL, recorded_ms INTEGER NOT NULL,
+                 PRIMARY KEY (network, script_pubkey, ghostkey));
+             INSERT INTO script_interests
+                 VALUES ('signet', X'01', X'02', 1, 1, {recorded_ms});"
+        )
     }
 
     /// The newest block time is that of the highest block on its network

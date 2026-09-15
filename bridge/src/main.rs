@@ -570,7 +570,7 @@ async fn observe_once(
         round.record(script, &freenet_bitcoin_common::Claim::ScannedTo, wm);
     }
 
-    store.prune_blocks(obs.network(), 1000)?;
+    store.prune_blocks(obs.network(), Store::BLOCKS_KEPT)?;
 
     let Some(publisher) = publisher else {
         tracing::debug!("no Freenet connection; observations recorded but not published");
@@ -923,6 +923,11 @@ mod tests {
             (
                 concat!("&tip, &watch", "ed, &mut round)"),
                 "claims are no longer limited to the watched scripts",
+            ),
+            (
+                concat!("prune_blocks(obs.network(), ", "Store::BLOCKS_KEPT)"),
+                "blocks are no longer pruned, or no longer to the window watch \
+                 expiry reads the deciding block from",
             ),
         ] {
             assert!(src.contains(needle), "{why}");

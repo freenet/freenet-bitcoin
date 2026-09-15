@@ -93,6 +93,30 @@ impl BridgeConfig {
         if cfg.networks.is_empty() {
             anyhow::bail!("configuration lists no networks; the bridge would do nothing");
         }
+        // The bridge keeps the blocks within `BLOCKS_KEPT` of where it has
+        // scanned. A `deep_confirmations` past that names a block it no longer
+        // holds, so no watch would ever end; a `demo_backfill_blocks` past it
+        // rewinds at every start to a block it no longer holds, which reads as
+        // a reorg and retracts payments nothing moved.
+        let kept = crate::store::Store::BLOCKS_KEPT;
+        for n in &cfg.networks {
+            if n.deep_confirmations >= kept {
+                anyhow::bail!(
+                    "{:?}: deep_confirmations {} is past the {kept} blocks the bridge keeps, \
+                     so no watch would ever end",
+                    n.network,
+                    n.deep_confirmations
+                );
+            }
+            if n.demo_backfill_blocks >= kept {
+                anyhow::bail!(
+                    "{:?}: demo_backfill_blocks {} is past the {kept} blocks the bridge keeps, \
+                     so every start would read as a reorg",
+                    n.network,
+                    n.demo_backfill_blocks
+                );
+            }
+        }
         Ok(cfg)
     }
 
@@ -120,6 +144,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.networks[0].deep_confirmations, 6);
+    }
+
+    /// A depth past the blocks the bridge keeps would end no watch, and a
+    /// backfill past them rewinds at every start to a block it no longer
+    /// holds, which reads as a reorg.
+    #[test]
+    fn a_depth_past_the_blocks_kept_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.toml");
+        let cfg = |extra: &str| {
+            format!(
+                r#"
+                signing_key_path = "/k"
+                database_path = "/d"
+                contract_dir = "/c"
+
+                [[networks]]
+                network = "Signet"
+                rpc_url = "http://127.0.0.1:38332"
+                {extra}
+                "#
+            )
+        };
+        std::fs::write(&path, cfg("deep_confirmations = 2000")).unwrap();
+        let err = BridgeConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("deep_confirmations"), "{err}");
+        std::fs::write(&path, cfg("demo_backfill_blocks = 1000")).unwrap();
+        let err = BridgeConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("demo_backfill_blocks"), "{err}");
+        std::fs::write(&path, cfg("deep_confirmations = 6")).unwrap();
+        BridgeConfig::load(&path).expect("within the blocks kept");
     }
 
     /// The bridge used to serve HTTP, configured by `listen` and `auth`. A
