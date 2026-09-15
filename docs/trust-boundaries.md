@@ -160,12 +160,14 @@ Keys. They receive an address and an amount and pay it with any wallet.
 | Replay a signet observation as mainnet | Network folded into `ScriptId` and checked against parameters |
 | Write to a bridge's inbox without a Ghost Key | Every peer verifies the certificate chain to the master key, and the entry's signature, before storing it |
 | Replay a request into another bridge's inbox | The Ghost Key's signature covers the bridge id; an inbox refuses an entry addressed to another bridge |
-| Flood a bridge's inbox | At most 2 records per Ghost Key and 128 in all, newest kept, so filling it takes 64 Ghost Keys. **Not stopped outright:** a holder of that many can keep other requests out while they keep posting. See `MAX_RECORDS` |
+| Flood a bridge's inbox | At most 2 waiting requests per Ghost Key and 128 in all, newest kept, and a request gives its place back once read, so holding the inbox takes 64 Ghost Keys sending faster than the bridge reads. **Not stopped outright.** See `MAX_ENTRIES` |
+| Grow the inbox's removals past what peers can hold | Only the bridge signs removals, one batch per height naming only what it has read; it stops reading at `REMOVAL_BUDGET`, half the hard bound every peer enforces (`MAX_REMOVED`). A flood of that size makes new requests wait for the floor, about half an hour |
+| Make a removal of your own entry take someone else's with it | A removal names 8 bytes of the entry's digest, so it would take an entry sharing those with the pending one: about 2^64 tries, against a bridge that reads within seconds |
 | Copy another sender's sealed request into your own entry | A request is sealed to the sender's Ghost Key and the entry's height as well as to the bridge, so a copy does not open |
 | Replay an old Watch after the sender's Unwatch | Each request carries its sender's timestamp, sealed; the bridge keeps each requester's latest request per script and ignores anything older |
 | Present certificates in endless spellings to multiply RSA checks | Certificates are held in one canonical form, and a delta larger than the caps is refused before anything is verified |
-| Date a request into the future so it outlives every floor | An entry more than 18 blocks above the floor is dropped by every peer and never stored, and the floor only rises |
-| Bring back a request the bridge removed | A tombstone lasts until the floor passes the entry it removes; the bridge records what it acted on, so a request read twice is acted on once |
+| Date a request into the future so it outlives every floor | An entry more than 4 blocks above the floor is dropped by every peer and never stored, and the floor only rises |
+| Bring back a request the bridge removed | A removal lasts until the floor passes the entries it removes; the bridge records what it acted on, so a request read twice is acted on once |
 | Make the bridge rescan the chain from the start | A request cannot move the scan cursor at all: its `scan_from_height` hint is not acted on yet (#7). One Ghost Key may have at most 1000 scripts watched |
 | Write entries under a Ghost Key anyone can sign for | A certificate for a weak (low-order) key is refused, and signatures are verified strictly |
 | Headers carrying trivially little work | `PowFloor` rejects them — a sanity check only; see below |

@@ -258,14 +258,17 @@ down, and it walks back to the fork point and retracts the orphaned outputs.
 The bridge has no network listener. A client asks it to watch a script by
 appending a Ghost Key signed request, sealed to the bridge, to its inbox
 contract. The bridge reads the inbox over its own connection to the local node,
-acts on each request, and removes it with a signed tombstone. On first start it
+acts on each request, and removes it with a signed removal batch. On first start it
 opens the inbox itself, by PUTting it with its first floor, and logs the
 contract id as `serving the request inbox`.
 
 - **Mainnet must be configured.** Requests are dated by Bitcoin mainnet block
   height whichever network they are for, and the inbox floor follows the
-  mainnet tip, 6 blocks behind. With no `Bitcoin` network in the config the
+  mainnet tip, 2 blocks behind. With no `Bitcoin` network in the config the
   inbox stays closed, and the bridge says so at startup.
+- **The floor waits two minutes after the bridge connects to its node**
+  (`FLOOR_HOLD_MS`), so a node that was down has time to catch up with the
+  inbox before the floor moves past requests other peers were holding.
 - **`bitcoin_inbox_contract.wasm` must be in the contract directory**, beside
   the other two. `scripts/deploy.sh` installs it.
 - **`listen` and `auth` are ignored.** They configured the HTTP service the
@@ -274,13 +277,28 @@ contract id as `serving the request inbox`.
   each script (`script_interests`), and a script stops being scanned only when
   the last requester withdraws. A watch registered before the inbox existed has
   no requester on record, so no unwatch ends it.
+- **A watch lasts a day** after the Watch that last asked for it
+  (`WATCH_LIFETIME_MS`), and then ends as if its requester had withdrawn it.
+  Watching costs an update to the script's address contract every block, and
+  a client typically watches an address for one payment. A client that still
+  wants the script sends the Watch again, with a newer timestamp. Where a
+  payment to the script has been seen and is not yet `deep_confirmations`
+  deep, the watch lasts until it is: after a reorg the observer rescans only
+  watched scripts, so ending the watch sooner could have it retract a payment
+  that was only moved to another block. Watches registered before the inbox
+  existed never end this way.
 - **Acted-on entries are recorded** (`inbox_handled`) until the floor passes
-  them, so an entry whose tombstone failed to land is removed again rather than
-  acted on again. Each requester's latest request per script is kept with its
-  sender's timestamp, so requests take effect in the order they were made
-  whatever order they arrive in. Deleting the database loses both records; the
-  cost is that requests still in the inbox, a few hours' worth at most, are
-  acted on a second time.
+  them, so an entry whose removal failed to land is removed again rather than
+  acted on again, and each removal batch is built from this record. Each
+  requester's latest request per script is kept with its sender's timestamp,
+  so requests take effect in the order they were made whatever order they
+  arrive in. Deleting the database loses both records; the cost is that
+  requests still in the inbox, about half an hour's worth, are acted on a
+  second time.
+- **Reading stops at the removal budget** (`REMOVAL_BUDGET`, 4096 entries).
+  Every entry read is removed, and removals last until the floor passes them,
+  about half an hour. Past the budget, new requests wait in the inbox for the
+  floor, and the bridge logs `the removal budget is spent`.
 
 ### Backfilling history on a pruned node
 
@@ -333,19 +351,22 @@ enabling `txindex`.
   an absence of payments means nothing and the claim would be misleading.
 - **Requests come only through the inbox.** There is no service to expose and
   no reverse proxy to run. The inbox admits only Ghost Key signed entries,
-  verified by every peer, and holds at most 2 requests per Ghost Key and 128 in
-  all. The bridge adds its own limit: 1000 watched scripts per Ghost Key. A
-  request cannot move the scan cursor (see "Backfilling history" above).
-- **A tombstone means read, not done.** The bridge removes every entry it
+  verified by every peer, and holds at most 2 waiting requests per Ghost Key
+  and 128 in all; a request gives its place back as soon as the bridge has
+  read it. The bridge adds its own limit: 1000 watched scripts per Ghost Key.
+  A request cannot move the scan cursor (see "Backfilling history" above).
+- **A removal means read, not done.** The bridge removes every entry it
   reads, including ones it cannot open, ones for a network it does not
   observe, and a Watch beyond its sender's limit, whose extra scripts it
   drops with a warning in the log. A sender learns what a Watch did from the
   address contract, not from the inbox.
-- **What the inbox does not stop.** Whoever holds 64 Ghost Keys can fill it and
-  keep other requests out for as long as they keep posting. That is the price
-  of censoring a bridge's inbox, paid once in donations; see `MAX_RECORDS` in
-  `inbox/src/lib.rs` for why it cannot be raised without raising what every
-  peer spends validating the inbox.
+- **What the inbox does not stop.** Whoever holds 64 Ghost Keys can hold every
+  place in it, for as long as they keep sending faster than the bridge reads,
+  and whoever can send 4096 requests within about half an hour spends the
+  removal budget, after which new requests wait for the floor. See
+  `MAX_ENTRIES` and `REMOVAL_BUDGET` in `inbox/src/lib.rs` for why neither is
+  raised freely: more entries mean more certificates for every peer to check,
+  and more removals mean a larger state.
 
 #### What it bought, measured
 

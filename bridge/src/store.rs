@@ -816,6 +816,72 @@ impl Store {
         Ok(n as usize)
     }
 
+    /// Requesters on `net` whose latest request, a Watch, was recorded before
+    /// `cutoff_ms`, as (script, Ghost Key): the watches that have run out.
+    /// Operator interests never run out and are left out.
+    pub fn watches_recorded_before(
+        &self,
+        net: BitcoinNetwork,
+        cutoff_ms: i64,
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT script_pubkey, ghostkey FROM script_interests
+             WHERE network = ?1 AND watching = 1 AND recorded_ms < ?2 AND ghostkey != ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![net.as_str(), cutoff_ms, OPERATOR_INTEREST.to_vec()],
+                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+            )?
+            .filter_map(|row| row.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// End one requester's watch because it ran out, returning whether
+    /// anyone still wants the script.
+    ///
+    /// Recorded as a withdrawal made now, with the expired Watch's timestamp,
+    /// so a delayed copy of that Watch cannot bring it back, while any newer
+    /// Watch from the requester renews it. Call inside
+    /// [`Store::with_transaction`] with the watch removal it implies.
+    pub fn expire_interest(
+        &self,
+        net: BitcoinNetwork,
+        script: &[u8],
+        ghostkey: &[u8],
+        now_ms: i64,
+    ) -> anyhow::Result<bool> {
+        self.conn.execute(
+            "UPDATE script_interests SET watching = 0, recorded_ms = ?4
+             WHERE network = ?1 AND script_pubkey = ?2 AND ghostkey = ?3 AND watching = 1",
+            params![net.as_str(), script, ghostkey, now_ms],
+        )?;
+        Ok(self.watchers(net, script)? == 0)
+    }
+
+    /// Whether a payment to `script` has been seen that the chain has not yet
+    /// buried `deep` blocks below `tip`: confirmed fewer than `deep` deep, or
+    /// moved out of its block by a reorg and not yet seen again.
+    pub fn has_shallow_output(
+        &self,
+        net: BitcoinNetwork,
+        script: &[u8],
+        tip: u32,
+        deep: u32,
+    ) -> anyhow::Result<bool> {
+        // Depth is tip - height + 1, so fewer than `deep` deep means a height
+        // above tip + 1 - deep.
+        let above = tip as i64 + 1 - deep as i64;
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM observed_outputs
+             WHERE network = ?1 AND script_pubkey = ?2
+               AND (block_height IS NULL OR block_height > ?3))",
+            params![net.as_str(), script, above],
+            |r| r.get::<_, bool>(0),
+        )?)
+    }
+
     /// Forget withdrawals recorded before `cutoff_ms`. A withdrawal only has
     /// to outlive any older request still in the inbox, which is hours.
     pub fn prune_withdrawals_before(&self, cutoff_ms: i64) -> anyhow::Result<()> {
@@ -903,6 +969,29 @@ impl Store {
             params![floor as i64],
         )?;
         Ok(())
+    }
+
+    /// Entries read that the floor has not yet passed, which is how many
+    /// removals the inbox still has to hold for this bridge. Accurate once
+    /// [`Store::prune_handled_below`] has run for the current floor.
+    pub fn handled_count(&self) -> anyhow::Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM inbox_handled", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// The keys of every entry read at one height: what one removal batch
+    /// names.
+    pub fn handled_at(&self, entry_height: u32) -> anyhow::Result<Vec<[u8; 32]>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT entry_key FROM inbox_handled WHERE entry_height = ?1")?;
+        let keys = stmt
+            .query_map(params![entry_height as i64], |r| r.get::<_, Vec<u8>>(0))?
+            .filter_map(|row| row.ok().and_then(|k| <[u8; 32]>::try_from(k).ok()))
+            .collect();
+        Ok(keys)
     }
 }
 

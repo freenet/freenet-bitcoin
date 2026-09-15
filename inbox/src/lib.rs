@@ -20,10 +20,11 @@
 //!   which network, which scripts) is encrypted to the bridge. The network
 //!   learns that a given Ghost Key sent this bridge a request, and when. It
 //!   never learns which addresses. That trade was decided explicitly in #3.
-//! * **The bridge removes what it has read**, with a signed tombstone, and
-//!   advances a signed floor ("ignore anything dated below this") that only
-//!   ever rises. Both are needed: without a tombstone, any peer still holding
-//!   the entry would merge it straight back.
+//! * **The bridge removes what it has read**, and advances a signed floor
+//!   ("ignore anything dated below this") that only ever rises. Removal leaves
+//!   a record behind, because without one any peer still holding the entry
+//!   would merge it straight back. The record is small and does not take the
+//!   entry's place (see [`RemovalBatch`]).
 //!
 //! # Dating, and why it is Bitcoin mainnet
 //!
@@ -42,14 +43,16 @@
 //!
 //! # What a sender does after sending
 //!
-//! The bridge sends no reply. A tombstone for the sender's entry key means the
-//! bridge has READ the request, not that it did what was asked: it tombstones a
-//! request it cannot open, one for a network it does not observe, and a Watch
-//! beyond its sender's limit of watched scripts, in the same way as one it
-//! acted on. What a Watch did shows up where it matters, in the address
-//! contract for the script. If the entry disappears with no tombstone, because
-//! the floor passed it or the caps pushed it out before the bridge read it,
-//! the sender seals and sends it again.
+//! The bridge sends no reply. A removal naming the sender's entry
+//! ([`InboxStateV1::is_removed`]) means the bridge has READ the request, not
+//! that it did what was asked: it removes a request it cannot open, one for a
+//! network it does not observe, and a Watch beyond its sender's limit of
+//! watched scripts, in the same way as one it acted on. What a Watch did shows
+//! up where it matters, in the address contract for the script. If the entry
+//! disappears without being removed, because the floor passed it or the caps
+//! pushed it out before the bridge read it, the sender seals and sends it
+//! again. The floor passes an unread entry about half an hour after it is
+//! sent (see [`WINDOW_BLOCKS`]).
 //!
 //! A sender sends its entry together with the floor it read
 //! ([`InboxDelta::submission`]), so a peer whose floor lags takes the floor
@@ -57,19 +60,30 @@
 //!
 //! # The merge, and the one subtle part
 //!
-//! State merges by union of entries, union of tombstones and the higher floor,
-//! then [`InboxStateV1::normalize`] drops what is below the floor, what is
-//! tombstoned, and what exceeds the caps. The caps are the subtle part, because
-//! capping and removal usually do not commute: keep "the lowest digests" and a
-//! tombstone that frees a slot needs back an entry some peer already discarded,
-//! so two peers merging in different orders disagree forever.
+//! State merges by union of entries, union of removal batches and the higher
+//! floor, then [`InboxStateV1::normalize`] drops what is below the floor, what
+//! has been removed, and what exceeds the caps. The caps are the subtle part.
 //!
-//! What makes these caps commute: every discarded record ranks *below* every
-//! kept one on height (newest first, then key), the floor only ever removes
-//! from the bottom of that order, and a tombstone keeps its entry's slot rather
-//! than freeing it. So nothing a peer has discarded can ever be needed again.
-//! The merge laws are asserted on exact bytes in this crate's tests, across
-//! tombstones, floor advances and both caps.
+//! Removal frees an entry's place under the caps. That is the point: it is
+//! what lets a bridge that reads quickly keep its inbox open to everyone. It
+//! has a cost. Suppose a peer holding more entries than the caps allow
+//! discards the lowest-ranked one, and then learns that a higher-ranked entry
+//! was removed. The entry it discarded would now fit, and it no longer has it,
+//! while a peer that learned of the removal first kept it. So when the caps
+//! overflow, the order records arrive in can decide which entry survives.
+//!
+//! What holds regardless, and what this crate's tests assert on exact bytes:
+//!
+//! * **Below the caps the merge laws hold exactly.** Union, removal, the floor
+//!   and the ranking are each independent of order, and nothing is discarded.
+//! * **Two peers that exchange state agree afterwards**, because the normal
+//!   form is a function of the records present and the floor alone. An entry
+//!   one peer discarded comes back from any peer that kept it; one that no
+//!   peer kept is gone for everyone.
+//!
+//! The caps overflow only when more requests are waiting than the inbox
+//! holds, which is a flood, and in a flood some requests are dropped whatever
+//! the rule. A sender whose entry vanished without being removed sends again.
 
 #![deny(unsafe_code)]
 
@@ -88,6 +102,8 @@ mod tests;
 pub use bytes::ByteBuf;
 pub use state::{InboxDelta, InboxStateV1, InboxSummary, WireEntry};
 
+use std::collections::BTreeSet;
+
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use freenet_bitcoin_common::{from_cbor, to_cbor, BitcoinNetwork, BridgeId};
 use ghostkey_common::{ScopedPayload, SignatureRequestor};
@@ -102,22 +118,31 @@ use serde::{Deserialize, Serialize};
 // on validation, and each distinct certificate costs a full chain check ending
 // in an RSA signature: 344 us natively per certificate (2026-09-10), more in
 // WASM. Certificates are stored once and shared, so the worst case is one
-// distinct Ghost Key per record, which an attacker pays a donation for each.
+// distinct Ghost Key per entry, which an attacker pays a donation for each.
 // ---------------------------------------------------------------------------
 
 /// How far behind the mainnet tip the bridge keeps its floor, in blocks.
 ///
-/// About an hour. It is the tolerance for a sender whose view of the tip is
-/// stale: an entry dated below the floor is dropped, so the sender resends.
-pub const FLOOR_LAG_BLOCKS: u32 = 6;
+/// Senders date an entry from the floor, not the tip (see [`sender_height`]),
+/// so this only places the floor relative to the chain. It is kept below
+/// [`WINDOW_BLOCKS`], so an entry dated by the tip itself is inside the window
+/// too: with these values [`sender_height`] is the tip.
+pub const FLOOR_LAG_BLOCKS: u32 = 2;
 
 /// Entries dated more than this above the floor are refused.
 ///
 /// Stops anyone dating an entry into the future so that it outlives every
-/// floor. Comfortably exceeds [`FLOOR_LAG_BLOCKS`], so a sender dating by the
-/// tip is always inside it. Safe as a validity rule because the floor only
-/// rises: an entry inside the window stays inside it.
-pub const WINDOW_BLOCKS: u32 = 18;
+/// floor. Safe as a validity rule because the floor only rises: an entry
+/// inside the window stays inside it.
+///
+/// It also sets how long a request and its removal last. A sender dates at
+/// `floor + WINDOW_BLOCKS - SENDER_SLACK_BLOCKS`, and the floor passes that
+/// height three blocks later: about half an hour on average, though blocks
+/// arrive irregularly and three can take anything from a few minutes to over
+/// an hour. The bridge normally reads a request within seconds of it reaching
+/// the bridge's node; one it has not read by then is dropped, and its sender
+/// sends it again.
+pub const WINDOW_BLOCKS: u32 = 4;
 
 /// How far below the top of the window a sender dates its entry. See the
 /// module docs: enough for a peer whose floor lags by a block or two, and
@@ -130,28 +155,56 @@ pub fn sender_height(floor: u32) -> u32 {
     floor.saturating_add(WINDOW_BLOCKS - SENDER_SLACK_BLOCKS)
 }
 
-/// Records (entries plus tombstones) the inbox holds at once.
+/// Entries, which are requests not yet read, the inbox holds at once.
 ///
-/// **This is also what censoring the inbox costs.** Filling it takes
-/// `MAX_RECORDS / MAX_RECORDS_PER_GHOSTKEY` Ghost Keys, 64 of them. Whoever
-/// holds that many can keep every other request out for as long as they keep
-/// posting: the caps rank newest first, and ties at the top of the window are
-/// broken by entry key, which a sender can grind. The price is paid once, in
-/// donations. Raising it means more records, and every record's certificate
-/// is an RSA check each time a peer validates the state.
-pub const MAX_RECORDS: usize = 128;
+/// **This is also what censoring the inbox costs.** Holding every place takes
+/// `MAX_ENTRIES / MAX_ENTRIES_PER_GHOSTKEY` Ghost Keys, 64 of them, and since
+/// a read entry gives its place up, they must keep sending faster than the
+/// bridge reads. The caps rank newest first, and ties at one height are
+/// broken by entry key, which a sender can grind. Raising it means more
+/// entries, and every entry's certificate is an RSA check each time a peer
+/// validates the state.
+pub const MAX_ENTRIES: usize = 128;
 
-/// Records one Ghost Key may hold at once.
+/// Entries one Ghost Key may hold at once.
 ///
 /// A Ghost Key decides who may write; this decides how much of the inbox one
-/// can occupy. Two, so filling the inbox takes as many Ghost Keys as its size
-/// allows. A tombstone keeps its entry's slot until the floor passes the
-/// entry, so a sender holding two records competes with itself when it sends
-/// a third: requests dated at one height are ranked by entry key, so the third
-/// may displace either of the others or lose to them. Send one request naming
-/// all your scripts rather than several, and send the next one after an
-/// earlier one has been read.
-pub const MAX_RECORDS_PER_GHOSTKEY: usize = 2;
+/// can occupy. A read entry gives its place back, so this limits how many
+/// requests a sender has waiting, not how many it sends. Requests dated at
+/// one height rank by entry key, so a third sent before the bridge has read
+/// the first two may displace one of them: send one request naming all your
+/// scripts rather than several at once.
+pub const MAX_ENTRIES_PER_GHOSTKEY: usize = 2;
+
+/// Bytes of an entry's key a removal keeps.
+///
+/// Eight rather than thirty-two, because a removal is kept for every entry
+/// the bridge reads until the floor passes it. A sender who wanted its own
+/// entry's removal to take someone else's pending entry with it would need an
+/// entry whose key shares these 8 bytes with that one: about 2^64 tries,
+/// against a bridge that reads a pending entry within seconds.
+pub const REMOVED_PREFIX_BYTES: usize = 8;
+
+/// Removed entries the inbox may name, across all its removal batches.
+///
+/// A hard bound on state size: 64 KiB of prefixes. Only the bridge signs
+/// removals, and it keeps itself to [`REMOVAL_BUDGET`], half of this, so a peer
+/// whose floor lags the bridge's a little still holds a valid state.
+pub const MAX_REMOVED: usize = 8192;
+
+/// How many entries the bridge reads before the floor must move on.
+///
+/// The bridge removes whatever it reads, and stops reading once the removals
+/// the floor has not yet passed reach this; new requests then wait for the
+/// floor. Reaching it takes this many requests within about half an hour.
+pub const REMOVAL_BUDGET: usize = MAX_REMOVED / 2;
+
+/// Removal batches the inbox may hold.
+///
+/// The bridge signs one per height it has read entries at, and a larger batch
+/// replaces a smaller one it covers (see [`RemovalBatch`]), so an honest inbox
+/// holds about one per height in the window.
+pub const MAX_REMOVAL_BATCHES: usize = 64;
 
 /// Scripts one request may name. Enforced by senders and the bridge; the
 /// contract cannot see inside a sealed request, and bounds its size instead.
@@ -178,7 +231,8 @@ pub const MAX_CERTIFICATE_BYTES: usize = 4 * 1024;
 
 const ENTRY_DOMAIN: &[u8] = b"freenet-bitcoin/inbox-entry/v1\0";
 const FLOOR_DOMAIN: &[u8] = b"freenet-bitcoin/inbox-floor/v1\0";
-const TOMBSTONE_DOMAIN: &[u8] = b"freenet-bitcoin/inbox-tombstone/v1\0";
+const REMOVAL_DOMAIN: &[u8] = b"freenet-bitcoin/inbox-removal/v1\0";
+const BATCH_KEY_DOMAIN: &str = "freenet-bitcoin/inbox-removal-key/v1";
 const ENTRY_KEY_DOMAIN: &str = "freenet-bitcoin/inbox-entry-key/v1";
 const CERT_KEY_DOMAIN: &str = "freenet-bitcoin/inbox-cert-key/v1";
 
@@ -187,11 +241,28 @@ const CERT_KEY_DOMAIN: &str = "freenet-bitcoin/inbox-cert-key/v1";
 // ---------------------------------------------------------------------------
 
 /// An entry's identity: a digest of the WHOLE entry, so two entries that differ
-/// in any byte are two entries. A tombstone is filed under the key of the entry
-/// it removes.
+/// in any byte are two entries.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct EntryKey(pub [u8; 32]);
 freenet_bitcoin_common::impl_bytes32_serde!(EntryKey);
+
+impl EntryKey {
+    /// What a removal keeps of this key. See [`REMOVED_PREFIX_BYTES`].
+    pub fn removal_prefix(&self) -> RemovedPrefix {
+        let mut p = [0u8; REMOVED_PREFIX_BYTES];
+        p.copy_from_slice(&self.0[..REMOVED_PREFIX_BYTES]);
+        RemovedPrefix(p)
+    }
+}
+
+/// The part of an entry's key a removal keeps.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub struct RemovedPrefix(pub [u8; REMOVED_PREFIX_BYTES]);
+
+/// A removal batch's identity: a digest of its height and what it removes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub struct BatchKey(pub [u8; 32]);
+freenet_bitcoin_common::impl_bytes32_serde!(BatchKey);
 
 /// A certificate's identity in the state's certificate map.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
@@ -506,12 +577,11 @@ fn floor_message(bridge: &BridgeId, height: u32) -> Vec<u8> {
     v
 }
 
-fn tombstone_message(bridge: &BridgeId, entry: &EntryKey, height: u32, gk: &GhostkeyId) -> Vec<u8> {
-    let mut v = TOMBSTONE_DOMAIN.to_vec();
+fn removal_message(bridge: &BridgeId, height: u32, removed: &[u8]) -> Vec<u8> {
+    let mut v = REMOVAL_DOMAIN.to_vec();
     v.extend_from_slice(&bridge.0);
-    v.extend_from_slice(&entry.0);
     v.extend_from_slice(&height.to_le_bytes());
-    v.extend_from_slice(&gk.0);
+    v.extend_from_slice(removed);
     v
 }
 
@@ -555,34 +625,120 @@ impl SignedFloor {
     }
 }
 
-/// The bridge has read this entry. Filed under the entry's key.
+/// "The bridge has read these entries": the removal record.
 ///
-/// Carries the entry's height and Ghost Key so it keeps the entry's slot in
-/// both the floor order and the per-Ghost Key cap. It lives until the floor
-/// passes the ENTRY's height: keyed on the time of removal instead, it could
-/// expire while its entry was still above the floor and let it come back.
+/// Names entries by [`RemovedPrefix`], all dated at one block height, and
+/// lasts until the floor passes that height. Dated by the ENTRIES' height, not
+/// the time of removal: dated by the latter, a removal could expire while its
+/// entries were still above the floor and let them come back.
+///
+/// For each height it has read entries at, the bridge signs one batch naming
+/// every entry at that height it has read so far. As it reads more, it signs
+/// a larger batch for the height, and a batch another one covers is dropped
+/// ([`RemovalBatch::covered_by`]). So batches do not pile up, and a batch that
+/// failed to land is superseded by the next rather than resent.
+///
+/// A removal takes no place under the entry caps: an entry gives its place
+/// back as soon as its removal arrives.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub struct SignedTombstone {
-    pub entry: EntryKey,
-    pub entry_height: u32,
-    pub ghostkey: GhostkeyId,
+pub struct RemovalBatch {
+    /// The height of the entries this batch removes.
+    pub height: u32,
+    /// Their prefixes, concatenated, ascending and distinct.
+    pub removed: ByteBuf,
     pub signature: ByteBuf,
 }
 
-impl SignedTombstone {
-    pub fn for_entry(key: &SigningKey, entry_key: EntryKey, entry: &InboxEntry) -> Self {
+impl RemovalBatch {
+    pub fn sign(key: &SigningKey, height: u32, removed: &BTreeSet<RemovedPrefix>) -> Self {
         let bridge = BridgeId(key.verifying_key().to_bytes());
-        let msg = tombstone_message(&bridge, &entry_key, entry.mainnet_height, &entry.ghostkey);
-        SignedTombstone {
-            entry: entry_key,
-            entry_height: entry.mainnet_height,
-            ghostkey: entry.ghostkey,
-            signature: ByteBuf(key.sign(&msg).to_bytes().to_vec()),
+        let bytes: Vec<u8> = removed.iter().flat_map(|p| p.0).collect();
+        let signature = key.sign(&removal_message(&bridge, height, &bytes));
+        RemovalBatch {
+            height,
+            removed: ByteBuf(bytes),
+            signature: ByteBuf(signature.to_bytes().to_vec()),
         }
     }
 
+    /// At least one prefix and at most [`MAX_REMOVED`], whole prefixes only,
+    /// ascending with no repeats: one set of removals, one byte string. Cheap,
+    /// so checked before anything is hashed or verified.
+    pub fn check_shape(&self) -> Result<(), String> {
+        let b = &self.removed.0;
+        if b.is_empty() || !b.len().is_multiple_of(REMOVED_PREFIX_BYTES) {
+            return Err("a removal batch must name at least one whole prefix".into());
+        }
+        if b.len() / REMOVED_PREFIX_BYTES > MAX_REMOVED {
+            return Err(format!(
+                "a removal batch may name at most {MAX_REMOVED} entries"
+            ));
+        }
+        let mut chunks = b.chunks_exact(REMOVED_PREFIX_BYTES);
+        let mut last = chunks.next();
+        for p in chunks {
+            if last.is_some_and(|l| l >= p) {
+                return Err("a removal batch's prefixes must ascend with no repeats".into());
+            }
+            last = Some(p);
+        }
+        Ok(())
+    }
+
     pub fn verify(&self, bridge: &BridgeId) -> Result<(), String> {
-        let msg = tombstone_message(bridge, &self.entry, self.entry_height, &self.ghostkey);
+        self.check_shape()?;
+        let msg = removal_message(bridge, self.height, &self.removed.0);
         check_bridge_sig(bridge, &msg, &self.signature)
+    }
+
+    /// This batch's identity: its height and what it removes. Not the
+    /// signature, which a bridge signing deterministically never varies.
+    pub fn key(&self) -> BatchKey {
+        let mut h = blake3::Hasher::new_derive_key(BATCH_KEY_DOMAIN);
+        h.update(&self.height.to_le_bytes());
+        h.update(&self.removed.0);
+        BatchKey(*h.finalize().as_bytes())
+    }
+
+    /// How many entries it removes.
+    pub fn len(&self) -> usize {
+        self.removed.0.len() / REMOVED_PREFIX_BYTES
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.removed.0.is_empty()
+    }
+
+    pub fn prefixes(&self) -> impl Iterator<Item = RemovedPrefix> + '_ {
+        self.removed.0.chunks_exact(REMOVED_PREFIX_BYTES).map(|c| {
+            let mut p = [0u8; REMOVED_PREFIX_BYTES];
+            p.copy_from_slice(c);
+            RemovedPrefix(p)
+        })
+    }
+
+    /// Whether `other` makes this batch redundant: it lasts at least as long
+    /// and removes everything this one does. Both must pass
+    /// [`Self::check_shape`]. A batch covers itself, so callers compare keys.
+    ///
+    /// Dropping covered batches keeps the batches that nothing covers, which
+    /// is the same set whichever order batches arrive in: that is what lets it
+    /// sit inside the merge.
+    pub fn covered_by(&self, other: &RemovalBatch) -> bool {
+        if other.height < self.height || other.len() < self.len() {
+            return false;
+        }
+        let mut theirs = other.removed.0.chunks_exact(REMOVED_PREFIX_BYTES);
+        'mine: for p in self.removed.0.chunks_exact(REMOVED_PREFIX_BYTES) {
+            for q in theirs.by_ref() {
+                match q.cmp(p) {
+                    std::cmp::Ordering::Less => continue,
+                    std::cmp::Ordering::Equal => continue 'mine,
+                    std::cmp::Ordering::Greater => return false,
+                }
+            }
+            return false;
+        }
+        true
     }
 }

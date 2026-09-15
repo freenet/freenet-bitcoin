@@ -3,8 +3,8 @@
 //! Clients ask this bridge to watch a Bitcoin script by appending a sealed,
 //! Ghost Key signed entry to the bridge's inbox contract (see
 //! `freenet_bitcoin_inbox`). This module reads the inbox, acts on each entry,
-//! removes it with a signed tombstone, and keeps the inbox's floor following
-//! the Bitcoin mainnet tip.
+//! removes it with a signed removal batch, keeps the inbox's floor following
+//! the Bitcoin mainnet tip, and ends watches nobody has renewed for a day.
 //!
 //! # Its own connection
 //!
@@ -25,11 +25,12 @@
 //! request arriving late changes nothing.
 //!
 //! Entries acted on are also recorded (`inbox_handled`), so an entry whose
-//! tombstone failed to land is removed again rather than acted on again, and
+//! removal failed to land is removed again rather than acted on again, and
 //! the highest floor this bridge has signed is stored, so an entry below it is
-//! never acted on even when a stale copy of the inbox presents it.
+//! never acted on even when a stale copy of the inbox presents it. The same
+//! record is what each removal batch is built from.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,8 +40,8 @@ use ed25519_dalek::SigningKey;
 use freenet_bitcoin_common::{from_cbor, to_cbor, BitcoinNetwork, BridgeId};
 use freenet_bitcoin_inbox::seal::unseal;
 use freenet_bitcoin_inbox::{
-    Action, EntryKey, InboxDelta, InboxEntry, InboxParameters, InboxStateV1, SignedFloor,
-    SignedTombstone, FLOOR_LAG_BLOCKS, WINDOW_BLOCKS,
+    Action, EntryKey, InboxDelta, InboxEntry, InboxParameters, InboxStateV1, RemovalBatch,
+    RemovedPrefix, SignedFloor, FLOOR_LAG_BLOCKS, REMOVAL_BUDGET, WINDOW_BLOCKS,
 };
 use freenet_stdlib::client_api::{
     ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse, WebApi,
@@ -78,6 +79,26 @@ const REOPEN_INTERVAL: Duration = Duration::from_secs(60);
 /// request by the same sender still in the inbox, which is hours at most.
 const WITHDRAWAL_MEMORY_MS: i64 = 24 * 60 * 60 * 1000;
 
+/// How long a watch lasts after the Watch that last asked for it.
+///
+/// Watching costs the bridge an update to the script's address contract with
+/// every block, and an application typically watches an address for one
+/// payment, so a watch nobody renews ends by itself rather than lasting until
+/// someone remembers to withdraw it. A Watch sent again, with a newer
+/// timestamp as every request must have, starts the day again. A watch whose
+/// script has a payment still being buried outlives its day; see
+/// [`Processor::expire_watches`].
+pub const WATCH_LIFETIME_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// How long after connecting to its node the bridge waits before raising the
+/// floor.
+///
+/// The node may have been down, or just started, and until it has caught up
+/// with the inbox the requests other peers hold are missing from the copy the
+/// bridge reads. Raising the floor at once would drop any of those dated
+/// below it, unread. A node catches up with one small contract in seconds.
+pub const FLOOR_HOLD_MS: i64 = 2 * 60 * 1000;
+
 // ---------------------------------------------------------------------------
 // One pass over the inbox. No I/O but SQLite, so it is tested directly.
 // ---------------------------------------------------------------------------
@@ -99,10 +120,12 @@ impl Tips {
 /// What a pass decided.
 #[derive(Debug, Default)]
 pub struct Pass {
-    /// Tombstones and floor to send back to the inbox.
+    /// Removals and floor to send back to the inbox.
     pub delta: InboxDelta,
     /// Entries acted on for the first time.
     pub acted: usize,
+    /// Entries left unread because the removal budget was spent.
+    pub deferred: usize,
 }
 
 pub struct Processor<'a> {
@@ -113,6 +136,11 @@ pub struct Processor<'a> {
     pub observed: &'a [BitcoinNetwork],
     /// See [`MAX_WATCHES_PER_GHOSTKEY`]; a field so tests can use a small one.
     pub max_watches_per_ghostkey: usize,
+    /// Each observed network's configured `deep_confirmations`: how deep a
+    /// payment must be before the watch that found it may end.
+    pub deep_confirmations: &'a HashMap<BitcoinNetwork, u32>,
+    /// The floor is not raised before this time; see [`FLOOR_HOLD_MS`].
+    pub floor_hold_until_ms: i64,
 }
 
 impl Processor<'_> {
@@ -151,6 +179,8 @@ impl Processor<'_> {
         entries.sort_by_key(|(k, e)| (e.mainnet_height, *k));
 
         let mut pass = Pass::default();
+        let mut handled = self.store.handled_count()?;
+        let mut read_heights: BTreeSet<u32> = BTreeSet::new();
         for (k, e) in entries {
             // Below a floor this bridge signed: a stale copy of the inbox. It
             // was either acted on already or dropped unread when that floor
@@ -163,22 +193,55 @@ impl Processor<'_> {
                 continue;
             }
             if !self.store.is_handled(&k.0)? {
+                // Every entry read is removed, and a removal lasts until the
+                // floor passes it. Past the budget, reading waits for the
+                // floor, so a flood leaves requests waiting in the inbox
+                // rather than growing the removals past what it may hold.
+                if handled >= REMOVAL_BUDGET {
+                    pass.deferred += 1;
+                    continue;
+                }
                 self.store.with_transaction(|| {
                     self.act(e, tips, now_ms)?;
                     self.store.mark_handled(&k.0, e.mainnet_height)
                 })?;
+                handled += 1;
                 pass.acted += 1;
             }
-            // Ed25519 signatures are deterministic, so re-sending a tombstone
-            // that was lost sends the same bytes.
-            pass.delta
-                .tombstones
-                .push(SignedTombstone::for_entry(self.key, k, e));
+            read_heights.insert(e.mainnet_height);
+        }
+        if pass.deferred > 0 {
+            tracing::warn!(
+                deferred = pass.deferred,
+                budget = REMOVAL_BUDGET,
+                "the removal budget is spent; requests wait for the floor to pass older removals"
+            );
         }
 
+        // One batch per height, naming every entry ever read at it. It covers
+        // any batch sent for that height before, so the inbox keeps only the
+        // newest, and a batch that failed to land is made good by this one.
+        // Built from the store, which is deterministic, and signed with
+        // Ed25519, which is too: an unchanged set is sent as the same bytes.
+        for h in read_heights {
+            let removed: BTreeSet<RemovedPrefix> = self
+                .store
+                .handled_at(h)?
+                .into_iter()
+                .map(|k| EntryKey(k).removal_prefix())
+                .collect();
+            pass.delta
+                .removals
+                .push(RemovalBatch::sign(self.key, h, &removed));
+        }
+
+        self.expire_watches(tips, now_ms)?;
+
         let target = match tips.mainnet() {
-            Some(tip) => known.max(Some(tip.saturating_sub(FLOOR_LAG_BLOCKS))),
-            None => known,
+            Some(tip) if now_ms >= self.floor_hold_until_ms => {
+                known.max(Some(tip.saturating_sub(FLOOR_LAG_BLOCKS)))
+            }
+            _ => known,
         };
         if let Some(t) = target {
             if state_floor.is_none_or(|cur| t > cur) {
@@ -189,10 +252,54 @@ impl Processor<'_> {
         Ok(pass)
     }
 
+    /// End watches nobody has renewed within [`WATCH_LIFETIME_MS`].
+    ///
+    /// Except where a payment to the script has been seen and is not yet
+    /// `deep_confirmations` deep: after a reorg the observer rescans only the
+    /// scripts it watches, so ending the watch before the payment is buried
+    /// could have it retract a payment that was merely moved to another block.
+    /// On a network whose tip cannot be read, depth cannot be told, so nothing
+    /// there ends until it can.
+    fn expire_watches(&self, tips: &Tips, now_ms: i64) -> Result<()> {
+        let cutoff = now_ms.saturating_sub(WATCH_LIFETIME_MS);
+        let mut ended = 0usize;
+        for &net in self.observed {
+            let Some(&tip) = tips.by_network.get(&net) else {
+                continue;
+            };
+            // A network missing from the map cannot be judged: keep its
+            // watches while any payment to them is on record.
+            let deep = self
+                .deep_confirmations
+                .get(&net)
+                .copied()
+                .unwrap_or(u32::MAX);
+            for (script, ghostkey) in self.store.watches_recorded_before(net, cutoff)? {
+                if self.store.has_shallow_output(net, &script, tip, deep)? {
+                    continue;
+                }
+                self.store.with_transaction(|| {
+                    if self
+                        .store
+                        .expire_interest(net, &script, &ghostkey, now_ms)?
+                    {
+                        self.store.remove_watch(net, &script)?;
+                    }
+                    Ok(())
+                })?;
+                ended += 1;
+            }
+        }
+        if ended > 0 {
+            tracing::info!(ended, "watches nobody renewed for a day ended");
+        }
+        Ok(())
+    }
+
     /// Act on one entry. An error here is the store failing, and rolls back
     /// the entry; anything wrong with the entry itself is logged and the entry
-    /// is removed like any other, so it stops holding its sender's slot. The
-    /// tombstone therefore says the entry was read, not what came of it.
+    /// is removed like any other, so it stops holding its sender's place. The
+    /// removal therefore says the entry was read, not what came of it.
     fn act(&self, e: &InboxEntry, tips: &Tips, now_ms: i64) -> Result<()> {
         let body = match e.body() {
             Ok(b) => b,
@@ -532,12 +639,19 @@ impl InboxWorker {
         let mut api = WebApi::start(stream);
         let store = Store::open(&self.db_path)?;
         let observed: Vec<BitcoinNetwork> = self.networks.iter().map(|n| n.network).collect();
+        let deep: HashMap<BitcoinNetwork, u32> = self
+            .networks
+            .iter()
+            .map(|n| (n.network, n.deep_confirmations))
+            .collect();
         let processor = Processor {
             params: &self.params,
             key: &self.key,
             store: &store,
             observed: &observed,
             max_watches_per_ghostkey: MAX_WATCHES_PER_GHOSTKEY,
+            deep_confirmations: &deep,
+            floor_hold_until_ms: now_ms().saturating_add(FLOOR_HOLD_MS),
         };
         let key = self.contract_key()?;
         let mut session = Session {
@@ -669,7 +783,7 @@ pub type Fingerprint = ([u8; 32], Option<u32>);
 /// Which state needs no processing again.
 ///
 /// Only a pass that had nothing to send is remembered. One that sent
-/// tombstones or a floor may have had them refused after sending, so its state
+/// removals or a floor may have had them refused after sending, so its state
 /// is processed again, and they are sent again, until a pass finds nothing
 /// left to send. Processing a settled state again would cost an RSA check per
 /// certificate for nothing.
@@ -831,11 +945,34 @@ mod tests {
             &InboxDelta {
                 floor: Some(SignedFloor::sign(&bridge_key(), floor)),
                 entries,
-                tombstones: vec![],
+                removals: vec![],
             },
         )
         .unwrap();
         s
+    }
+
+    fn try_run_held(
+        store: &Store,
+        state: &InboxStateV1,
+        tips: &Tips,
+        cap: usize,
+        now_ms: i64,
+        floor_hold_until_ms: i64,
+    ) -> Result<Pass> {
+        let params = params();
+        let key = bridge_key();
+        let deep = HashMap::from([(BitcoinNetwork::Bitcoin, 6), (SIGNET, 6)]);
+        Processor {
+            params: &params,
+            key: &key,
+            store,
+            observed: OBSERVED,
+            max_watches_per_ghostkey: cap,
+            deep_confirmations: &deep,
+            floor_hold_until_ms,
+        }
+        .pass(state, tips, now_ms)
     }
 
     fn try_run(
@@ -845,16 +982,12 @@ mod tests {
         cap: usize,
         now_ms: i64,
     ) -> Result<Pass> {
-        let params = params();
-        let key = bridge_key();
-        Processor {
-            params: &params,
-            key: &key,
-            store,
-            observed: OBSERVED,
-            max_watches_per_ghostkey: cap,
-        }
-        .pass(state, tips, now_ms)
+        try_run_held(store, state, tips, cap, now_ms, i64::MIN)
+    }
+
+    /// Entries a pass removes, across its batches.
+    fn removed(pass: &Pass) -> usize {
+        pass.delta.removals.iter().map(RemovalBatch::len).sum()
     }
 
     fn run_with(store: &Store, state: &InboxStateV1, tips: &Tips, cap: usize) -> Pass {
@@ -899,7 +1032,197 @@ mod tests {
         let mut after = state.clone();
         after.apply_delta(&params(), &pass.delta).unwrap();
         assert!(after.entries.is_empty());
-        assert_eq!(after.tombstones.len(), 1);
+        assert_eq!(after.removals.len(), 1);
+        after.verify(&params()).unwrap();
+    }
+
+    /// A second pass reads a new entry at a height already read at, and signs
+    /// one batch naming both: it covers the first, which the inbox drops.
+    #[test]
+    fn one_batch_per_height_names_everything_read_there_and_replaces_the_last() {
+        let store = Store::open_in_memory().unwrap();
+        let (a, b) = (&ghostkeys()[0], &ghostkeys()[1]);
+        let wa = entry(a, FLOOR + 1, &request(Action::Watch, b"a", 1));
+        let wb = entry(b, FLOOR + 1, &request(Action::Watch, b"b", 1));
+        let mut state = inbox(FLOOR, vec![wa]);
+        let first = run(&store, &state, &tips());
+        state.apply_delta(&params(), &first.delta).unwrap();
+
+        state
+            .apply_delta(&params(), &InboxDelta::submission(None, wb))
+            .unwrap();
+        let second = run(&store, &state, &tips());
+        assert_eq!(second.delta.removals.len(), 1);
+        assert_eq!(removed(&second), 2);
+        assert!(first.delta.removals[0].covered_by(&second.delta.removals[0]));
+        state.apply_delta(&params(), &second.delta).unwrap();
+        assert!(state.entries.is_empty());
+        assert_eq!(
+            state.removals.len(),
+            1,
+            "the first batch is covered and goes"
+        );
+        state.verify(&params()).unwrap();
+    }
+
+    /// Filled to one short of the budget with entries already read; the pass
+    /// reads one more and leaves the other waiting, until the floor passes the
+    /// old removals and frees the budget.
+    #[test]
+    fn past_the_removal_budget_reading_waits_for_the_floor() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .with_transaction(|| {
+                for i in 0..(REMOVAL_BUDGET - 1) as u64 {
+                    let mut k = [0u8; 32];
+                    k[..8].copy_from_slice(&i.to_be_bytes());
+                    store.mark_handled(&k, FLOOR + 1)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let (a, b) = (&ghostkeys()[0], &ghostkeys()[1]);
+        let two = vec![
+            entry(a, FLOOR + 2, &request(Action::Watch, b"a", 1)),
+            entry(b, FLOOR + 2, &request(Action::Watch, b"b", 1)),
+        ];
+        let pass = run(&store, &inbox(FLOOR, two.clone()), &tips());
+        assert_eq!((pass.acted, pass.deferred), (1, 1));
+        assert_eq!(watched(&store).len(), 1);
+        assert_eq!(removed(&pass), 1, "only what was read is removed");
+
+        let pass = run(&store, &inbox(FLOOR + 2, two), &tips());
+        assert_eq!((pass.acted, pass.deferred), (1, 0));
+        assert_eq!(watched(&store).len(), 2);
+    }
+
+    #[test]
+    fn the_floor_is_held_for_a_while_after_connecting_and_then_follows_the_tip() {
+        let store = Store::open_in_memory().unwrap();
+        let state = inbox(FLOOR - 10, vec![]);
+        let held = try_run_held(&store, &state, &tips(), 3, 1_000, 2_000).unwrap();
+        assert!(held.delta.floor.is_none());
+        let moved = try_run_held(&store, &state, &tips(), 3, 2_000, 2_000).unwrap();
+        assert_eq!(moved.delta.floor.map(|f| f.height), Some(FLOOR));
+    }
+
+    // --- how long a watch lasts ------------------------------------------------
+
+    const HOUR: i64 = 3_600_000;
+    const T0: i64 = 1_700_000_000_000;
+
+    fn watch_at(store: &Store, gk: &TestGhostkey, made_at_ms: u64, now_ms: i64) {
+        let w = entry(gk, FLOOR + 1, &request(Action::Watch, b"spk", made_at_ms));
+        run_at(store, &inbox(FLOOR, vec![w]), &tips(), now_ms);
+    }
+
+    fn tick(store: &Store, tips: &Tips, now_ms: i64) {
+        run_at(store, &inbox(FLOOR, vec![]), tips, now_ms);
+    }
+
+    fn payment(store: &Store, height: Option<u32>) {
+        store
+            .record_output(
+                SIGNET,
+                b"spk",
+                &[7u8; 32],
+                0,
+                10_000,
+                height.map(|h| (h, BlockHash([1; 32]))),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_watch_ends_a_day_after_it_was_last_asked_for() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        tick(&store, &tips(), T0 + 23 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert!(watched(&store).is_empty());
+    }
+
+    #[test]
+    fn a_watch_sent_again_starts_the_day_again() {
+        let store = Store::open_in_memory().unwrap();
+        let a = &ghostkeys()[0];
+        watch_at(&store, a, 1, T0);
+        watch_at(&store, a, 2, T0 + 20 * HOUR);
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        tick(&store, &tips(), T0 + 45 * HOUR);
+        assert!(watched(&store).is_empty());
+    }
+
+    /// Ended by running out, it is a withdrawal like any other: a delayed copy
+    /// of the Watch it ended cannot bring it back, a newer Watch can.
+    #[test]
+    fn a_watch_that_ran_out_comes_back_only_for_a_newer_request() {
+        let store = Store::open_in_memory().unwrap();
+        let a = &ghostkeys()[0];
+        watch_at(&store, a, 10, T0);
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        watch_at(&store, a, 5, T0 + 26 * HOUR);
+        assert!(
+            watched(&store).is_empty(),
+            "older than the one that ran out"
+        );
+        watch_at(&store, a, 20, T0 + 26 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+    }
+
+    #[test]
+    fn a_watch_whose_payment_is_still_being_buried_outlives_its_day() {
+        // Five deep, one short of `deep_confirmations`.
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        payment(&store, Some(SIGNET_TIP - 4));
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+
+        // Six deep: buried, and the watch ends.
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        payment(&store, Some(SIGNET_TIP - 5));
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert!(watched(&store).is_empty());
+
+        // Moved out of its block by a reorg and not seen again.
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        payment(&store, None);
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+    }
+
+    #[test]
+    fn nothing_ends_on_a_network_whose_tip_cannot_be_read() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        let mut no_signet = tips();
+        no_signet.by_network.remove(&SIGNET);
+        tick(&store, &no_signet, T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+    }
+
+    #[test]
+    fn a_watch_from_before_the_inbox_never_runs_out() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .add_watch(
+                &WatchedScript {
+                    network: SIGNET,
+                    script_pubkey: b"spk".to_vec(),
+                    scan_from_height: 0,
+                    is_public_demo: false,
+                },
+                0,
+            )
+            .unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
     }
 
     #[test]
@@ -968,11 +1291,7 @@ mod tests {
         run(&store, &inbox(FLOOR, vec![w.clone()]), &tips());
         let pass = run(&store, &inbox(FLOOR, vec![w]), &tips());
         assert_eq!(pass.acted, 0);
-        assert_eq!(
-            pass.delta.tombstones.len(),
-            1,
-            "the lost tombstone is sent again"
-        );
+        assert_eq!(removed(&pass), 1, "the lost removal is sent again");
     }
 
     #[test]
@@ -998,7 +1317,7 @@ mod tests {
         let pass = run(&store, &state, &tips());
         assert!(watched(&store).is_empty());
         assert!(store.watched(BitcoinNetwork::Regtest).unwrap().is_empty());
-        assert_eq!(pass.delta.tombstones.len(), 2, "both are removed");
+        assert_eq!(removed(&pass), 2, "both are removed");
     }
 
     /// The inbox is dated by mainnet whatever network a request is for, so a
@@ -1020,7 +1339,7 @@ mod tests {
         let pass = run(&store, &state, &no_signet);
         assert_eq!(pass.acted, 1);
         assert_eq!(watched(&store), vec![b"spk".to_vec()]);
-        assert_eq!(pass.delta.tombstones.len(), 1);
+        assert_eq!(removed(&pass), 1);
         assert_eq!(
             store.watched(SIGNET).unwrap()[0].scan_from_height,
             u32::MAX,
