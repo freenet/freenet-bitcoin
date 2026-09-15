@@ -3,10 +3,10 @@
 //! # Why this app embeds the contracts it reads
 //!
 //! A Freenet webapp is served under a Content-Security-Policy whose
-//! `connect-src` is its own gateway and nothing else. It cannot fetch a
-//! bridge's HTTP status endpoint to ask which contract to read — the browser
-//! refuses the request. That is the sandbox working correctly: a Freenet app
-//! reaches the world through its node.
+//! `connect-src` is its own gateway and nothing else, so it cannot ask a
+//! bridge anything over HTTP; nor does a bridge offer HTTP, since it talks
+//! only through contracts. That is the sandbox working correctly: a Freenet
+//! app reaches the world through its node.
 //!
 //! The alternative usually reached for is a compiled-in contract id, and it
 //! rots: a contract's key is `BLAKE3(BLAKE3(wasm) || params)`, so any rebuild

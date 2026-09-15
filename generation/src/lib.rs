@@ -77,7 +77,7 @@ use freenet_stdlib::prelude::ContractInstanceId;
 /// binary nobody can check.
 pub const POINTER_CONTRACT_WASM: &[u8] = include_bytes!("../pointer-v1.wasm");
 
-/// Which of this project's two contracts a pointer describes.
+/// Which of this project's contracts a pointer describes.
 ///
 /// One pointer per artifact, because they are separate WASM modules with
 /// separate code hashes. A pointer record holds exactly one code hash, and
@@ -87,6 +87,10 @@ pub const POINTER_CONTRACT_WASM: &[u8] = include_bytes!("../pointer-v1.wasm");
 pub enum Artifact {
     Address,
     Tip,
+    /// The bridge's request inbox, where clients ask it to watch a script.
+    /// A client derives the inbox address from the code hash in this pointer
+    /// and `freenet_bitcoin_inbox::InboxParameters::production(bridge)`.
+    Inbox,
 }
 
 impl Artifact {
@@ -100,6 +104,7 @@ impl Artifact {
         match self {
             Artifact::Address => b"freenet-bitcoin.address",
             Artifact::Tip => b"freenet-bitcoin.tip",
+            Artifact::Inbox => b"freenet-bitcoin.inbox",
         }
     }
 
@@ -108,10 +113,11 @@ impl Artifact {
         match self {
             Artifact::Address => "address contract",
             Artifact::Tip => "tip contract",
+            Artifact::Inbox => "request inbox contract",
         }
     }
 
-    pub const ALL: [Artifact; 2] = [Artifact::Address, Artifact::Tip];
+    pub const ALL: [Artifact; 3] = [Artifact::Address, Artifact::Tip, Artifact::Inbox];
 }
 
 /// A bridge id, reinterpreted as the Ed25519 key that signs its pointers.
@@ -218,9 +224,15 @@ mod tests {
     /// is all a reader has before it has read anything.
     #[test]
     fn pointer_addresses_are_derivable_offline() {
-        let a = pointer_id(&bridge(), Artifact::Address).unwrap();
-        let t = pointer_id(&bridge(), Artifact::Tip).unwrap();
-        assert_ne!(a, t, "the two artifacts must not share a version space");
+        let ids: Vec<_> = Artifact::ALL
+            .iter()
+            .map(|a| pointer_id(&bridge(), *a).unwrap())
+            .collect();
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b, "no two artifacts may share a version space");
+            }
+        }
     }
 
     /// Pinned because these strings are part of an address. A rename that
@@ -230,6 +242,7 @@ mod tests {
     fn app_ids_are_wire_constants() {
         assert_eq!(Artifact::Address.app_id(), b"freenet-bitcoin.address");
         assert_eq!(Artifact::Tip.app_id(), b"freenet-bitcoin.tip");
+        assert_eq!(Artifact::Inbox.app_id(), b"freenet-bitcoin.inbox");
     }
 
     /// A different bridge is a different pointer: two operators may genuinely
@@ -249,13 +262,18 @@ mod tests {
     }
 
     /// The signing message must cover the artifact, or a record the bridge
-    /// signed for one contract would validate as the other's.
+    /// signed for one contract would validate as another's.
     #[test]
-    fn the_signed_message_separates_the_two_artifacts() {
+    fn the_signed_message_separates_the_artifacts() {
         let h = [3u8; 32];
-        assert_ne!(
-            signing_message(&bridge(), Artifact::Address, 1, &h).unwrap(),
-            signing_message(&bridge(), Artifact::Tip, 1, &h).unwrap()
-        );
+        let msgs: Vec<_> = Artifact::ALL
+            .iter()
+            .map(|a| signing_message(&bridge(), *a, 1, &h).unwrap())
+            .collect();
+        for (i, a) in msgs.iter().enumerate() {
+            for b in &msgs[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 }

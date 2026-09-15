@@ -46,7 +46,15 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace
              --exclude bitcoin-address-contract --exclude bitcoin-tip-contract
-             --all-targets -- -D warnings
+             --exclude bitcoin-inbox-contract
+             --all-targets --features freenet-bitcoin-inbox/seal -- -D warnings
+
+      # The inbox contract is linted on the target and features it ships with.
+      # On the host without `contract` its `#[contract]` expansion does not
+      # compile at all, which is why the host step above excludes it.
+      - name: Clippy (inbox contract, wasm target)
+        run: cargo clippy -p bitcoin-inbox-contract
+             --target wasm32-unknown-unknown --features contract -- -D warnings
 
       # The merge laws, SPV verification, and the service layer. These assert
       # convergence on exact serialized bytes, which is how peers actually
@@ -63,7 +71,7 @@ jobs:
         # though the bridge crate is not tested at all. That false reading cost
         # a review cycle. Keep it greppable.
         run: |
-          cargo test -p freenet-bitcoin-common -p freenet-bitcoin-generation -p bitcoin-freenet-bridge -p freenet-bitcoin-webapp
+          cargo test -p freenet-bitcoin-common -p freenet-bitcoin-generation -p bitcoin-freenet-bridge -p freenet-bitcoin-webapp -p freenet-bitcoin-inbox --features freenet-bitcoin-inbox/seal
 
       # The webapp ships as wasm, so lint the target that actually ships --
       # native-only dead-code findings there are noise, and wasm-only ones
@@ -85,7 +93,8 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq wabt
           ./scripts/check-wasm-imports.sh \
             target/wasm32-unknown-unknown/release/bitcoin_address_contract.wasm \
-            target/wasm32-unknown-unknown/release/bitcoin_tip_contract.wasm
+            target/wasm32-unknown-unknown/release/bitcoin_tip_contract.wasm \
+            target/wasm32-unknown-unknown/release/bitcoin_inbox_contract.wasm
 
       # A contract's key is BLAKE3(BLAKE3(wasm) || params), so the code hash IS
       # the contract's identity. Print it so a re-key is visible in the log of

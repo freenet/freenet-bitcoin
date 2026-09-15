@@ -4,20 +4,19 @@
 //!
 //! * an **observation loop** per network, following the chain and publishing
 //!   signed observations into per-script Freenet contracts, and
-//! * a **request service**, where clients ask this operator to synchronize a
-//!   script (subject to whatever authorization policy the operator runs).
+//! * an **inbox worker**, reading the bridge's request inbox contract, where
+//!   Ghost Key holders ask it to synchronize a script (see `inbox`).
 //!
-//! Those are separate on purpose. The observations are public and generic, and
-//! carry the evidence a reader needs to check what they say about a
-//! transaction; who is allowed to ask for them is one operator's business and
-//! never touches the Freenet wire.
+//! Both reach the world only through Freenet contracts. The observations are
+//! public and generic, and carry the evidence a reader needs to check what they
+//! say about a transaction. The requests are sealed to this bridge: the network
+//! learns which Ghost Key asked and when, never which script.
 //!
 //! An observation is not self-validating, though. A reader who checks the
 //! evidence learns that a real transaction paid that script that amount; which
 //! blocks are on Bitcoin is this bridge's assertion, and readers trust it for
 //! that. See `freenet_bitcoin_common::spv`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -28,9 +27,9 @@ use freenet_bitcoin_common::BitcoinNetwork;
 use bitcoin_freenet_bridge::{
     chain::ChainClient,
     config::BridgeConfig,
-    freenet::FreenetPublisher,
+    freenet::{ContractWasm, FreenetPublisher},
+    inbox::InboxWorker,
     observer::{Observer, RoundClaims},
-    service::{router, ServiceState},
     signer::Signer,
     store::{Store, WatchedScript},
 };
@@ -141,7 +140,8 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
     tracing::info!(bridge_id = %signer.bridge_id().to_bs58(), "bridge starting");
 
     // Opened here purely to seed the operator's public demo scripts before
-    // anything else starts; the observer and the service each open their own.
+    // anything else starts; the observer and the inbox worker each open their
+    // own.
     let store = Store::open(&cfg.database_path)?;
 
     // Seed the operator's public demo scripts. These are explicitly public
@@ -198,28 +198,18 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
         anyhow::bail!("no Bitcoin Core instance is reachable; nothing to do");
     }
 
-    let address_wasm = std::fs::read(cfg.contract_dir.join("bitcoin_address_contract.wasm"))
-        .with_context(|| {
-            format!(
-                "reading bitcoin_address_contract.wasm from {}",
-                cfg.contract_dir.display()
-            )
-        })?;
-    let tip_wasm =
-        std::fs::read(cfg.contract_dir.join("bitcoin_tip_contract.wasm")).with_context(|| {
-            format!(
-                "reading bitcoin_tip_contract.wasm from {}",
-                cfg.contract_dir.display()
-            )
-        })?;
+    let wasm = ContractWasm::load(&cfg.contract_dir)?;
 
-    let publisher = match FreenetPublisher::connect(&cfg.freenet_ws, address_wasm, tip_wasm).await {
+    let publisher = match FreenetPublisher::connect(&cfg.freenet_ws, &wasm).await {
         Ok(p) => Some(Arc::new(p)),
         Err(e) => {
-            // The bridge still serves status and still observes the chain; it
-            // just cannot publish yet. Failing hard here would make a node
-            // restart take the bridge down with it.
-            tracing::error!("cannot reach the Freenet node ({e}); will retry");
+            // The bridge still observes the chain, and the inbox worker has
+            // its own connection that reconnects. Failing hard here would make
+            // a node restart take the bridge down with it.
+            tracing::error!(
+                "cannot reach the Freenet node ({e}); observations will not be published \
+                 until the bridge restarts"
+            );
             None
         }
     };
@@ -274,15 +264,10 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
         }
     }
 
-    // Compute each network's tip-contract instance id and publish it via
-    // /v1/status.
-    //
-    // A client cannot derive this for itself: BitcoinTipParameters includes
-    // `trusted_bridges`, which is per-deployment, not a fixed per-network
-    // constant. Without the bridge publishing it, an application would have to
-    // hardcode a contract id -- and a hardcoded id goes stale silently on the
-    // next re-key, with every read coming back looking like "no data yet".
-    let mut tip_contract_ids: HashMap<BitcoinNetwork, String> = HashMap::new();
+    // Log each network's tip-contract instance id, so an operator can check
+    // what readers will look for. Readers derive it themselves: the tip
+    // generation pointer names the code hash, and `BitcoinTipParameters` is
+    // the network plus the bridges they already trust.
     if let Some(p) = publisher.as_ref() {
         for net_cfg in &cfg.networks {
             let params = freenet_bitcoin_common::BitcoinTipParameters {
@@ -291,12 +276,7 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
             };
             match p.tip_key(&params) {
                 Ok(k) => {
-                    tracing::info!(
-                        network = ?net_cfg.network,
-                        contract = %k.id(),
-                        "tip contract id published via /v1/status"
-                    );
-                    tip_contract_ids.insert(net_cfg.network, k.id().to_string());
+                    tracing::info!(network = ?net_cfg.network, contract = %k.id(), "tip contract")
                 }
                 Err(e) => tracing::warn!("cannot derive tip contract id: {e}"),
             }
@@ -312,51 +292,33 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
     // which the bridge has already stopped writing to -- and a reader cannot
     // tell that from "no payments yet", which is the whole failure being
     // removed here.
+    let mut pointers_ok = true;
     if let Some(p) = publisher.as_ref() {
-        for result in bitcoin_freenet_bridge::generation::publish_pointers(p, &signer, &store).await
-        {
-            if let Err(e) = result {
-                // Not fatal: the bridge's real job is unaffected. What is lost
-                // is a reader's ability to notice a re-key, so say so plainly
-                // rather than at debug level.
-                tracing::error!(
-                    "could not publish a generation pointer ({e}); readers built against                      different contract WASM will see an empty page with no error"
-                );
-            }
-        }
+        pointers_ok = publish_pointers_logged(p, &signer, &store).await;
     }
 
-    let state = Arc::new(ServiceState {
-        cfg: cfg.clone(),
-        signer: Signer::load_or_create(&cfg.signing_key_path)?,
-        observers,
-        store: std::sync::Mutex::new(Store::open(&cfg.database_path)?),
-        address_code_hash,
-        tip_contract_ids,
-    });
-
-    let listen = cfg.listen.clone();
-    let app = router(state.clone());
-    let http = tokio::spawn(async move {
-        let listener = match tokio::net::TcpListener::bind(&listen).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("cannot bind {listen}: {e}");
-                return;
+    // The inbox worker gets its own OS thread, runtime, SQLite connection and
+    // Freenet connection, for the same reasons as the observer below.
+    let inbox = InboxWorker::new(&cfg, signer.key().clone(), wasm.inbox.clone());
+    std::thread::Builder::new()
+        .name("inbox".into())
+        .spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt.block_on(inbox.run()),
+                Err(e) => tracing::error!("cannot build the inbox runtime: {e}"),
             }
-        };
-        tracing::info!(%listen, "request service listening");
-        if let Err(e) = axum::serve(listener, app).await {
-            tracing::error!("http server stopped: {e}");
-        }
-    });
+        })
+        .context("spawning the inbox thread")?;
 
     // The observation loop runs on its own OS thread with its own SQLite
     // connection and its own current-thread runtime.
     //
     // rusqlite's Connection is deliberately not Sync, and the alternative --
     // holding a lock across every await in the loop -- would serialize the
-    // HTTP handler behind a multi-block catch-up scan. Thread-confining the
+    // inbox worker behind a multi-block catch-up scan. Thread-confining the
     // connection is also how SQLite prefers to be used.
     let observe_cfg = cfg.clone();
     let db_path = cfg.database_path.clone();
@@ -380,16 +342,76 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
                     return;
                 }
             };
-            rt.block_on(observation_loop(observe_cfg, signer, store, publisher));
+            rt.block_on(observation_loop(
+                observe_cfg,
+                signer,
+                store,
+                publisher,
+                pointers_ok,
+            ));
         })
         .context("spawning the observer thread")?;
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
-        _ = http => tracing::warn!("http server exited"),
-    }
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for a shutdown signal")?;
+    tracing::info!("shutting down");
     drop(observe);
     Ok(())
+}
+
+/// How often generation pointers are re-asserted once they published cleanly.
+const POINTER_REASSERT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// How soon to try again after a pointer failed to publish.
+const POINTER_RETRY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// How long until pointers are published again, given whether the last
+/// attempt published all of them.
+fn pointer_wait(all_published: bool) -> std::time::Duration {
+    if all_published {
+        POINTER_REASSERT
+    } else {
+        POINTER_RETRY
+    }
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_pointer_is_retried_sooner_than_a_healthy_one_is_reasserted() {
+        assert_eq!(pointer_wait(false), std::time::Duration::from_secs(5 * 60));
+        assert_eq!(pointer_wait(true), std::time::Duration::from_secs(30 * 60));
+    }
+}
+
+/// Publish every generation pointer, logging each failure. True when all
+/// published.
+///
+/// A failure is not fatal: the bridge's real job is unaffected. What is lost is
+/// a reader's ability to notice a re-key, or to find the inbox at all, so it is
+/// said plainly rather than at debug level.
+async fn publish_pointers_logged(
+    publisher: &FreenetPublisher,
+    signer: &Signer,
+    store: &Store,
+) -> bool {
+    let mut ok = true;
+    for result in
+        bitcoin_freenet_bridge::generation::publish_pointers(publisher, signer, store).await
+    {
+        if let Err(e) = result {
+            ok = false;
+            tracing::error!(
+                "could not publish a generation pointer ({e}); readers built against different \
+                 contract WASM will see an empty page with no error, and senders cannot find the \
+                 request inbox"
+            );
+        }
+    }
+    ok
 }
 
 /// Follow the chain and publish what we see.
@@ -402,6 +424,7 @@ async fn observation_loop(
     signer: Signer,
     store: Store,
     publisher: Option<Arc<FreenetPublisher>>,
+    pointers_ok: bool,
 ) {
     let mut observers: Vec<Observer> = Vec::new();
     for net_cfg in &cfg.networks {
@@ -410,15 +433,28 @@ async fn observation_loop(
         }
     }
 
+    // Generation pointers are re-asserted for the life of the process, not
+    // only at startup. A pointer that failed to publish would otherwise stay
+    // missing until a restart, and a reader resolving through it finds no
+    // inbox, or reads an old generation of the other contracts. Republishing
+    // an unchanged record is harmless.
+    let mut pointers_due = std::time::Instant::now() + pointer_wait(pointers_ok);
+
     loop {
         for obs in &observers {
             if let Err(e) = observe_once(obs, &signer, &store, publisher.as_deref()).await {
                 tracing::error!(network = ?obs.network(), "observation round failed: {e}");
             }
         }
-        // A short sleep rather than a tight loop. `wait_for_new_block` inside
-        // `observe_once` does the real waiting; this only paces the retry when
-        // something failed.
+        if let Some(p) = publisher.as_deref() {
+            if std::time::Instant::now() >= pointers_due {
+                let ok = publish_pointers_logged(p, &signer, &store).await;
+                pointers_due = std::time::Instant::now() + pointer_wait(ok);
+            }
+        }
+        // A short sleep rather than a tight loop. Once the observer has caught
+        // up, a round returns almost at once, so this is the polling interval:
+        // each network's tip is checked about every 2 seconds.
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
@@ -482,7 +518,8 @@ async fn observe_once(
     // Bounded by construction: the state prunes to TIP_RETAIN, the round
     // scans at most 50 blocks, and an entry is about 150 bytes.
     let mut tip_entries = Vec::new();
-    // Bound the work per round so a long catch-up cannot starve the service --
+    // Bound the work per round so a long catch-up cannot hold up the other
+    // networks, which this loop scans one after another --
     // but widen the bound when this round is going to retract something, so it
     // reaches the tip it will stamp those retractions with rather than leaving
     // blocks for the next round to contradict them from. See `scan_ceiling`.
@@ -640,16 +677,17 @@ async fn print_generation(cfg: BridgeConfig) -> Result<()> {
     let bridge = signer.bridge_id();
     println!("bridge   : {}", bridge.to_bs58());
 
-    let address_wasm = std::fs::read(cfg.contract_dir.join("bitcoin_address_contract.wasm"))?;
-    let tip_wasm = std::fs::read(cfg.contract_dir.join("bitcoin_tip_contract.wasm"))?;
-    println!(
-        "installed: {}  bitcoin_address_contract.wasm",
-        code_hash_b58(&freenet_bitcoin_generation::code_hash(&address_wasm))
-    );
-    println!(
-        "installed: {}  bitcoin_tip_contract.wasm",
-        code_hash_b58(&freenet_bitcoin_generation::code_hash(&tip_wasm))
-    );
+    let wasm = ContractWasm::load(&cfg.contract_dir)?;
+    for (bytes, file) in [
+        (&wasm.address, "bitcoin_address_contract.wasm"),
+        (&wasm.tip, "bitcoin_tip_contract.wasm"),
+        (&wasm.inbox, "bitcoin_inbox_contract.wasm"),
+    ] {
+        println!(
+            "installed: {}  {file}",
+            code_hash_b58(&freenet_bitcoin_generation::code_hash(bytes))
+        );
+    }
 
     for artifact in Artifact::ALL {
         match freenet_bitcoin_generation::pointer_id(&bridge, artifact) {
@@ -658,7 +696,7 @@ async fn print_generation(cfg: BridgeConfig) -> Result<()> {
         }
     }
 
-    let publisher = FreenetPublisher::connect(&cfg.freenet_ws, address_wasm, tip_wasm).await?;
+    let publisher = FreenetPublisher::connect(&cfg.freenet_ws, &wasm).await?;
     let store = Store::open(&cfg.database_path)?;
     let mut disagreed = false;
     for result in
@@ -700,9 +738,8 @@ async fn verify_address(
     let signer = Signer::load_or_create(&cfg.signing_key_path)?;
     let script = parse_address(address, network)?;
 
-    let address_wasm = std::fs::read(cfg.contract_dir.join("bitcoin_address_contract.wasm"))?;
-    let tip_wasm = std::fs::read(cfg.contract_dir.join("bitcoin_tip_contract.wasm"))?;
-    let publisher = FreenetPublisher::connect(&cfg.freenet_ws, address_wasm, tip_wasm).await?;
+    let wasm = ContractWasm::load(&cfg.contract_dir)?;
+    let publisher = FreenetPublisher::connect(&cfg.freenet_ws, &wasm).await?;
 
     let params = BitcoinAddressParameters {
         network,

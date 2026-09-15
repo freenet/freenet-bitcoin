@@ -1,0 +1,46 @@
+[package]
+name = "freenet-bitcoin-inbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A bridge's Ghost Key gated request inbox: how anyone asks a bridge to watch Bitcoin scripts, entirely through a Freenet contract."
+
+[dependencies]
+freenet-bitcoin-common = { workspace = true }
+serde = { workspace = true }
+ciborium = { workspace = true }
+ed25519-dalek = { workspace = true }
+blake3 = { workspace = true }
+# Ghost Key certificate chain verification. Its dependency tree pulls in `rand`
+# and so `getrandom`, which refuses a bare wasm32 target unless told where
+# randomness comes from. Verification never asks for randomness, so the
+# `custom` backend is selected and never called: a module verifying a real
+# production certificate imports nothing from the host at all (measured
+# 2026-09-10 against the contract import allowlist).
+ghostkey_lib = "0.2"
+getrandom = { version = "0.2", features = ["custom"] }
+# The ScopedPayload the ghostkey delegate signs. Its freenet-stdlib is 0.8,
+# this workspace's: two stdlib versions can never link.
+ghostkey-common = { version = "0.3", default-features = false }
+
+# Sealing a request to a bridge. Needed by senders and by the bridge; never by
+# the contract, which only ever sees ciphertext.
+x25519-dalek = { version = "2", features = ["static_secrets"], optional = true }
+chacha20poly1305 = { version = "0.10", optional = true }
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
+
+# A throwaway Ghost Key authority for other crates' tests. See `test_support`.
+freenet-stdlib = { workspace = true, optional = true }
+blind-rsa-signatures = { version = "=0.15.1", optional = true }
+rand = { version = "0.8", optional = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+freenet-stdlib = { workspace = true }
+blind-rsa-signatures = "=0.15.1"
+rand = "0.8"
+
+[features]
+seal = ["dep:x25519-dalek", "dep:chacha20poly1305", "dep:rand_core"]
+test-support = ["seal", "dep:freenet-stdlib", "dep:blind-rsa-signatures", "dep:rand"]

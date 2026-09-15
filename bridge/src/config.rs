@@ -5,29 +5,6 @@ use std::path::PathBuf;
 use freenet_bitcoin_common::BitcoinNetwork;
 use serde::{Deserialize, Serialize};
 
-/// Which service-authorization policy this operator runs.
-///
-/// This is the whole of "may this caller ask me to do work". It is an
-/// **operator** choice and appears nowhere in the Bitcoin contracts: another
-/// operator running `Open` produces observations that are byte-compatible with
-/// Freenet.org's, and every application keeps working.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
-#[serde(rename_all = "snake_case", tag = "mode")]
-pub enum AuthPolicy {
-    /// Serve anybody who asks. Right for a bridge you run for yourself.
-    #[default]
-    Open,
-    /// Serve holders of a valid Ghost Key — an anonymous certificate proving a
-    /// donation to Freenet. This is Freenet.org's policy, and the reason a
-    /// Ghost Key buys something concrete.
-    GhostKey {
-        /// Reject certificates whose chain does not reach this master key.
-        /// `None` uses the key compiled into `ghostkey_lib`.
-        #[serde(default)]
-        master_verifying_key_b64: Option<String>,
-    },
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NetworkConfig {
     pub network: BitcoinNetwork,
@@ -94,12 +71,6 @@ pub struct BridgeConfig {
     /// exactly why the evidence is there.
     pub signing_key_path: PathBuf,
     pub database_path: PathBuf,
-    /// Address the HTTP service listens on. Put a reverse proxy in front for
-    /// TLS; this should not face the internet directly.
-    #[serde(default = "default_listen")]
-    pub listen: String,
-    #[serde(default)]
-    pub auth: AuthPolicy,
     /// Freenet node WebSocket URL used to publish contract updates.
     #[serde(default = "default_freenet_ws")]
     pub freenet_ws: String,
@@ -107,10 +78,6 @@ pub struct BridgeConfig {
     /// contract keys and PUT the contracts themselves.
     pub contract_dir: PathBuf,
     pub networks: Vec<NetworkConfig>,
-}
-
-fn default_listen() -> String {
-    "127.0.0.1:8431".to_string()
 }
 
 fn default_freenet_ws() -> String {
@@ -139,9 +106,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_minimal_config_parses_and_defaults_to_open_access() {
-        // Defaulting to Open matters: the generic bridge must be usable by
-        // anyone without adopting Freenet.org's donation policy.
+    fn a_minimal_config_parses() {
         let cfg: BridgeConfig = toml::from_str(
             r#"
             signing_key_path = "/var/lib/btcbridge/key"
@@ -154,18 +119,21 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.auth, AuthPolicy::Open);
         assert_eq!(cfg.networks[0].deep_confirmations, 6);
-        assert_eq!(cfg.listen, "127.0.0.1:8431");
     }
 
+    /// The bridge used to serve HTTP, configured by `listen` and `auth`. A
+    /// config file still carrying them must keep loading after an upgrade:
+    /// refusing it would stop the bridge on restart over two settings that no
+    /// longer do anything.
     #[test]
-    fn ghost_key_policy_parses() {
+    fn a_config_written_for_the_old_http_service_still_parses() {
         let cfg: BridgeConfig = toml::from_str(
             r#"
             signing_key_path = "/k"
             database_path = "/d"
             contract_dir = "/c"
+            listen = "127.0.0.1:8431"
             auth = { mode = "ghost_key" }
 
             [[networks]]
@@ -174,7 +142,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert!(matches!(cfg.auth, AuthPolicy::GhostKey { .. }));
+        assert_eq!(cfg.networks[0].network, BitcoinNetwork::Bitcoin);
     }
 
     #[test]

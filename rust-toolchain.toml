@@ -9,10 +9,11 @@
 # rather than erroring — the failure looks exactly like "this address has no
 # activity yet".
 #
-# The bridge already mitigates the client half by publishing the current
-# `address_code_hash` and `tip_contract_id` over `/v1/status`, so a client that
-# re-resolves at runtime recovers automatically. The pin exists so the re-key
-# is a deliberate act rather than a side effect of a toolchain upgrade.
+# The bridge already mitigates the client half by publishing each contract's
+# current code hash in a generation pointer (see `freenet-bitcoin-generation`),
+# so a client that re-resolves at runtime recovers automatically. The pin
+# exists so the re-key is a deliberate act rather than a side effect of a
+# toolchain upgrade.
 #
 # When updating this pin: record the OUTGOING code hashes in
 # `legacy_contracts.toml` BEFORE changing the channel, then rebuild and commit

@@ -81,8 +81,10 @@ OUT="$BUILD_DIR/$CONTRACT_TARGET/release"
 
 NEW_ADDRESS_HASH=$(b3sum --no-names "$OUT/bitcoin_address_contract.wasm")
 NEW_TIP_HASH=$(b3sum --no-names "$OUT/bitcoin_tip_contract.wasm")
+NEW_INBOX_HASH=$(b3sum --no-names "$OUT/bitcoin_inbox_contract.wasm")
 echo "  address contract: $NEW_ADDRESS_HASH"
 echo "  tip contract:     $NEW_TIP_HASH"
+echo "  inbox contract:   $NEW_INBOX_HASH"
 
 # ---------------------------------------------------------------------------
 step "Check what the bridge is running now"
@@ -97,11 +99,21 @@ if [ -f "$CONTRACT_DIR/bitcoin_address_contract.wasm" ]; then
 else
   echo "  nothing installed yet"
 fi
+# Checked on its own: the inbox arrived later than the other two, so a bridge
+# can have them installed and not it.
+OLD_INBOX_HASH=""
+if [ -f "$CONTRACT_DIR/bitcoin_inbox_contract.wasm" ]; then
+  OLD_INBOX_HASH=$(b3sum --no-names "$CONTRACT_DIR/bitcoin_inbox_contract.wasm")
+  echo "  inbox contract:   $OLD_INBOX_HASH"
+fi
 
 # A generation being replaced must be recorded in legacy/ FIRST. The migration
 # probe walks that list to carry old observations forward; a generation left
 # out of it is not migrated, and its state is orphaned with no error anywhere.
-for pair in "address:$OLD_ADDRESS_HASH:$NEW_ADDRESS_HASH" "tip:$OLD_TIP_HASH:$NEW_TIP_HASH"; do
+# The inbox is not migrated (see legacy/inbox_contract.toml) but is recorded
+# the same way, so the check below can refuse a retired generation.
+for pair in "address:$OLD_ADDRESS_HASH:$NEW_ADDRESS_HASH" "tip:$OLD_TIP_HASH:$NEW_TIP_HASH" \
+            "inbox:$OLD_INBOX_HASH:$NEW_INBOX_HASH"; do
   what=${pair%%:*}; rest=${pair#*:}; old=${rest%%:*}; new=${rest#*:}
   [ -n "$old" ] || continue
   [ "$old" != "$new" ] || continue
@@ -115,7 +127,7 @@ done
 
 # The same check the webapp bundle carries, applied to the bytes about to be
 # installed: never deploy a generation the project has already retired.
-for pair in "address:$NEW_ADDRESS_HASH" "tip:$NEW_TIP_HASH"; do
+for pair in "address:$NEW_ADDRESS_HASH" "tip:$NEW_TIP_HASH" "inbox:$NEW_INBOX_HASH"; do
   what=${pair%%:*}; new=${pair#*:}
   if grep -q "$new" "legacy/${what}_contract.toml"; then
     die "the ${what} contract this tree builds ($new) is recorded in legacy/ as
@@ -134,6 +146,8 @@ if [ "$DO_BRIDGE" = 1 ]; then
       "$OUT/bitcoin_address_contract.wasm" "$CONTRACT_DIR/bitcoin_address_contract.wasm"
   run sudo install -m 0644 -o btcbridge -g btcbridge \
       "$OUT/bitcoin_tip_contract.wasm" "$CONTRACT_DIR/bitcoin_tip_contract.wasm"
+  run sudo install -m 0644 -o btcbridge -g btcbridge \
+      "$OUT/bitcoin_inbox_contract.wasm" "$CONTRACT_DIR/bitcoin_inbox_contract.wasm"
   run sudo systemctl restart "$SERVICE"
   if [ "$DRY_RUN" = 0 ]; then
     sleep 5
@@ -204,6 +218,8 @@ else
   echo "  bridge and webapp are on contract generation:"
   echo "    address $NEW_ADDRESS_HASH"
   echo "    tip     $NEW_TIP_HASH"
+  echo "  and the bridge reads its requests from inbox generation:"
+  echo "    inbox   $NEW_INBOX_HASH"
   echo
   echo "  Verify what a visitor sees, not what the logs say:"
   echo "    sudo -u btcbridge $BRIDGE_BIN --config $BRIDGE_CFG --print-generation"

@@ -1,0 +1,13 @@
+# Superseded generations of bitcoin-inbox-contract. See address_contract.toml
+# for the procedure: append the outgoing hash BEFORE rebuilding, and commit the
+# entry with the rebuilt WASM.
+#
+# Unlike the address and tip contracts, nothing is migrated forward from an old
+# inbox generation. Its entries are requests dated within about an hour of the
+# Bitcoin mainnet tip, and a sender knows its request was read when the inbox
+# holds a tombstone for it. A request left unread in a superseded inbox is
+# therefore not carried over: its sender resends to the generation the inbox
+# pointer names. Entries are recorded so scripts/deploy.sh can refuse to move
+# the bridge back onto a retired generation.
+#
+# No inbox generation has been deployed yet, so none is superseded.

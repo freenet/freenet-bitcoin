@@ -78,6 +78,7 @@ pub async fn publish_pointers(
         let hash = match artifact {
             Artifact::Address => publisher.address_code_hash(),
             Artifact::Tip => publisher.tip_code_hash(),
+            Artifact::Inbox => publisher.inbox_code_hash(),
         };
         out.push(publish_one(publisher, signer, store, artifact, hash).await);
     }

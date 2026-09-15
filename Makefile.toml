@@ -5,7 +5,7 @@ default_to_workspace = false
 CONTRACT_TARGET = "wasm32-unknown-unknown"
 
 [tasks.build-contracts]
-description = "Build both Bitcoin contracts to WASM"
+description = "Build the Bitcoin contracts to WASM"
 # Never `cargo build` directly. The build flags are part of a contract's
 # identity -- they are what stops the build machine's paths being compiled into
 # it -- so a second way to build these is a second contract.
@@ -19,7 +19,8 @@ dependencies = ["build-contracts"]
 script = '''
 ./scripts/check-wasm-imports.sh \
   target/${CONTRACT_TARGET}/release/bitcoin_address_contract.wasm \
-  target/${CONTRACT_TARGET}/release/bitcoin_tip_contract.wasm
+  target/${CONTRACT_TARGET}/release/bitcoin_tip_contract.wasm \
+  target/${CONTRACT_TARGET}/release/bitcoin_inbox_contract.wasm
 '''
 
 [tasks.code-hashes]
@@ -62,11 +63,12 @@ args = ["build", "--release", "-p", "bitcoin-freenet-bridge"]
 dependencies = ["sync-webapp-contracts"]
 command = "cargo"
 args = ["test", "-p", "freenet-bitcoin-common", "-p", "freenet-bitcoin-generation",
-        "-p", "bitcoin-freenet-bridge", "-p", "freenet-bitcoin-webapp"]
+        "-p", "bitcoin-freenet-bridge", "-p", "freenet-bitcoin-webapp",
+        "-p", "freenet-bitcoin-inbox", "--features", "freenet-bitcoin-inbox/seal"]
 
 [tasks.preflight]
 description = "Everything CI runs, before you push"
-dependencies = ["fmt-check", "clippy", "test", "check-imports", "code-hashes"]
+dependencies = ["fmt-check", "clippy", "clippy-inbox-contract", "test", "check-imports", "code-hashes"]
 
 [tasks.fmt-check]
 command = "cargo"
@@ -76,7 +78,14 @@ args = ["fmt", "--all", "--", "--check"]
 dependencies = ["sync-webapp-contracts"]
 command = "cargo"
 args = ["clippy", "--workspace", "--exclude", "bitcoin-address-contract",
-        "--exclude", "bitcoin-tip-contract", "--all-targets", "--", "-D", "warnings"]
+        "--exclude", "bitcoin-tip-contract", "--exclude", "bitcoin-inbox-contract",
+        "--all-targets", "--features", "freenet-bitcoin-inbox/seal", "--", "-D", "warnings"]
+
+[tasks.clippy-inbox-contract]
+description = "Lint the inbox contract on the target and features it ships with"
+command = "cargo"
+args = ["clippy", "-p", "bitcoin-inbox-contract", "--target", "${CONTRACT_TARGET}",
+        "--features", "contract", "--", "-D", "warnings"]
 
 [tasks.verify-merge]
 description = "Run the network's own merge-law verifier against both contracts"

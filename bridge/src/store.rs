@@ -12,11 +12,13 @@
 //!
 //! # It is also the most privacy-sensitive thing the bridge holds
 //!
-//! `watched_scripts` is the one place where "somebody asked about this
-//! address" is written down, and where a Ghost Key fingerprint sits next to a
-//! Bitcoin script. That mapping is deliberately confined to this file, is
-//! never replicated to Freenet, and is why `docs/privacy.md` says a bridge
-//! operator is trusted with correlation even though nobody else is.
+//! `watched_scripts` and `script_interests` are where "somebody asked about
+//! this address" is written down, and `script_interests` is where a Ghost Key
+//! sits next to a Bitcoin script: it records who asked for each script, which
+//! is what lets one requester's unwatch leave everyone else's interest in
+//! place. That mapping is deliberately confined to this file, is never
+//! replicated to Freenet, and is why `docs/privacy.md` says a bridge operator
+//! is trusted with correlation even though nobody else is.
 
 use std::path::Path;
 
@@ -39,6 +41,41 @@ pub struct Store {
     conn: Connection,
 }
 
+/// The requester recorded for a script someone watched before anyone asked
+/// for it through the inbox. No certificate certifies this key, so no request
+/// can ever withdraw it.
+///
+/// Zero bytes long: every requester is identified by a 32-byte Ghost Key, so
+/// no request can ever name this one. (An earlier version used the all-zero
+/// key, which a certificate can certify.)
+pub const OPERATOR_INTEREST: &[u8] = &[];
+
+/// One requester's request about one script.
+#[derive(Clone, Copy, Debug)]
+pub struct Interest<'a> {
+    pub network: BitcoinNetwork,
+    pub script: &'a [u8],
+    pub ghostkey: &'a [u8; 32],
+    pub watching: bool,
+    /// When the sender made the request, by the sender's clock.
+    pub request_ms: u64,
+}
+
+/// What [`Store::set_interest`] did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InterestChange {
+    /// Not newer than this requester's last request about this script.
+    Stale,
+    /// Would take this requester past its limit of watched scripts.
+    OverCap,
+    /// The requester now wants the script.
+    Watching,
+    /// The requester no longer wants it; `last` when nobody else does either.
+    Withdrawn { last: bool },
+    /// A withdrawal from a requester that was not watching it.
+    Unchanged,
+}
+
 /// A script the bridge is currently synchronizing.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WatchedScript {
@@ -56,12 +93,19 @@ impl Store {
             std::fs::create_dir_all(dir).ok();
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-        // WAL so a long block scan does not block the HTTP handler, and
+        // WAL so a long block scan does not block the inbox worker, and
         // NORMAL sync because losing the last few writes costs a rescan, not
         // correctness.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // The observer and the inbox worker each hold a connection and both
+        // write, so a write that meets the other's lock has to wait its turn.
+        // This restates rusqlite's own default (5 s, set in `Connection::open`
+        // as of 0.40), which is why removing it changes nothing today; it is
+        // kept so the reliance is written down and survives a change of that
+        // default.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let s = Store { conn };
         s.migrate()?;
         Ok(s)
@@ -76,6 +120,17 @@ impl Store {
     }
 
     fn migrate(&self) -> anyhow::Result<()> {
+        // `script_interests` first shipped with one `since_ms` column and no
+        // record of withdrawals, on a branch that never ran against a real
+        // database. Such a table holds nothing worth keeping and would stop
+        // the index below, so it is replaced.
+        if self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('script_interests') WHERE name = 'since_ms'")?
+            .exists([])?
+        {
+            self.conn.execute_batch("DROP TABLE script_interests;")?;
+        }
         self.conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS chain_checkpoint (
@@ -189,13 +244,44 @@ impl Store {
                 code_hash  BLOB NOT NULL
             );
 
-            -- Single-use challenges for service authorization. Rows are
-            -- deleted on use, which is what makes a captured authorization
-            -- non-replayable.
-            CREATE TABLE IF NOT EXISTS challenges (
-                challenge  BLOB PRIMARY KEY,
-                issued_ms  INTEGER NOT NULL
+            -- Who asked for each script, by Ghost Key, and whether they still
+            -- want it: one row per (script, requester) holding that
+            -- requester's latest request. A withdrawal is kept for a day, so a
+            -- delayed older Watch cannot bring the interest back. Never
+            -- replicated. See the module docs.
+            CREATE TABLE IF NOT EXISTS script_interests (
+                network        TEXT NOT NULL,
+                script_pubkey  BLOB NOT NULL,
+                ghostkey       BLOB NOT NULL,
+                watching       INTEGER NOT NULL,
+                request_ms     INTEGER NOT NULL,
+                recorded_ms    INTEGER NOT NULL,
+                PRIMARY KEY (network, script_pubkey, ghostkey)
             );
+            CREATE INDEX IF NOT EXISTS script_interests_by_ghostkey
+                ON script_interests (ghostkey, watching);
+
+            -- The inbox's own bookkeeping. Today only `signed_floor`, the
+            -- highest floor this bridge has signed: entries below it are never
+            -- acted on, even if a stale copy of the inbox presents them again.
+            CREATE TABLE IF NOT EXISTS inbox_meta (
+                name   TEXT PRIMARY KEY,
+                value  INTEGER NOT NULL
+            );
+
+            -- Inbox entries already acted on. A tombstone can fail to land,
+            -- and without this record a Watch whose tombstone was lost would
+            -- be acted on again after the same requester's later Unwatch had
+            -- been, bringing back an interest they withdrew. Pruned once the
+            -- inbox floor passes an entry, because the inbox drops the entry
+            -- itself from then on.
+            CREATE TABLE IF NOT EXISTS inbox_handled (
+                entry_key     BLOB PRIMARY KEY,
+                entry_height  INTEGER NOT NULL
+            );
+
+            -- Left behind by the HTTP request service this bridge used to run.
+            DROP TABLE IF EXISTS challenges;
             "#,
         )?;
         Ok(())
@@ -220,11 +306,10 @@ impl Store {
         }))
     }
 
-    /// Move the checkpoint BACKWARD so a newly-watched script gets backfilled.
-    ///
-    /// Without this, `scan_from_height` on a watch request is silently ignored
-    /// and a script added today never sees a payment made yesterday -- the
-    /// bridge would only ever scan forward from wherever it happened to be.
+    /// Move the checkpoint back to `height`, never forward, and never create
+    /// one. Only the startup rewinds call this (the demo scripts' backfill and
+    /// the tip contract's refill), before the observer starts. A watch request
+    /// does not: see freenet/freenet-bitcoin#7.
     ///
     /// Rewinding is safe because rescanning is idempotent: claims are keyed by
     /// digest, so re-observing a payment produces a claim the contract already
@@ -264,9 +349,10 @@ impl Store {
                  (network, script_pubkey, scan_from_height, is_public_demo, first_seen_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(network, script_pubkey) DO UPDATE SET
-                 -- Keep the EARLIEST scan height ever requested: a later
-                 -- requester asking to scan from a high block must not make us
-                 -- forget history an earlier one is relying on.
+                 -- Keep the lowest height recorded. Nothing reads it to
+                 -- decide a scan yet (freenet/freenet-bitcoin#7); once a
+                 -- backfill does, a later requester must not cut short the
+                 -- history an earlier one asked for.
                  scan_from_height = MIN(scan_from_height, ?3),
                  is_public_demo   = MAX(is_public_demo, ?4)",
             params![
@@ -625,38 +711,196 @@ impl Store {
         Ok(n > 0)
     }
 
-    // --- challenges --------------------------------------------------------
+    // --- who asked for each script ------------------------------------------
 
-    pub fn issue_challenge(&self, challenge: &[u8], now_ms: i64) -> anyhow::Result<()> {
+    /// Record one requester's latest request about one script.
+    ///
+    /// Requests are applied in the order their sender made them, by
+    /// `request_ms`, whatever order they arrive in: a request no newer than
+    /// the one already recorded for that requester and script changes
+    /// nothing. Call inside [`Store::with_transaction`] together with the
+    /// watch change it implies, so the two cannot come apart.
+    pub fn set_interest(
+        &self,
+        i: &Interest,
+        max_per_ghostkey: usize,
+        now_ms: i64,
+    ) -> anyhow::Result<InterestChange> {
+        let net = i.network.as_str();
+        let gk = i.ghostkey.to_vec();
+        let request_ms = i.request_ms.min(i64::MAX as u64) as i64;
+        let existing: Option<(bool, i64)> = self
+            .conn
+            .query_row(
+                "SELECT watching, request_ms FROM script_interests
+                 WHERE network = ?1 AND script_pubkey = ?2 AND ghostkey = ?3",
+                params![net, i.script, gk],
+                |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        if let Some((prev_watching, prev)) = existing {
+            // Same millisecond: a withdrawal wins over a watch, so a Watch and
+            // an Unwatch that tie end unwatched whichever arrives first.
+            let newer = request_ms > prev || (request_ms == prev && prev_watching && !i.watching);
+            if !newer {
+                return Ok(InterestChange::Stale);
+            }
+        }
+        let was_watching = existing.is_some_and(|(w, _)| w);
+
+        // A withdrawal is kept so a delayed older Watch cannot land after it.
+        // Each requester may hold a bounded number, like watches, or one could
+        // fill the table; a day's pruning clears them. The bound counts every
+        // withdrawal the requester holds, and at the bound a withdrawal of a
+        // script it never watched is simply not recorded.
+        if !i.watching && existing.is_none() {
+            let held: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM script_interests WHERE ghostkey = ?1 AND watching = 0",
+                params![gk],
+                |r| r.get(0),
+            )?;
+            if held as usize >= max_per_ghostkey {
+                return Ok(InterestChange::Unchanged);
+            }
+        }
+
+        if i.watching && !was_watching {
+            let held: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM script_interests WHERE ghostkey = ?1 AND watching = 1",
+                params![gk],
+                |r| r.get(0),
+            )?;
+            if held as usize >= max_per_ghostkey {
+                return Ok(InterestChange::OverCap);
+            }
+            // A script watched before anyone asked for it through the inbox,
+            // an operator's demo script or one registered before the inbox
+            // existed, has no requester on record. Give it one that never
+            // leaves, so inbox requesters leaving cannot end it.
+            if self.watchers(i.network, i.script)? == 0 && self.is_watched(i.network, i.script)? {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO script_interests
+                         (network, script_pubkey, ghostkey, watching, request_ms, recorded_ms)
+                     VALUES (?1, ?2, ?3, 1, 0, ?4)",
+                    params![net, i.script, OPERATOR_INTEREST.to_vec(), now_ms],
+                )?;
+            }
+        }
+
         self.conn.execute(
-            "INSERT OR REPLACE INTO challenges (challenge, issued_ms) VALUES (?1, ?2)",
-            params![challenge, now_ms],
+            "INSERT INTO script_interests
+                 (network, script_pubkey, ghostkey, watching, request_ms, recorded_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(network, script_pubkey, ghostkey) DO UPDATE SET
+                 watching = ?4, request_ms = ?5, recorded_ms = ?6",
+            params![net, i.script, gk, i.watching as i64, request_ms, now_ms],
+        )?;
+
+        Ok(match (i.watching, was_watching) {
+            (true, _) => InterestChange::Watching,
+            (false, false) => InterestChange::Unchanged,
+            (false, true) => InterestChange::Withdrawn {
+                last: self.watchers(i.network, i.script)? == 0,
+            },
+        })
+    }
+
+    /// How many requesters currently want `script`.
+    fn watchers(&self, net: BitcoinNetwork, script: &[u8]) -> anyhow::Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM script_interests
+             WHERE network = ?1 AND script_pubkey = ?2 AND watching = 1",
+            params![net.as_str(), script],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Forget withdrawals recorded before `cutoff_ms`. A withdrawal only has
+    /// to outlive any older request still in the inbox, which is hours.
+    pub fn prune_withdrawals_before(&self, cutoff_ms: i64) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM script_interests WHERE watching = 0 AND recorded_ms < ?1",
+            params![cutoff_ms],
         )?;
         Ok(())
     }
 
-    /// Consume a challenge. Returns true only if it existed and was fresh.
-    ///
-    /// Deleting on consumption is what makes an intercepted authorization
-    /// useless to replay, so this must stay a single atomic delete rather than
-    /// a check followed by a delete.
-    pub fn consume_challenge(
-        &self,
-        challenge: &[u8],
-        now_ms: i64,
-        ttl_ms: i64,
-    ) -> anyhow::Result<bool> {
-        let n = self.conn.execute(
-            "DELETE FROM challenges WHERE challenge = ?1 AND issued_ms > ?2",
-            params![challenge, now_ms - ttl_ms],
-        )?;
-        Ok(n > 0)
+    // --- inbox bookkeeping --------------------------------------------------
+
+    /// The highest floor this bridge's key has signed for its inbox, whether
+    /// this bridge sent it or read it back from the inbox.
+    pub fn signed_floor(&self) -> anyhow::Result<Option<u32>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM inbox_meta WHERE name = 'signed_floor'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|v| v as u32))
     }
 
-    pub fn purge_expired_challenges(&self, now_ms: i64, ttl_ms: i64) -> anyhow::Result<()> {
+    /// Record a floor this bridge signed. Only ever raises the record.
+    pub fn set_signed_floor(&self, height: u32) -> anyhow::Result<()> {
         self.conn.execute(
-            "DELETE FROM challenges WHERE issued_ms <= ?1",
-            params![now_ms - ttl_ms],
+            "INSERT INTO inbox_meta (name, value) VALUES ('signed_floor', ?1)
+             ON CONFLICT(name) DO UPDATE SET value = MAX(value, ?1)",
+            params![height as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Run `f` as one SQLite transaction: everything it writes lands, or none
+    /// of it does. Taken as a write transaction from the start, so it waits
+    /// for the observer's lock (see the busy timeout in `open`) rather than
+    /// failing when it first writes.
+    pub fn with_transaction<T>(&self, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let out = f()?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Run arbitrary SQL, for tests that need to arrange a failure.
+    #[cfg(test)]
+    pub fn execute_for_test(&self, sql: &str) -> anyhow::Result<()> {
+        self.conn.execute_batch(sql)?;
+        Ok(())
+    }
+
+    // --- inbox entries already acted on ------------------------------------
+
+    pub fn is_handled(&self, entry_key: &[u8; 32]) -> anyhow::Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM inbox_handled WHERE entry_key = ?1",
+                params![entry_key.to_vec()],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    pub fn mark_handled(&self, entry_key: &[u8; 32], entry_height: u32) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO inbox_handled (entry_key, entry_height) VALUES (?1, ?2)",
+            params![entry_key.to_vec(), entry_height as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Forget entries dated below `floor`: the inbox has dropped them, so
+    /// they can never be presented again.
+    pub fn prune_handled_below(&self, floor: u32) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM inbox_handled WHERE entry_height < ?1",
+            params![floor as i64],
         )?;
         Ok(())
     }
@@ -689,8 +933,9 @@ mod tests {
 
     #[test]
     fn a_second_requester_cannot_raise_the_scan_floor() {
-        // If a later request could push scan_from_height up, it would silently
-        // blind the bridge to history an earlier watcher depends on.
+        // Informational until freenet/freenet-bitcoin#7. Once a backfill reads
+        // it, a later request pushing it up would cut short the history an
+        // earlier watcher asked for.
         let s = store();
         s.add_watch(&watch(b"abc", 100, false), 0).unwrap();
         s.add_watch(&watch(b"abc", 900_000, false), 0).unwrap();
@@ -698,6 +943,37 @@ mod tests {
             s.watched(BitcoinNetwork::Signet).unwrap()[0].scan_from_height,
             100
         );
+    }
+
+    /// A rewind that moved the cursor forward would skip the blocks between,
+    /// and every payment in them would never be seen.
+    #[test]
+    fn a_rewind_only_ever_moves_the_checkpoint_back() {
+        let s = store();
+        let at = |h| BlockAnchor {
+            height: h,
+            hash: BlockHash([0; 32]),
+        };
+        s.set_checkpoint(BitcoinNetwork::Signet, &at(500)).unwrap();
+        s.rewind_checkpoint_to(BitcoinNetwork::Signet, 800).unwrap();
+        assert_eq!(
+            s.checkpoint(BitcoinNetwork::Signet)
+                .unwrap()
+                .unwrap()
+                .height,
+            500
+        );
+        s.rewind_checkpoint_to(BitcoinNetwork::Signet, 300).unwrap();
+        assert_eq!(
+            s.checkpoint(BitcoinNetwork::Signet)
+                .unwrap()
+                .unwrap()
+                .height,
+            300
+        );
+        s.rewind_checkpoint_to(BitcoinNetwork::Bitcoin, 300)
+            .unwrap();
+        assert!(s.checkpoint(BitcoinNetwork::Bitcoin).unwrap().is_none());
     }
 
     #[test]
@@ -719,29 +995,285 @@ mod tests {
         assert_eq!(s.watched(BitcoinNetwork::Bitcoin).unwrap().len(), 1);
     }
 
+    fn interest<'a>(
+        script: &'a [u8],
+        gk: &'a [u8; 32],
+        watching: bool,
+        request_ms: u64,
+    ) -> Interest<'a> {
+        Interest {
+            network: BitcoinNetwork::Signet,
+            script,
+            ghostkey: gk,
+            watching,
+            request_ms,
+        }
+    }
+
     #[test]
-    fn a_challenge_can_only_be_used_once() {
-        // The property that makes a captured authorization useless.
+    fn a_requesters_latest_request_wins_whatever_order_they_arrive_in() {
         let s = store();
-        s.issue_challenge(b"nonce", 1000).unwrap();
-        assert!(s.consume_challenge(b"nonce", 1000, 60_000).unwrap());
-        assert!(
-            !s.consume_challenge(b"nonce", 1000, 60_000).unwrap(),
-            "a challenge must not be reusable"
+        let gk = [1u8; 32];
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &gk, false, 20), 10, 0)
+                .unwrap(),
+            InterestChange::Unchanged
+        );
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &gk, true, 10), 10, 0)
+                .unwrap(),
+            InterestChange::Stale,
+            "the earlier Watch arrived after the later Unwatch, and changes nothing"
+        );
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &gk, true, 30), 10, 0)
+                .unwrap(),
+            InterestChange::Watching
+        );
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &gk, true, 30), 10, 0)
+                .unwrap(),
+            InterestChange::Stale,
+            "the same request read twice"
         );
     }
 
     #[test]
-    fn an_expired_challenge_is_refused() {
+    fn a_withdrawal_says_whether_anyone_still_wants_the_script() {
         let s = store();
-        s.issue_challenge(b"nonce", 1_000).unwrap();
-        assert!(!s.consume_challenge(b"nonce", 1_000_000, 60_000).unwrap());
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        s.set_interest(&interest(b"abc", &a, true, 1), 10, 0)
+            .unwrap();
+        s.set_interest(&interest(b"abc", &b, true, 1), 10, 0)
+            .unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &a, false, 2), 10, 0)
+                .unwrap(),
+            InterestChange::Withdrawn { last: false }
+        );
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &b, false, 2), 10, 0)
+                .unwrap(),
+            InterestChange::Withdrawn { last: true }
+        );
     }
 
     #[test]
-    fn an_unknown_challenge_is_refused() {
+    fn a_requester_cannot_watch_more_than_its_limit() {
         let s = store();
-        assert!(!s.consume_challenge(b"never-issued", 0, 60_000).unwrap());
+        let gk = [1u8; 32];
+        s.set_interest(&interest(b"s1", &gk, true, 1), 2, 0)
+            .unwrap();
+        s.set_interest(&interest(b"s2", &gk, true, 1), 2, 0)
+            .unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"s3", &gk, true, 1), 2, 0)
+                .unwrap(),
+            InterestChange::OverCap
+        );
+        s.set_interest(&interest(b"s1", &gk, false, 2), 2, 0)
+            .unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"s3", &gk, true, 3), 2, 0)
+                .unwrap(),
+            InterestChange::Watching,
+            "a withdrawal frees room"
+        );
+    }
+
+    #[test]
+    fn a_script_watched_before_the_inbox_gets_an_owner_that_never_leaves() {
+        let s = store();
+        s.add_watch(&watch(b"old", 0, false), 0).unwrap();
+        let gk = [1u8; 32];
+        s.set_interest(&interest(b"old", &gk, true, 1), 10, 0)
+            .unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"old", &gk, false, 2), 10, 0)
+                .unwrap(),
+            InterestChange::Withdrawn { last: false }
+        );
+    }
+
+    #[test]
+    fn old_withdrawals_are_forgotten() {
+        let s = store();
+        let gk = [1u8; 32];
+        s.set_interest(&interest(b"abc", &gk, false, 20), 10, 1_000)
+            .unwrap();
+        s.prune_withdrawals_before(2_000).unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &gk, true, 10), 10, 3_000)
+                .unwrap(),
+            InterestChange::Watching,
+            "once forgotten, the withdrawal no longer outranks an older request"
+        );
+    }
+
+    #[test]
+    fn the_signed_floor_only_rises() {
+        let s = store();
+        assert_eq!(s.signed_floor().unwrap(), None);
+        s.set_signed_floor(100).unwrap();
+        s.set_signed_floor(90).unwrap();
+        assert_eq!(s.signed_floor().unwrap(), Some(100));
+    }
+
+    #[test]
+    fn a_failed_transaction_leaves_nothing_behind() {
+        let s = store();
+        let r: anyhow::Result<()> = s.with_transaction(|| {
+            s.mark_handled(&[1; 32], 100)?;
+            anyhow::bail!("the step after it failed")
+        });
+        assert!(r.is_err());
+        assert!(!s.is_handled(&[1; 32]).unwrap());
+    }
+
+    #[test]
+    fn a_withdrawal_beats_a_watch_made_in_the_same_millisecond() {
+        let gk = [1u8; 32];
+        let s = store();
+        s.set_interest(&interest(b"abc", &gk, true, 5), 10, 0)
+            .unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &gk, false, 5), 10, 0)
+                .unwrap(),
+            InterestChange::Withdrawn { last: true },
+            "the Unwatch read second still applies"
+        );
+        let s = store();
+        s.set_interest(&interest(b"abc", &gk, false, 5), 10, 0)
+            .unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &gk, true, 5), 10, 0)
+                .unwrap(),
+            InterestChange::Stale,
+            "the Watch read second does not"
+        );
+    }
+
+    #[test]
+    fn withdrawals_of_scripts_never_watched_are_bounded_per_requester() {
+        let s = store();
+        let gk = [1u8; 32];
+        for script in [b"s1", b"s2", b"s3"] {
+            s.set_interest(&interest(script, &gk, false, 5), 2, 0)
+                .unwrap();
+        }
+        assert_eq!(
+            s.set_interest(&interest(b"s2", &gk, true, 1), 2, 0)
+                .unwrap(),
+            InterestChange::Stale,
+            "the second withdrawal was recorded"
+        );
+        assert_eq!(
+            s.set_interest(&interest(b"s3", &gk, true, 1), 2, 0)
+                .unwrap(),
+            InterestChange::Watching,
+            "the third was over the bound and was not"
+        );
+    }
+
+    /// The operator's interest is marked by a key no request can carry. The
+    /// all-zero key can be certified, so it is just another requester.
+    #[test]
+    fn the_all_zero_key_is_an_ordinary_requester_not_the_operator() {
+        let s = store();
+        s.add_watch(&watch(b"old", 0, false), 0).unwrap();
+        let zero = [0u8; 32];
+        s.set_interest(&interest(b"old", &zero, true, 1), 10, 0)
+            .unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"old", &zero, false, 2), 10, 0)
+                .unwrap(),
+            InterestChange::Withdrawn { last: false },
+            "the operator still wants it"
+        );
+    }
+
+    #[test]
+    fn a_database_from_the_first_inbox_commit_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE script_interests (
+                     network TEXT NOT NULL, script_pubkey BLOB NOT NULL,
+                     ghostkey BLOB NOT NULL, since_ms INTEGER NOT NULL,
+                     PRIMARY KEY (network, script_pubkey, ghostkey));
+                 INSERT INTO script_interests VALUES ('signet', X'00', X'01', 0);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &[1u8; 32], true, 1), 10, 0)
+                .unwrap(),
+            InterestChange::Watching
+        );
+        drop(s);
+        let s = Store::open(&path).expect("and again, once migrated");
+        assert_eq!(
+            s.set_interest(&interest(b"abc", &[1u8; 32], true, 1), 10, 0)
+                .unwrap(),
+            InterestChange::Stale,
+            "what was recorded after migrating survives the next open"
+        );
+    }
+
+    /// The observer and the inbox worker write one database through two
+    /// connections. A write that meets the other's lock must wait its turn,
+    /// not fail.
+    ///
+    /// The waiting transaction reads before it writes, as `set_interest` does.
+    /// That is the case a deferred transaction gets wrong: its read pins a
+    /// snapshot the other connection's commit then makes stale, and its write
+    /// fails at once instead of waiting.
+    #[test]
+    fn a_write_waits_for_the_other_connections_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        let a = Store::open(&path).unwrap();
+        let b = Store::open(&path).unwrap();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            a.with_transaction(|| {
+                a.mark_handled(&[1; 32], 100)?;
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        locked_rx.recv().unwrap();
+        // b's write blocks inside SQLite, so the lock is released from
+        // another thread, well inside the busy timeout.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            release_tx.send(()).unwrap();
+        });
+        b.with_transaction(|| {
+            b.is_handled(&[1; 32])?;
+            b.mark_handled(&[2; 32], 100)
+        })
+        .expect("waits for the lock, then writes");
+        releaser.join().unwrap();
+        holder.join().unwrap();
+        assert!(b.is_handled(&[1; 32]).unwrap());
+        assert!(b.is_handled(&[2; 32]).unwrap());
+    }
+
+    #[test]
+    fn handled_entries_are_forgotten_once_the_floor_passes_them() {
+        let s = store();
+        s.mark_handled(&[1; 32], 100).unwrap();
+        s.mark_handled(&[2; 32], 110).unwrap();
+        s.prune_handled_below(105).unwrap();
+        assert!(!s.is_handled(&[1; 32]).unwrap());
+        assert!(s.is_handled(&[2; 32]).unwrap());
     }
 
     #[test]
