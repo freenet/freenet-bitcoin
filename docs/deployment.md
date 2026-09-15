@@ -288,16 +288,19 @@ contract id as `serving the request inbox`.
   network up to the tip, that tip is past the watch's day by Bitcoin's own
   clock (its median time past, less two hours' margin), and Bitcoin Core has
   finished syncing, so downtime, a node cut off from its peers, or a clock
-  stepped forward never leaves blocks from its day unscanned (in practice a
-  watch lasts about 27 hours) (the bridge warns when the observer is
+  stepped forward never leaves blocks from its day unscanned (the bridge warns when the observer is
   more than 6 blocks behind; #11 is the known exception, a reorg round that
-  fails part-way); not while the floor is held;
+  fails part-way, and a reorg deeper than the confirmations a watch waits for
+  can still bring in a payment from a day already ended); not while the floor is held;
   and not while a request from its own requester waits on the removal budget,
   since that may be its renewal (only while that request is still in the
   inbox: one the caps push out or the floor passes no longer counts). Expiry
   needs both clocks past a watch's day, so a wrong host clock delays expiry
   rather than hastening it, except that a clock behind when a watch is
-  recorded shortens the watch by as much: keep it synchronized (NTP). Every scan also covers the scripts of
+  recorded shortens the watch by as much: keep it synchronized (NTP). In
+  practice a watch lasts about 27 hours. The bridge warns when Bitcoin Core
+  has been syncing for ten minutes, or its chain's clock is more than six
+  hours behind, since no watch ends on that network meanwhile. Every scan also covers the scripts of
   payments a reorg moved out of their block and that have not been seen
   again, watched or not, so such a payment is found where it was re-mined
   rather than left retracted. Where a

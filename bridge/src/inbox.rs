@@ -37,7 +37,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::SigningKey;
-use freenet_bitcoin_common::{from_cbor, to_cbor, BitcoinNetwork, BridgeId};
+use freenet_bitcoin_common::{from_cbor, to_cbor, BitcoinNetwork, BlockHash, BridgeId};
 use freenet_bitcoin_inbox::seal::unseal;
 use freenet_bitcoin_inbox::{
     Action, EntryKey, InboxDelta, InboxEntry, InboxParameters, InboxStateV1, RemovalBatch,
@@ -128,7 +128,8 @@ fn floor_held(until: Option<Instant>) -> bool {
 /// How far past a watch's day the scanned tip's median time past must be
 /// before the watch ends: two hours, the most a block's timestamp may run
 /// ahead of the clock of a node that accepts it. So the block whose timestamp
-/// is the tip's median time past was accepted after the day ended, and every
+/// is the tip's median time past could not have been accepted by an honest
+/// node before the day ended, and every
 /// block above the tip came later still: every block from the day lies at or
 /// below the tip the observer scanned. The median time past runs about an
 /// hour behind the clock, so a watch lasts about 27 hours in practice.
@@ -138,15 +139,27 @@ pub const MEDIAN_TIME_MARGIN_MS: i64 = 2 * 60 * 60 * 1000;
 /// behind its headers at every block, which is not worth a line.
 const SYNC_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// How long each network's node has been syncing, so that one stuck syncing
-/// is reported, once per spell.
+/// How far the chain's clock may lag the host's before it is reported: six
+/// hours. It normally runs about an hour behind; this far behind, the node
+/// has had no block for hours, as when it is cut off from its peers, and no
+/// watch ends on its network meanwhile.
+const CHAIN_STALL_WARN_MS: i64 = 6 * 60 * 60 * 1000;
+
+/// Whether the chain's clock (`median_ms`) lags the host's enough to report.
+fn chain_stalled(now_ms: i64, median_ms: i64) -> bool {
+    now_ms.saturating_sub(median_ms) > CHAIN_STALL_WARN_MS
+}
+
+/// How long each network has been in some condition (its node syncing, its
+/// chain's clock stalled), so that one stuck in it is reported, once per
+/// spell.
 #[derive(Debug, Default)]
-struct SyncWatch {
+struct SpellWatch {
     since: HashMap<BitcoinNetwork, Instant>,
     warned: BTreeSet<BitcoinNetwork>,
 }
 
-impl SyncWatch {
+impl SpellWatch {
     /// The networks to report now: syncing for [`SYNC_WARN_AFTER`] and not
     /// yet reported in this spell.
     fn update(&mut self, syncing: &BTreeSet<BitcoinNetwork>, now: Instant) -> Vec<BitcoinNetwork> {
@@ -184,6 +197,9 @@ pub struct Tips {
     /// Each network's tip's median time past, in milliseconds: Bitcoin's own
     /// clock, which a watch's day must pass as well as the host's.
     pub median_time_ms: HashMap<BitcoinNetwork, i64>,
+    /// Each network's tip block, read with its height, so the observer's
+    /// checkpoint can be matched to the very block whose clock was read.
+    pub tip_hash: HashMap<BitcoinNetwork, BlockHash>,
 }
 
 impl Tips {
@@ -435,11 +451,16 @@ impl Processor<'_> {
             }
             // Checked once here, to spare a transaction per watch while the
             // observer is behind, and again inside each, where it counts.
-            // Caught up means exactly at the tip: a checkpoint above it means
-            // the node went back (a reindex), and has not fetched those blocks
-            // again yet.
-            let scanned_to = self.store.checkpoint(net)?.map(|c| c.height);
-            if scanned_to != Some(tip) {
+            // Caught up means exactly at the tip, block for block: a
+            // checkpoint above it means the node went back (a reindex), and
+            // one at its height on another chain has not scanned the blocks
+            // whose clock the cutoff above was read from.
+            let Some(&tip_hash) = tips.tip_hash.get(&net) else {
+                continue;
+            };
+            let checkpoint = self.store.checkpoint(net)?;
+            let scanned_to = checkpoint.as_ref().map(|c| c.height);
+            if checkpoint.is_none_or(|c| c.height != tip || c.hash != tip_hash) {
                 lagging = true;
                 let behind = scanned_to.map(|h| tip.saturating_sub(h));
                 // Once per lag, not once per pass: a stuck observer is
@@ -465,7 +486,10 @@ impl Processor<'_> {
                 // Checked inside the transaction that ends the watch, so the
                 // observer's progress and outputs are read as they stand then.
                 let outcome = self.store.with_transaction(|| {
-                    let scanned = self.store.checkpoint(net)?.is_some_and(|c| c.height == tip);
+                    let scanned = self
+                        .store
+                        .checkpoint(net)?
+                        .is_some_and(|c| c.height == tip && c.hash == tip_hash);
                     if !scanned {
                         return Ok(Expiry::Unscanned);
                     }
@@ -486,8 +510,8 @@ impl Processor<'_> {
                         stopped += usize::from(last);
                     }
                     Ok(Expiry::Kept) => {}
-                    // The observer moved since the check above (a reorg to
-                    // the same height): tried again on the next pass.
+                    // The observer moved since the check above, usually to
+                    // a block that arrived mid-pass: tried again next pass.
                     Ok(Expiry::Unscanned) => lagging = true,
                     // One watch that cannot end must not keep the rest from
                     // ending; it is tried again on the next pass.
@@ -877,7 +901,8 @@ impl InboxWorker {
         let key = self.contract_key()?;
         let mut session = Session {
             chains: HashMap::new(),
-            sync: SyncWatch::default(),
+            sync: SpellWatch::default(),
+            stall: SpellWatch::default(),
             quiet: QuietCache::default(),
         };
 
@@ -1062,7 +1087,8 @@ struct Session {
     /// failure.
     chains: HashMap<BitcoinNetwork, ChainClient>,
     quiet: QuietCache,
-    sync: SyncWatch,
+    sync: SpellWatch,
+    stall: SpellWatch,
 }
 
 impl Session {
@@ -1087,6 +1113,7 @@ impl Session {
                 Ok(s) => {
                     tips.by_network.insert(n.network, s.tip.height);
                     tips.median_time_ms.insert(n.network, s.median_time_ms);
+                    tips.tip_hash.insert(n.network, s.tip.hash);
                     if !s.synced {
                         tips.syncing.insert(n.network);
                     }
@@ -1101,6 +1128,19 @@ impl Session {
             tracing::warn!(
                 network = ?n,
                 "Bitcoin Core has been syncing for ten minutes; no watch ends on this network until it has finished"
+            );
+        }
+        let now = now_ms();
+        let stalled: BTreeSet<BitcoinNetwork> = tips
+            .median_time_ms
+            .iter()
+            .filter(|&(_, &m)| chain_stalled(now, m))
+            .map(|(&n, _)| n)
+            .collect();
+        for n in self.stall.update(&stalled, Instant::now()) {
+            tracing::warn!(
+                network = ?n,
+                "Bitcoin Core's chain has not moved for hours by its own clock (is it cut off from its peers?); no watch ends on this network until it does"
             );
         }
         tips
@@ -1187,6 +1227,10 @@ mod tests {
             median_time_ms: HashMap::from([
                 (BitcoinNetwork::Bitcoin, i64::MAX),
                 (SIGNET, i64::MAX),
+            ]),
+            tip_hash: HashMap::from([
+                (BitcoinNetwork::Bitcoin, BlockHash([0; 32])),
+                (SIGNET, BlockHash([0; 32])),
             ]),
             ..Default::default()
         }
@@ -1510,6 +1554,76 @@ mod tests {
         payment(&store, None);
         tick(&store, &tips(), T0 + 25 * HOUR);
         assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+    }
+
+    #[test]
+    fn nothing_ends_on_a_network_whose_chain_clock_cannot_be_read() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        let mut no_clock = tips();
+        no_clock.median_time_ms.remove(&SIGNET);
+        tick(&store, &no_clock, T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+    }
+
+    /// A checkpoint at the tip's height on another chain, as in a reorg the
+    /// observer has not caught yet, has not scanned the blocks whose clock
+    /// was read.
+    #[test]
+    fn a_checkpoint_on_another_chain_at_the_tips_height_is_not_caught_up() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        store
+            .set_checkpoint(
+                SIGNET,
+                &BlockAnchor {
+                    height: SIGNET_TIP,
+                    hash: BlockHash([9; 32]),
+                },
+            )
+            .unwrap();
+        let pass = run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        assert!(pass.gated);
+        tick(&store, &tips(), T0 + 26 * HOUR);
+        assert!(watched(&store).is_empty());
+    }
+
+    /// The observer can move between the check before expiry and the one
+    /// inside a watch's transaction. That watch is kept, and the pass marked
+    /// to run again rather than cached as quiet. A trigger moves the
+    /// checkpoint to another chain as the first watch ends.
+    #[test]
+    fn a_watch_the_observer_moves_past_mid_pass_is_tried_again() {
+        let store = Store::open_in_memory().unwrap();
+        let (a, b) = (&ghostkeys()[0], &ghostkeys()[1]);
+        watch_at(&store, a, 1, T0);
+        let second = entry(b, FLOOR + 1, &request(Action::Watch, b"spk2", 1));
+        run_at(&store, &inbox(FLOOR, vec![second]), &tips(), T0);
+        caught_up(&store);
+        store
+            .execute_for_test(
+                "CREATE TRIGGER moved AFTER UPDATE ON script_interests
+                 WHEN NEW.watching = 0
+                 BEGIN UPDATE chain_checkpoint
+                 SET block_hash = X'0909090909090909090909090909090909090909090909090909090909090909'
+                 WHERE network = 'signet'; END;",
+            )
+            .unwrap();
+        let pass = run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0 + 25 * HOUR);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk2".to_vec()],
+            "the first ended, the second was kept"
+        );
+        assert!(pass.gated, "the kept watch is tried again");
+    }
+
+    #[test]
+    fn a_chain_clock_hours_behind_is_reported_and_its_usual_lag_is_not() {
+        assert!(!chain_stalled(T0, T0 - HOUR), "the usual lag");
+        assert!(!chain_stalled(T0, T0 - 6 * HOUR));
+        assert!(chain_stalled(T0, T0 - 6 * HOUR - 1));
     }
 
     #[test]
@@ -2352,7 +2466,7 @@ mod tests {
 
     #[test]
     fn a_node_still_syncing_after_ten_minutes_is_reported_once() {
-        let mut w = SyncWatch::default();
+        let mut w = SpellWatch::default();
         let syncing = BTreeSet::from([SIGNET]);
         assert!(w.update(&syncing, at(0)).is_empty());
         assert!(w.update(&syncing, at(599)).is_empty());
