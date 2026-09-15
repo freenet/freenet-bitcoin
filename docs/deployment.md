@@ -308,7 +308,8 @@ contract id as `serving the request inbox`.
   second time.
 - **Reading stops at the removal budget** (`REMOVAL_BUDGET`, 4096 entries).
   Every entry read is removed, and removals last until the floor passes them,
-  about half an hour. Past the budget, new requests wait in the inbox for the
+  about half an hour for a request dated as senders date them and at most
+  five blocks for any. Past the budget, new requests wait in the inbox for the
   floor, and the bridge logs that they do. Each Ghost Key gets a 64th of the
   budget (`REMOVAL_SHARE_PER_GHOSTKEY`), so one sender cannot spend it for
   everyone; a sender past its share waits the same way while others are read.
@@ -376,7 +377,9 @@ enabling `txindex`.
 - **What the inbox does not stop.** 64 Ghost Keys can hold every place in it.
   A request gives its place back once read, and each Ghost Key is read only up
   to its share of the removal budget, so the cost is 64 Ghost Keys each
-  sending about 66 requests every half hour. That is the same act as spending
+  sending about 66 requests every five blocks, about 50 minutes (dated at the
+  top of the window, which also outranks honest requests by height). That is
+  the same act as spending
   the removal budget, after which new requests wait for the floor. See
   `MAX_ENTRIES` and `REMOVAL_BUDGET` in `inbox/src/lib.rs` for why neither is
   raised freely: more entries mean more certificates for every peer to check,

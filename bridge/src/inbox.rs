@@ -85,7 +85,8 @@ const WITHDRAWAL_MEMORY_MS: i64 = 24 * 60 * 60 * 1000;
 /// budget, and while it is spent the bridge reads nothing, so 64 Ghost Keys
 /// would hold every place in the inbox without sending again. With it,
 /// spending the budget takes 64 Ghost Keys each having 64 requests read within
-/// about half an hour (about 66 sent each, to hold the inbox as well), and a
+/// five blocks, about 50 minutes (about 66 sent each, to hold the inbox as
+/// well), and a
 /// key past its share only makes its own requests
 /// wait. An honest sender watching many addresses names up to 32 in one
 /// request.

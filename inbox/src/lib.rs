@@ -175,9 +175,14 @@ pub fn sender_height(floor: u32) -> u32 {
 /// entry gives its place up, so they must keep sending; and the bridge reads
 /// each Ghost Key only up to its share of [`REMOVAL_BUDGET`], a 64th, before
 /// the floor moves on. So the cheapest hold is also what spends the budget:
-/// 64 Ghost Keys each sending about 66 requests every half hour. The caps
-/// rank newest first, and ties at one height are
-/// broken by entry key, which a sender can grind. Raising it means more
+/// 64 Ghost Keys each sending about 66 requests every five blocks, about 50
+/// minutes. Five, not three, because nothing makes an attacker date entries
+/// as senders do: dated at the top of the window, they and their removals
+/// last until the floor passes that height, and they outrank every entry
+/// dated by [`sender_height`] by height alone. The caps rank newest first, and
+/// ties at one height are broken by entry key, which a sender can grind. What
+/// honest senders get is the refill: between two bridge passes each Ghost Key
+/// can put back only its two entries. Raising it means more
 /// entries, and every entry's certificate is an RSA check each time a peer
 /// validates the state.
 pub const MAX_ENTRIES: usize = 128;
@@ -214,7 +219,7 @@ pub const REMOVED_PREFIX_BYTES: usize = 8;
 /// database within one window and so signed a second, unrelated set of
 /// batches for the same heights. Two such losses in one window can exceed
 /// this bound, and peers then refuse the bridge's deltas until the floor
-/// passes the old batches, about half an hour.
+/// passes the old batches, within five blocks.
 pub const MAX_REMOVED: usize = 8192;
 
 /// How many entries the bridge reads before the floor must move on.
@@ -223,8 +228,8 @@ pub const MAX_REMOVED: usize = 8192;
 /// the floor has not yet passed reach this; new requests then wait for the
 /// floor. The bridge also gives each Ghost Key only a share of it (a 64th,
 /// `REMOVAL_SHARE_PER_GHOSTKEY` in the bridge), so reaching it takes 64
-/// Ghost Keys each having 64 requests read within about half an hour (about
-/// 66 sent each, to hold every place in the inbox as well; see
+/// Ghost Keys each having 64 requests read within five blocks, about 50
+/// minutes (about 66 sent each, to hold every place in the inbox as well; see
 /// [`MAX_ENTRIES`]).
 pub const REMOVAL_BUDGET: usize = MAX_REMOVED / 2;
 
@@ -557,9 +562,31 @@ pub(crate) fn verify_entry(
     certified: &VerifyingKey,
     params: &InboxParameters,
 ) -> Result<InboxEntryBody, String> {
+    certifies(certified, entry)?;
+    verify_entry_signature(entry, params)
+}
+
+/// Check that a verified certificate certifies the Ghost Key an entry claims.
+pub(crate) fn certifies(certified: &VerifyingKey, entry: &InboxEntry) -> Result<(), String> {
     if entry.ghostkey.0 != *certified.as_bytes() {
         return Err("entry names a different Ghost Key than its certificate certifies".into());
     }
+    Ok(())
+}
+
+/// Check one entry's own signature under the Ghost Key it claims, returning
+/// the signed body. The claim means nothing until [`certifies`] ties it to a
+/// verified certificate.
+///
+/// Callers run this before any certificate check. Certificates are public, so
+/// anyone can pair real ones with forged entries; checked in this order, such
+/// a forgery costs a peer an Ed25519 check rather than an RSA check.
+pub(crate) fn verify_entry_signature(
+    entry: &InboxEntry,
+    params: &InboxParameters,
+) -> Result<InboxEntryBody, String> {
+    let claimed = VerifyingKey::from_bytes(&entry.ghostkey.0)
+        .map_err(|_| "entry names a Ghost Key that is not a valid point")?;
     if entry.scoped_payload.len() > MAX_SCOPED_PAYLOAD_BYTES {
         return Err(format!(
             "scoped payload is {} bytes, limit is {MAX_SCOPED_PAYLOAD_BYTES}",
@@ -571,7 +598,7 @@ pub(crate) fn verify_entry(
         .as_ref()
         .try_into()
         .map_err(|_| "signature must be 64 bytes")?;
-    certified
+    claimed
         .verify_strict(&entry.scoped_payload, &Signature::from_bytes(&sig))
         .map_err(|_| "the Ghost Key did not sign this entry")?;
 

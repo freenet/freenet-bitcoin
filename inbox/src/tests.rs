@@ -1167,6 +1167,64 @@ fn a_delta_larger_than_the_caps_is_refused_before_anything_is_checked() {
     assert_eq!(bytes(&s), before);
 }
 
+/// Each batch is hashed whole before it can be passed over, so a delta's
+/// total length is bounded before any is. Without that, batches dated below
+/// the floor, which change nothing and are accepted, could be sent at any size.
+#[test]
+fn a_delta_naming_more_removals_than_a_state_may_is_refused() {
+    let at =
+        |h: u32, start: u64, n: usize| RemovalBatch::sign(&bridge_sk(), h, &prefixes(start, n));
+    let mut s = open_at(100);
+    let before = bytes(&s);
+    let half = MAX_REMOVED / 2;
+    apply_removals(&mut s, vec![at(90, 0, half), at(91, 1 << 32, half)]).unwrap();
+    assert_eq!(bytes(&s), before, "batches below the floor change nothing");
+    assert!(apply_removals(&mut s, vec![at(90, 0, half), at(91, 1 << 32, half + 1)]).is_err());
+    assert_eq!(bytes(&s), before);
+}
+
+/// Certificates and the floor are public, so anyone can pair real ones with
+/// forged entries. Such a delta or state must fail on the entries' own
+/// signatures, before any certificate's RSA check is spent on it.
+#[test]
+fn a_forged_entry_fails_before_its_certificate_is_checked() {
+    // Under another master key every certificate fails, so which error comes
+    // back says which check ran first.
+    let mut other = params();
+    other.ghostkey_master.0 = SigningKey::from_bytes(&[9u8; 32])
+        .verifying_key()
+        .to_bytes();
+
+    let w = entry(&ghostkeys()[0], 104, 1);
+    let mut forged = w.clone();
+    let mut sig = forged.entry.signature.as_ref().to_vec();
+    sig[0] ^= 1;
+    forged.entry.signature = ByteBuf(sig);
+
+    let submit = |d: &WireEntry| {
+        open_at(100).apply_delta(
+            &other,
+            &InboxDelta {
+                entries: vec![d.clone()],
+                ..Default::default()
+            },
+        )
+    };
+    let err = submit(&w).unwrap_err();
+    assert!(err.contains("does not chain"), "{err}");
+    let err = submit(&forged).unwrap_err();
+    assert!(err.contains("did not sign"), "{err}");
+
+    let s = with_entries(100, &[w]);
+    let err = s.verify(&other).unwrap_err();
+    assert!(err.contains("does not chain"), "{err}");
+    let mut bad = s.clone();
+    bad.entries.clear();
+    bad.entries.insert(forged.entry.key(), forged.entry.clone());
+    let err = bad.verify(&other).unwrap_err();
+    assert!(err.contains("did not sign"), "{err}");
+}
+
 /// A delta refused part-way must leave nothing of itself behind.
 #[test]
 fn a_refused_delta_changes_nothing() {

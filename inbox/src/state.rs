@@ -8,10 +8,10 @@ use ghostkey_lib::ghost_key_certificate::GhostkeyCertificateV1;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    canonical_certificate, cert_key, verify_certificate, verify_entry, BatchKey, ByteBuf, CertKey,
-    EntryKey, GhostkeyId, InboxEntry, InboxEntryBody, InboxParameters, RemovalBatch, RemovedPrefix,
-    SignedFloor, MAX_ENTRIES, MAX_ENTRIES_PER_GHOSTKEY, MAX_REMOVAL_BATCHES, MAX_REMOVED,
-    WINDOW_BLOCKS,
+    canonical_certificate, cert_key, certifies, verify_certificate, verify_entry,
+    verify_entry_signature, BatchKey, ByteBuf, CertKey, EntryKey, GhostkeyId, InboxEntry,
+    InboxEntryBody, InboxParameters, RemovalBatch, RemovedPrefix, SignedFloor, MAX_ENTRIES,
+    MAX_ENTRIES_PER_GHOSTKEY, MAX_REMOVAL_BATCHES, MAX_REMOVED, WINDOW_BLOCKS,
 };
 use freenet_bitcoin_common::from_cbor;
 
@@ -325,6 +325,14 @@ impl InboxStateV1 {
             return Err("state holds a certificate no entry uses".into());
         }
 
+        // Each entry's own signature before any certificate. Certificates and
+        // the floor are public, so anyone can build a state of real ones and
+        // forged entries; checked in this order, that costs a peer Ed25519
+        // checks and no RSA.
+        for e in self.entries.values() {
+            verify_entry_signature(e, params)?;
+        }
+
         // The expensive half: at most one RSA check per entry.
         let mut certified: BTreeMap<CertKey, VerifyingKey> = BTreeMap::new();
         for (k, pem) in &self.certificates {
@@ -337,7 +345,7 @@ impl InboxStateV1 {
             certified.insert(*k, verify_certificate(pem, &params.ghostkey_master)?);
         }
         for e in self.entries.values() {
-            verify_entry(e, &certified[&e.cert], params)?;
+            certifies(&certified[&e.cert], e)?;
         }
         Ok(())
     }
@@ -433,6 +441,15 @@ impl InboxStateV1 {
             return Err(format!(
                 "a delta may carry at most {MAX_ENTRIES} entries and \
                  {MAX_REMOVAL_BATCHES} removal batches"
+            ));
+        }
+        // Their total length too, since each batch is hashed whole before it
+        // can be passed over. An honest delta's batches come from one state
+        // in normal form, whose bound is the same.
+        let named: usize = delta.removals.iter().map(RemovalBatch::len).sum();
+        if named > MAX_REMOVED {
+            return Err(format!(
+                "a delta may name at most {MAX_REMOVED} removed entries, this one names {named}"
             ));
         }
         // An honest delta comes from a state in normal form, or is one
@@ -535,6 +552,8 @@ impl InboxStateV1 {
                     // the rest of the delta is not refused on its account.
                     continue;
                 }
+                // Before the certificate, for the reason given in `verify`.
+                verify_entry_signature(&w.entry, params)?;
                 let pem = canonical_certificate(&w.certificate_pem)?;
                 let ck = cert_key(&pem);
                 if ck != w.entry.cert {
@@ -548,7 +567,7 @@ impl InboxStateV1 {
                         v
                     }
                 };
-                verify_entry(&w.entry, &vk, params)?;
+                certifies(&vk, &w.entry)?;
                 next.certificates.insert(ck, pem);
                 next.entries.insert(key, w.entry.clone());
             }
