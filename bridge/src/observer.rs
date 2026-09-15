@@ -174,22 +174,27 @@ impl ReorgOutcome {
     }
 }
 
-/// The scripts one round scans blocks for: the watch list, and the script of
-/// every outpoint the reorg orphaned.
+/// The scripts one round scans blocks for: the watch list, and every script
+/// with a payment in doubt, one a reorg moved out of its block and that no
+/// scan has found since (`Store::scripts_with_unconfirmed_outputs`, which
+/// includes this round's orphans).
 ///
 /// A watch can end between a payment's confirmation and a reorg that moves
-/// it: its requester withdrew it, or it ran out. Scanning the replacement
-/// blocks only for watched scripts would then miss the payment where it was
-/// re-mined, and `Observer::retraction_claims` would sign a retraction for a
-/// payment still on the chain, which nothing later corrects because nobody
-/// scans that script any more. Scanning the orphans' scripts as well finds it.
+/// it: its requester withdrew it, or it ran out. Scanning only watched
+/// scripts would then miss the payment where it was re-mined, in this round
+/// or any later one, and the retraction signed when the reorg was found would
+/// stand for a payment still on the chain. Scanning the scripts in doubt as
+/// well finds it, and a later confirmation supersedes the retraction. A
+/// script stays in doubt until then; one whose payment was double-spent stays
+/// for good, which costs a comparison per output scanned and publishes
+/// nothing.
 ///
-/// For the scan only: a script scanned here because of an orphan is not
+/// For the scan only: a script scanned here because it is in doubt is not
 /// watched, and must not be given a scan watermark, which would claim
 /// coverage of blocks nobody scanned for it.
-pub fn scan_set(watched: &[Vec<u8>], orphaned: &[OrphanedOutpoint]) -> Vec<Vec<u8>> {
+pub fn scan_set(watched: &[Vec<u8>], in_doubt: &[Vec<u8>]) -> Vec<Vec<u8>> {
     let mut scan = watched.to_vec();
-    for (script, _) in orphaned {
+    for script in in_doubt {
         if !scan.contains(script) {
             scan.push(script.clone());
         }
@@ -200,27 +205,16 @@ pub fn scan_set(watched: &[Vec<u8>], orphaned: &[OrphanedOutpoint]) -> Vec<Vec<u
 #[cfg(test)]
 mod scan_set_tests {
     use super::*;
-    use freenet_bitcoin_common::Txid;
-
-    fn orphan(script: &[u8], vout: u32) -> OrphanedOutpoint {
-        (
-            script.to_vec(),
-            OutPoint {
-                txid: Txid([1; 32]),
-                vout,
-            },
-        )
-    }
 
     #[test]
-    fn a_round_after_a_reorg_scans_the_orphans_scripts_too_once_each() {
+    fn a_round_scans_the_scripts_in_doubt_too_once_each() {
         let watched = vec![b"a".to_vec()];
         let scan = scan_set(
             &watched,
-            &[orphan(b"a", 0), orphan(b"gone", 0), orphan(b"gone", 1)],
+            &[b"a".to_vec(), b"gone".to_vec(), b"gone".to_vec()],
         );
         assert_eq!(scan, vec![b"a".to_vec(), b"gone".to_vec()]);
-        assert_eq!(scan_set(&watched, &[]), watched, "no reorg, no change");
+        assert_eq!(scan_set(&watched, &[]), watched, "nothing in doubt");
     }
 }
 

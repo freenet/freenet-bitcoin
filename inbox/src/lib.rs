@@ -169,9 +169,12 @@ pub fn sender_height(floor: u32) -> u32 {
 /// Entries, which are requests not yet read, the inbox holds at once.
 ///
 /// **This is also what censoring the inbox costs.** Holding every place takes
-/// `MAX_ENTRIES / MAX_ENTRIES_PER_GHOSTKEY` Ghost Keys, 64 of them, and since
-/// a read entry gives its place up, they must keep sending faster than the
-/// bridge reads. The caps rank newest first, and ties at one height are
+/// `MAX_ENTRIES / MAX_ENTRIES_PER_GHOSTKEY` Ghost Keys, 64 of them. A read
+/// entry gives its place up, so they must keep sending; and the bridge reads
+/// each Ghost Key only up to its share of [`REMOVAL_BUDGET`], a 64th, before
+/// the floor moves on. So the cheapest hold is also what spends the budget:
+/// 64 Ghost Keys each sending about 66 requests every half hour. The caps
+/// rank newest first, and ties at one height are
 /// broken by entry key, which a sender can grind. Raising it means more
 /// entries, and every entry's certificate is an RSA check each time a peer
 /// validates the state.

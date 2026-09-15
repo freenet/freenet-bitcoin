@@ -253,6 +253,16 @@ impl InboxStateV1 {
                 self.removals.len()
             ));
         }
+        // Bounded before the pairwise check below, which costs the number of
+        // batches squared times their length, and before any signature: an
+        // unsigned state can carry batches built to make every comparison
+        // walk to the end.
+        let removed_count = self.removed_count();
+        if removed_count > MAX_REMOVED {
+            return Err(format!(
+                "inbox names {removed_count} removed entries, cap is {MAX_REMOVED}"
+            ));
+        }
         for (k, b) in &self.removals {
             b.check_shape()?;
             if b.key() != *k {
@@ -271,12 +281,6 @@ impl InboxStateV1 {
             {
                 return Err("a removal batch another covers is still present".into());
             }
-        }
-        let removed_count = self.removed_count();
-        if removed_count > MAX_REMOVED {
-            return Err(format!(
-                "inbox names {removed_count} removed entries, cap is {MAX_REMOVED}"
-            ));
         }
         for b in self.removals.values() {
             b.verify(&params.bridge)?;
@@ -395,6 +399,10 @@ impl InboxStateV1 {
     /// which an earlier check covered.
     ///
     /// All or nothing: a delta refused part-way leaves the state as it was.
+    /// Whether a delta carrying an invalid batch is refused can depend on what
+    /// this peer holds, since a batch covered by one held here is passed over
+    /// unchecked; that changes which invalid deltas are refused, never what a
+    /// valid one does.
     /// An entry or batch outside the window is dropped, never an error. Below
     /// it, a peer whose floor was lower sent it. Above it, this peer's floor
     /// lags the sender's: every valid state's records lie within its own
@@ -420,6 +428,22 @@ impl InboxStateV1 {
                  {MAX_REMOVAL_BATCHES} removal batches"
             ));
         }
+        // An honest delta comes from a state in normal form, or is one
+        // sender's submission, so it never carries more entries from one Ghost
+        // Key than a state may hold. Refusing more before anything is verified
+        // keeps one Ghost Key from making every peer check a hundred of its
+        // entries per delta. The key counted is the one each entry claims; an
+        // entry that claims another fails `verify_entry` below.
+        let mut per: BTreeMap<GhostkeyId, usize> = BTreeMap::new();
+        for w in &delta.entries {
+            let c = per.entry(w.entry.ghostkey).or_insert(0);
+            *c += 1;
+            if *c > MAX_ENTRIES_PER_GHOSTKEY {
+                return Err(format!(
+                    "a delta may carry at most {MAX_ENTRIES_PER_GHOSTKEY} entries from one Ghost Key"
+                ));
+            }
+        }
 
         let mut next = self.clone();
 
@@ -437,6 +461,15 @@ impl InboxStateV1 {
                     next.floor = Some(f.clone());
                 }
             }
+        }
+
+        // Batches the floor has passed go before anything below is decided on
+        // their strength, whatever this delta carries: otherwise a floor that
+        // rose in this very delta could leave a stale batch hiding an entry
+        // that `normalize` would then keep, and which entry survived would
+        // depend on the order the two peers merged in.
+        if let Some(floor) = next.floor_height() {
+            next.removals.retain(|_, b| b.height >= floor);
         }
 
         if !delta.removals.is_empty() {
@@ -471,11 +504,9 @@ impl InboxStateV1 {
                     next.removals.insert(key, b.clone());
                 }
             }
-            // Before the removed set is built from them below: batches the
-            // floor has passed, and batches another covers, go now rather
-            // than at `normalize`, so an entry is skipped as removed only on
-            // the strength of a batch the result keeps.
-            next.removals.retain(|_, b| b.height >= floor);
+            // Before the removed set is built from them below, so an entry is
+            // skipped as removed only on the strength of a batch the result
+            // keeps.
             next.drop_covered();
         }
 

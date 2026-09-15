@@ -119,7 +119,13 @@ impl Store {
         Ok(s)
     }
 
+    /// One transaction, so two connections opening one database at once
+    /// cannot both run a step meant to run once, such as adding a column.
     fn migrate(&self) -> anyhow::Result<()> {
+        self.with_transaction(|| self.migrate_steps())
+    }
+
+    fn migrate_steps(&self) -> anyhow::Result<()> {
         // `script_interests` first shipped with one `since_ms` column and no
         // record of withdrawals, on a branch that never ran against a real
         // database. Such a table holds nothing worth keeping and would stop
@@ -541,6 +547,24 @@ impl Store {
         Ok(rows)
     }
 
+    /// Scripts with an output a reorg moved out of its block and that no scan
+    /// has seen again since, each once: the observer keeps scanning for them,
+    /// watched or not, until it does. See `observer::scan_set`.
+    pub fn scripts_with_unconfirmed_outputs(
+        &self,
+        net: BitcoinNetwork,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT script_pubkey FROM observed_outputs
+             WHERE network = ?1 AND block_height IS NULL",
+        )?;
+        let rows = stmt
+            .query_map(params![net.as_str()], |r| r.get::<_, Vec<u8>>(0))?
+            .filter_map(|row| row.ok())
+            .collect();
+        Ok(rows)
+    }
+
     /// Mark the outputs in orphaned blocks as unconfirmed again.
     pub fn unconfirm_above(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<()> {
         self.conn.execute(
@@ -854,7 +878,8 @@ impl Store {
     ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut stmt = self.conn.prepare(
             "SELECT script_pubkey, ghostkey FROM script_interests
-             WHERE network = ?1 AND watching = 1 AND recorded_ms < ?2 AND ghostkey != ?3",
+             WHERE network = ?1 AND watching = 1 AND recorded_ms < ?2 AND ghostkey != ?3
+             ORDER BY script_pubkey, ghostkey",
         )?;
         let rows = stmt
             .query_map(
@@ -1364,6 +1389,30 @@ mod tests {
             InterestChange::Stale,
             "what was recorded after migrating survives the next open"
         );
+    }
+
+    /// Only outputs still moved out of their block put a script in doubt,
+    /// and each script once.
+    #[test]
+    fn only_payments_a_reorg_moved_and_nobody_found_again_are_in_doubt() {
+        let s = store();
+        let net = BitcoinNetwork::Signet;
+        let at = Some((100, BlockHash([1; 32])));
+        s.record_output(net, b"moved", &[1; 32], 0, 5, None)
+            .unwrap();
+        s.record_output(net, b"moved", &[1; 32], 1, 5, None)
+            .unwrap();
+        s.record_output(net, b"settled", &[2; 32], 0, 5, at)
+            .unwrap();
+        s.record_output(BitcoinNetwork::Bitcoin, b"elsewhere", &[3; 32], 0, 5, None)
+            .unwrap();
+        assert_eq!(
+            s.scripts_with_unconfirmed_outputs(net).unwrap(),
+            vec![b"moved".to_vec()]
+        );
+        s.record_output(net, b"moved", &[1; 32], 0, 5, at).unwrap();
+        s.record_output(net, b"moved", &[1; 32], 1, 5, at).unwrap();
+        assert!(s.scripts_with_unconfirmed_outputs(net).unwrap().is_empty());
     }
 
     /// A database whose `inbox_handled` predates the requester column keeps

@@ -285,11 +285,13 @@ contract id as `serving the request inbox`.
   a client typically watches an address for one payment. A client that still
   wants the script sends the Watch again, with a newer timestamp. A watch
   ends only once the observer has scanned its network up to the tip, so
-  downtime never leaves blocks from its day unscanned, and not while the
-  floor is held or requests wait on the removal budget, since one of them may
-  be its renewal. A reorg's rescan also covers the scripts of the payments it
-  orphaned, watched or not, so a payment moved to another block is found
-  again rather than retracted. Where a
+  downtime never leaves blocks from its day unscanned (the bridge warns when
+  the observer is more than 6 blocks behind); not while the floor is held;
+  and not while a request from its own requester waits on the removal budget,
+  since that may be its renewal. Every scan also covers the scripts of
+  payments a reorg moved out of their block and that have not been seen
+  again, watched or not, so such a payment is found where it was re-mined
+  rather than left retracted. Where a
   payment to the script has been seen and is not yet `deep_confirmations`
   deep, the watch lasts until it is: after a reorg the observer rescans only
   watched scripts, so ending the watch sooner could have it retract a payment
@@ -370,9 +372,10 @@ enabling `txindex`.
   observe, and a Watch beyond its sender's limit, whose extra scripts it
   drops with a warning in the log. A sender learns what a Watch did from the
   address contract, not from the inbox.
-- **What the inbox does not stop.** Whoever holds 64 Ghost Keys can hold every
-  place in it, for as long as they keep sending faster than the bridge reads,
-  and 64 Ghost Keys each sending 64 requests within about half an hour spend
+- **What the inbox does not stop.** 64 Ghost Keys can hold every place in it.
+  A request gives its place back once read, and each Ghost Key is read only up
+  to its share of the removal budget, so the cost is 64 Ghost Keys each
+  sending about 66 requests every half hour. That is the same act as spending
   the removal budget, after which new requests wait for the floor. See
   `MAX_ENTRIES` and `REMOVAL_BUDGET` in `inbox/src/lib.rs` for why neither is
   raised freely: more entries mean more certificates for every peer to check,

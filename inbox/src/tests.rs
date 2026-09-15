@@ -167,6 +167,17 @@ fn add_entries(s: &mut InboxStateV1, entries: Vec<WireEntry>) {
     .unwrap();
 }
 
+/// A state that received `es` one delta each, as peers receive a stream of
+/// submissions: a single delta may carry at most two entries from one Ghost
+/// Key.
+fn one_by_one(floor: u32, es: &[WireEntry]) -> InboxStateV1 {
+    let mut s = open_at(floor);
+    for w in es {
+        add_entries(&mut s, vec![w.clone()]);
+    }
+    s
+}
+
 /// `n` prefixes naming no entry, from `start`: removals still count them.
 fn prefixes(start: u64, n: usize) -> BTreeSet<RemovedPrefix> {
     (start..start + n as u64)
@@ -564,7 +575,7 @@ fn one_ghostkey_keeps_only_its_newest_records() {
     let es: Vec<WireEntry> = (0..(MAX_ENTRIES_PER_GHOSTKEY as u32 + 3))
         .map(|i| entry(gk, 100 + (i % WINDOW_BLOCKS), i as u8))
         .collect();
-    let s = with_entries(100, &es);
+    let s = one_by_one(100, &es);
     assert_eq!(s.entries.len(), MAX_ENTRIES_PER_GHOSTKEY);
     let lowest_kept = s.entries.values().map(|e| e.mainnet_height).min().unwrap();
     let highest_dropped = es
@@ -665,6 +676,74 @@ fn a_batch_already_covered_is_passed_over_without_being_checked() {
     stale.signature.0[0] ^= 1;
     apply_removals(&mut s, vec![stale]).unwrap();
     assert_eq!(bytes(&s), before);
+}
+
+/// An honest delta carries at most two entries from one Ghost Key: it comes
+/// from a state in normal form, or is one sender's submission. More is
+/// refused before anything is verified, so one Ghost Key cannot make every
+/// peer check a hundred of its entries per delta.
+#[test]
+fn a_delta_with_more_entries_from_one_ghostkey_than_a_state_holds_is_refused() {
+    let gk = &ghostkeys()[0];
+    let es: Vec<WireEntry> = (0..=MAX_ENTRIES_PER_GHOSTKEY as u8)
+        .map(|i| entry(gk, 103, i))
+        .collect();
+    let mut s = open_at(100);
+    let before = bytes(&s);
+    let err = s
+        .apply_delta(
+            &params(),
+            &InboxDelta {
+                entries: es,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(err.contains("from one Ghost Key"), "{err}");
+    assert_eq!(bytes(&s), before);
+}
+
+/// A state can carry batches built so that every comparison between them
+/// walks to the end, and needs no signature to do it. The total is bounded
+/// first: two batches, one covering the other, and too many prefixes between
+/// them, must fail on the total rather than on the covering.
+#[test]
+fn verify_bounds_the_removals_before_comparing_them() {
+    let mut s = open_at(100);
+    for n in [MAX_REMOVED / 2 + 1, MAX_REMOVED / 2 + 2] {
+        let b = RemovalBatch::sign(&bridge_sk(), 101, &prefixes(0, n));
+        s.removals.insert(b.key(), b);
+    }
+    let err = s.verify(&params()).unwrap_err();
+    assert!(err.contains("removed entries"), "{err}");
+}
+
+/// A batch the floor has passed removes nothing, even in the merge that
+/// raises the floor past it, so below the caps the laws hold exactly. The
+/// batch names the entry's prefix, as an 8-byte prefix collision would.
+#[test]
+fn a_batch_below_a_newly_raised_floor_removes_nothing_in_that_merge() {
+    let e = entry(&ghostkeys()[0], 103, 1);
+    let named: BTreeSet<RemovedPrefix> = [e.entry.key().removal_prefix()].into();
+    let mut a = open_at(100);
+    apply_removals(&mut a, vec![RemovalBatch::sign(&bridge_sk(), 100, &named)]).unwrap();
+    let c = with_entries(101, std::slice::from_ref(&e));
+    assert_eq!(bytes(&merged(&a, &c)), bytes(&merged(&c, &a)));
+    assert!(merged(&a, &c).entries.contains_key(&e.entry.key()));
+
+    // Likewise when the delta that raises the floor carries a removal too.
+    let other = entry(&ghostkeys()[1], 103, 2);
+    let mut d = a.clone();
+    d.apply_delta(
+        &params(),
+        &InboxDelta {
+            floor: Some(SignedFloor::sign(&bridge_sk(), 101)),
+            entries: vec![e.clone()],
+            removals: vec![removal(103, &[&other])],
+        },
+    )
+    .unwrap();
+    assert!(d.entries.contains_key(&e.entry.key()));
 }
 
 /// Certificates are public, so a state carrying ones no entry uses must be
@@ -795,14 +874,16 @@ fn an_entry_discarded_for_want_of_room_comes_back_from_a_peer_that_kept_it() {
 
     // Entries first: `lo` ranks third of three and is discarded, and the
     // removal that would have made room comes too late.
-    let mut early = with_entries(100, &all);
+    let mut early = one_by_one(100, &all);
     apply_removals(&mut early, vec![removal(103, &[&hi1])]).unwrap();
     assert!(!early.entries.contains_key(&lo.entry.key()));
 
     // Removal first: there is room for `lo` when it arrives.
     let mut late = open_at(100);
     apply_removals(&mut late, vec![removal(103, &[&hi1])]).unwrap();
-    add_entries(&mut late, all.to_vec());
+    for w in &all {
+        add_entries(&mut late, vec![w.clone()]);
+    }
     assert!(late.entries.contains_key(&lo.entry.key()));
     assert_ne!(bytes(&early), bytes(&late), "the order decided");
 
@@ -886,10 +967,7 @@ fn state_bytes_do_not_depend_on_arrival_order() {
     let es: Vec<WireEntry> = (0..6).map(|i| entry(gk, 100 + i, i as u8)).collect();
     let mut rev = es.clone();
     rev.reverse();
-    assert_eq!(
-        bytes(&with_entries(100, &es)),
-        bytes(&with_entries(100, &rev))
-    );
+    assert_eq!(bytes(&one_by_one(100, &es)), bytes(&one_by_one(100, &rev)));
 }
 
 /// As above, but closer to how peers really meet: enough Ghost Keys that the
@@ -902,6 +980,7 @@ fn above_both_caps_summary_and_delta_exchange_settles_on_one_full_inbox() {
     let (entries, batches) = pool(&ghostkeys()[..100], MAX_ENTRIES_PER_GHOSTKEY + 1);
     let mut rng = StdRng::seed_from_u64(0xf1_11);
     let mut filled = false;
+    let mut varied = false;
     // One direction of an exchange: `to` asks `from` for what it lacks.
     let pull = |to: &mut InboxStateV1, from: &InboxStateV1| {
         if let Some(d) = from.delta(&to.summarize()) {
@@ -929,6 +1008,9 @@ fn above_both_caps_summary_and_delta_exchange_settles_on_one_full_inbox() {
             })
             .collect();
         filled |= peers.iter().any(|p| p.entries.len() == MAX_ENTRIES);
+        varied |= peers
+            .iter()
+            .any(|p| p.floor_height() != peers[0].floor_height());
 
         let mut settled = false;
         for _ in 0..20 {
@@ -955,6 +1037,10 @@ fn above_both_caps_summary_and_delta_exchange_settles_on_one_full_inbox() {
     assert!(
         filled,
         "the inbox-wide cap never bound, so this tested nothing new"
+    );
+    assert!(
+        varied,
+        "every peer shared one floor, so differing floors went untested"
     );
 }
 

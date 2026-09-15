@@ -110,6 +110,11 @@ pub const WATCH_LIFETIME_MS: i64 = 24 * 60 * 60 * 1000;
 /// below it, unread. A node catches up with one small contract in seconds.
 pub const FLOOR_HOLD_MS: i64 = 2 * 60 * 1000;
 
+/// How far behind the tip the observer may be, in blocks, before watches kept
+/// for it are worth a warning. A block or two is an observer between rounds;
+/// more than this is one that is stuck or catching up after downtime.
+const OBSERVER_LAG_WARN_BLOCKS: u32 = 6;
+
 // ---------------------------------------------------------------------------
 // One pass over the inbox. No I/O but SQLite, so it is tested directly.
 // ---------------------------------------------------------------------------
@@ -137,6 +142,13 @@ pub struct Pass {
     pub acted: usize,
     /// Entries left unread because the removal budget was spent.
     pub deferred: usize,
+    /// The Ghost Keys of those entries. Their watches do not end in this
+    /// pass, since a waiting request may be the Watch that renews one.
+    pub waiting: BTreeSet<[u8; 32]>,
+    /// Something was held back that the same state and tips could release:
+    /// the floor was held, or ending watches waited on the observer or
+    /// failed. Such a pass must run again, not be passed over as quiet.
+    pub gated: bool,
 }
 
 pub struct Processor<'a> {
@@ -214,6 +226,7 @@ impl Processor<'_> {
                     || self.store.handled_count_for(&e.ghostkey.0)? >= REMOVAL_SHARE_PER_GHOSTKEY
                 {
                     pass.deferred += 1;
+                    pass.waiting.insert(e.ghostkey.0);
                     continue;
                 }
                 self.store.with_transaction(|| {
@@ -265,14 +278,20 @@ impl Processor<'_> {
 
         // Last, and never allowed to cost the pass its removals and floor.
         // Not while the floor is held, because a node that has just connected
-        // may not yet hold the Watch that renews a watch; and not while
-        // requests wait on the removal budget, since one of them may be that
-        // Watch.
-        if !held && pass.deferred == 0 {
-            if let Err(e) = self.expire_watches(tips, now_ms) {
-                tracing::warn!(
-                    "ending watches that ran out failed; the next pass tries again: {e:#}"
-                );
+        // may not yet hold the Watch that renews a watch. And a Ghost Key with
+        // a request waiting on the removal budget keeps its watches for now,
+        // since that request may be the renewal: only its own, so no one
+        // sender can hold back every watch on the bridge.
+        pass.gated = held;
+        if !held {
+            match self.expire_watches(tips, now_ms, &pass.waiting) {
+                Ok(lagging) => pass.gated |= lagging,
+                Err(e) => {
+                    pass.gated = true;
+                    tracing::warn!(
+                        "ending watches that ran out failed; the next pass tries again: {e:#}"
+                    );
+                }
             }
         }
         Ok(pass)
@@ -287,12 +306,24 @@ impl Processor<'_> {
     /// never scanned for it, since nothing rescans them later.
     ///
     /// And not while a payment to the script has been seen and is not yet
-    /// `deep_confirmations` deep, so the watch lasts until the payment's proof
-    /// is complete. A reorg after that finds a moved payment anyway: the
-    /// observer scans the orphans' scripts as well (`observer::scan_set`).
-    fn expire_watches(&self, tips: &Tips, now_ms: i64) -> Result<()> {
+    /// `deep_confirmations` deep, so the watch lasts until the payment's
+    /// proof is complete. A reorg after that finds a moved payment anyway:
+    /// every scan also covers the scripts of payments a reorg moved out of
+    /// their block and no scan has found since (`observer::scan_set`).
+    ///
+    /// Not for a Ghost Key in `waiting`, whose request waiting on the removal
+    /// budget may be the renewal.
+    ///
+    /// Returns whether any watch that ran out was kept only because the
+    /// observer was behind, so the caller runs the pass again.
+    fn expire_watches(
+        &self,
+        tips: &Tips,
+        now_ms: i64,
+        waiting: &BTreeSet<[u8; 32]>,
+    ) -> Result<bool> {
         let cutoff = now_ms.saturating_sub(WATCH_LIFETIME_MS);
-        let (mut ended, mut stopped) = (0usize, 0usize);
+        let (mut ended, mut stopped, mut lagging) = (0usize, 0usize, false);
         for &net in self.observed {
             let Some(&tip) = tips.by_network.get(&net) else {
                 continue;
@@ -305,7 +336,30 @@ impl Processor<'_> {
                 .get(&net)
                 .copied()
                 .unwrap_or(u32::MAX);
-            for (script, ghostkey) in self.store.watches_recorded_before(net, cutoff)? {
+            let candidates = self.store.watches_recorded_before(net, cutoff)?;
+            if candidates.is_empty() {
+                continue;
+            }
+            // Checked once here, to spare a transaction per watch while the
+            // observer is behind, and again inside each, where it counts.
+            let scanned_to = self.store.checkpoint(net)?.map(|c| c.height);
+            if scanned_to.is_none_or(|h| h < tip) {
+                lagging = true;
+                let behind = scanned_to.map(|h| tip - h);
+                if behind.is_none_or(|b| b > OBSERVER_LAG_WARN_BLOCKS) {
+                    tracing::warn!(
+                        network = ?net,
+                        ?behind,
+                        kept = candidates.len(),
+                        "watches that ran out are kept until the observer has scanned up to the tip"
+                    );
+                }
+                continue;
+            }
+            for (script, ghostkey) in candidates {
+                if <[u8; 32]>::try_from(ghostkey.as_slice()).is_ok_and(|g| waiting.contains(&g)) {
+                    continue;
+                }
                 // Checked inside the transaction that ends the watch, so the
                 // observer's progress and outputs are read as they stand then.
                 let outcome = self.store.with_transaction(|| {
@@ -320,10 +374,19 @@ impl Processor<'_> {
                         self.store.remove_watch(net, &script)?;
                     }
                     Ok(Some(last))
-                })?;
-                if let Some(last) = outcome {
-                    ended += 1;
-                    stopped += usize::from(last);
+                });
+                match outcome {
+                    Ok(Some(last)) => {
+                        ended += 1;
+                        stopped += usize::from(last);
+                    }
+                    Ok(None) => {}
+                    // One watch that cannot end must not keep the rest from
+                    // ending; it is tried again on the next pass.
+                    Err(e) => {
+                        lagging = true;
+                        tracing::warn!(network = ?net, "ending a watch that ran out failed: {e:#}");
+                    }
                 }
             }
         }
@@ -334,7 +397,7 @@ impl Processor<'_> {
                 "watches nobody renewed for a day ended; `stopped` scripts are no longer scanned"
             );
         }
-        Ok(())
+        Ok(lagging)
     }
 
     /// Act on one entry. An error here is the store failing, and rolls back
@@ -766,7 +829,7 @@ impl InboxWorker {
         };
         session
             .quiet
-            .after_pass(fingerprint, !pass.delta.is_empty());
+            .after_pass(fingerprint, !pass.delta.is_empty() || pass.gated);
         if pass.acted > 0 {
             tracing::info!(acted = pass.acted, "read the request inbox");
         }
@@ -838,7 +901,8 @@ pub type Fingerprint = ([u8; 32], Vec<(BitcoinNetwork, u32)>, bool);
 
 /// Which state needs no processing again.
 ///
-/// Only a pass that had nothing to send is remembered. One that sent
+/// Only a pass that had nothing to send and held nothing back (see
+/// [`Pass::gated`]) is remembered. One that sent
 /// removals or a floor may have had them refused after sending, so its state
 /// is processed again, and they are sent again, until a pass finds nothing
 /// left to send. Processing a settled state again would cost an RSA check per
@@ -1379,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn a_watch_whose_tombstone_was_lost_is_removed_again_not_acted_on_again() {
+    fn a_watch_whose_removal_was_lost_is_removed_again_not_acted_on_again() {
         let store = Store::open_in_memory().unwrap();
         let w = entry(
             &ghostkeys()[0],
@@ -1794,8 +1858,12 @@ mod tests {
                 },
             )
             .unwrap();
-        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0 + 25 * HOUR);
+        let pass = run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0 + 25 * HOUR);
         assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        assert!(
+            pass.gated,
+            "kept for the observer, so not passed over as quiet"
+        );
         tick(&store, &tips(), T0 + 26 * HOUR);
         assert!(watched(&store).is_empty());
     }
@@ -1813,14 +1881,26 @@ mod tests {
     }
 
     /// A node that has just connected may not yet hold the Watch that renews
-    /// a watch, and a request waiting on the budget may be that Watch.
+    /// a watch, so nothing ends while the floor is held; and a request
+    /// waiting on the budget may be that Watch, so its sender's watches wait
+    /// with it, and only its sender's.
     #[test]
-    fn nothing_ends_while_the_floor_is_held_or_requests_wait() {
+    fn a_watch_is_kept_while_the_floor_is_held_or_its_renewal_waits() {
         let store = Store::open_in_memory().unwrap();
-        watch_at(&store, &ghostkeys()[0], 1, T0);
+        let (owner, other) = (&ghostkeys()[0], &ghostkeys()[2]);
+        watch_at(&store, owner, 1, T0);
+        run_at(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![entry(other, FLOOR + 1, &request(Action::Watch, b"spk2", 1))],
+            ),
+            &tips(),
+            T0,
+        );
         caught_up(&store);
         let later = T0 + 25 * HOUR;
-        try_run_held(
+        let held = try_run_held(
             &store,
             &inbox(FLOOR, vec![]),
             &tips(),
@@ -1829,7 +1909,8 @@ mod tests {
             later + 1,
         )
         .unwrap();
-        assert_eq!(watched(&store), vec![b"spk".to_vec()], "held");
+        assert!(held.gated, "a held pass is not passed over as quiet");
+        assert_eq!(watched(&store).len(), 2, "held");
 
         store
             .with_transaction(|| {
@@ -1841,14 +1922,15 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let waiting = entry(
-            &ghostkeys()[1],
-            FLOOR + 1,
-            &request(Action::Watch, b"other", 1),
-        );
-        let pass = run_at(&store, &inbox(FLOOR, vec![waiting]), &tips(), later);
+        // The owner's renewal waits on the spent budget.
+        let renewal = entry(owner, FLOOR + 1, &request(Action::Watch, b"spk", 2));
+        let pass = run_at(&store, &inbox(FLOOR, vec![renewal]), &tips(), later);
         assert_eq!(pass.deferred, 1);
-        assert_eq!(watched(&store), vec![b"spk".to_vec()], "a request waits");
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "the owner's watch waits for its renewal; the other one ends"
+        );
 
         tick(&store, &tips(), later);
         assert!(watched(&store).is_empty());
@@ -1883,11 +1965,9 @@ mod tests {
             })
             .unwrap();
         caught_up(&store);
+        // Fails where ending watches starts, before any one watch is tried.
         store
-            .execute_for_test(
-                "CREATE TRIGGER boom BEFORE UPDATE ON script_interests
-                 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
-            )
+            .execute_for_test("DROP TABLE chain_checkpoint")
             .unwrap();
         let fresh = entry(
             &ghostkeys()[1],
@@ -1902,10 +1982,31 @@ mod tests {
         );
         assert_eq!(removed(&pass), 1);
         assert_eq!(pass.delta.floor.map(|f| f.height), Some(FLOOR));
+        assert!(pass.gated, "the pass runs again");
         assert!(
             watched(&store).contains(&b"spk".to_vec()),
             "the failed expiry changed nothing"
         );
+    }
+
+    /// One watch whose ending fails keeps no other watch from ending. The
+    /// failing one comes first, since watches are tried in script order.
+    #[test]
+    fn one_watch_that_cannot_end_keeps_no_other_from_ending() {
+        let store = Store::open_in_memory().unwrap();
+        let (a, b) = (&ghostkeys()[0], &ghostkeys()[1]);
+        let stuck = entry(a, FLOOR + 1, &request(Action::Watch, b"boom", 1));
+        run_at(&store, &inbox(FLOOR, vec![stuck]), &tips(), T0);
+        watch_at(&store, b, 1, T0);
+        store
+            .execute_for_test(
+                "CREATE TRIGGER boom BEFORE UPDATE ON script_interests
+                 WHEN NEW.script_pubkey = X'626f6f6d'
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"boom".to_vec()]);
     }
 
     // --- the driver ------------------------------------------------------------

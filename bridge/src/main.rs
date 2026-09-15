@@ -505,9 +505,11 @@ async fn observe_once(
         reorg.resume_from = tip.height;
     }
     let next = reorg.resume_from;
-    // Blocks are scanned for the orphans' scripts too, watched or not; the
-    // watermarks below stay with `watched`. See `scan_set`.
-    let scan = scan_set(&watched, &reorg.orphaned);
+    // Blocks are scanned for the scripts of payments in doubt too, watched or
+    // not, including this round's orphans; the watermarks below stay with
+    // `watched`. See `scan_set`.
+    let in_doubt = store.scripts_with_unconfirmed_outputs(obs.network())?;
+    let scan = scan_set(&watched, &in_doubt);
 
     // A tip entry for EVERY block scanned, not only the last.
     //
