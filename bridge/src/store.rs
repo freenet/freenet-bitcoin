@@ -137,6 +137,24 @@ impl Store {
         {
             self.conn.execute_batch("DROP TABLE script_interests;")?;
         }
+        // `script_interests` first had no `start_height`, when watches ran out
+        // by the clock. A watch without one starts counting at the next
+        // expiry pass (`start_unstarted_watches`), so the column is added
+        // empty rather than the table replaced.
+        let interests_exist = self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('script_interests')")?
+            .exists([])?;
+        let interests_have_start = self
+            .conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('script_interests') WHERE name = 'start_height'",
+            )?
+            .exists([])?;
+        if interests_exist && !interests_have_start {
+            self.conn
+                .execute_batch("ALTER TABLE script_interests ADD COLUMN start_height INTEGER;")?;
+        }
         // `inbox_handled` first had no requester column. Its rows are still
         // good (they are what removals are built from), so the column is added
         // rather than the table replaced; old rows count against the whole
@@ -280,6 +298,10 @@ impl Store {
                 watching       INTEGER NOT NULL,
                 request_ms     INTEGER NOT NULL,
                 recorded_ms    INTEGER NOT NULL,
+                -- The observer's scan height when the latest Watch was
+                -- acted on, from which a watch's life is counted in blocks;
+                -- NULL until the observer has scanned anything.
+                start_height   INTEGER,
                 PRIMARY KEY (network, script_pubkey, ghostkey)
             );
             CREATE INDEX IF NOT EXISTS script_interests_by_ghostkey
@@ -891,28 +913,69 @@ impl Store {
         Ok(n as usize)
     }
 
-    /// Requesters on `net` whose latest request, a Watch, was recorded before
-    /// `cutoff_ms`, as (script, Ghost Key): the watches that have run out.
-    /// Operator interests never run out and are left out.
-    pub fn watches_recorded_before(
+    /// Requesters on `net` whose latest request is a Watch that started at
+    /// or below `height`, as (script, Ghost Key): the watches that have run
+    /// out, given the cutoff `inbox::watch_cutoff` computes. Operator
+    /// interests never run out and are left out, as are watches not started.
+    pub fn watches_started_by(
         &self,
         net: BitcoinNetwork,
-        cutoff_ms: i64,
+        height: u32,
     ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut stmt = self.conn.prepare(
             "SELECT script_pubkey, ghostkey FROM script_interests
-             WHERE network = ?1 AND watching = 1 AND recorded_ms < ?2 AND ghostkey != ?3
+             WHERE network = ?1 AND watching = 1 AND start_height <= ?2 AND ghostkey != ?3
              ORDER BY script_pubkey, ghostkey",
         )?;
         let rows = stmt
             .query_map(
-                params![net.as_str(), cutoff_ms, OPERATOR_INTEREST.to_vec()],
+                params![net.as_str(), height as i64, OPERATOR_INTEREST.to_vec()],
                 |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
             )?
             // A row that fails to read fails the expiry, which is logged and
             // tried again, rather than vanishing without a word.
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Start one requester's watch counting from `height`, the observer's
+    /// scan height when its Watch was acted on, or leave it to start at the
+    /// next expiry pass if the observer has not scanned yet (`None`). Call
+    /// with the `set_interest` it follows, which leaves this column alone.
+    pub fn start_watch(
+        &self,
+        net: BitcoinNetwork,
+        script: &[u8],
+        ghostkey: &[u8],
+        height: Option<u32>,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE script_interests SET start_height = ?4
+             WHERE network = ?1 AND script_pubkey = ?2 AND ghostkey = ?3",
+            params![net.as_str(), script, ghostkey, height.map(i64::from)],
+        )?;
+        Ok(())
+    }
+
+    /// Start counting, from `height`, every watch on `net` not yet started:
+    /// one acted on before the observer had scanned anything, or recorded
+    /// before watches were counted in blocks. Reads first, so a pass with
+    /// nothing to start takes no write lock.
+    pub fn start_unstarted_watches(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<()> {
+        let any: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM script_interests
+             WHERE network = ?1 AND watching = 1 AND start_height IS NULL AND ghostkey != ?2)",
+            params![net.as_str(), OPERATOR_INTEREST.to_vec()],
+            |r| r.get(0),
+        )?;
+        if any {
+            self.conn.execute(
+                "UPDATE script_interests SET start_height = ?2
+                 WHERE network = ?1 AND watching = 1 AND start_height IS NULL AND ghostkey != ?3",
+                params![net.as_str(), height as i64, OPERATOR_INTEREST.to_vec()],
+            )?;
+        }
+        Ok(())
     }
 
     /// End one requester's watch because it ran out, returning whether
@@ -1138,11 +1201,9 @@ mod tests {
     #[test]
     fn a_watch_row_that_cannot_be_read_fails_the_expiry() {
         let s = store();
-        s.execute_for_test("INSERT INTO script_interests VALUES ('signet', X'00', 7, 1, 0, 0);")
+        s.execute_for_test("INSERT INTO script_interests VALUES ('signet', X'00', 7, 1, 0, 0, 0);")
             .unwrap();
-        assert!(s
-            .watches_recorded_before(BitcoinNetwork::Signet, 1)
-            .is_err());
+        assert!(s.watches_started_by(BitcoinNetwork::Signet, 1).is_err());
     }
 
     fn watch(script: &[u8], from: u32, demo: bool) -> WatchedScript {

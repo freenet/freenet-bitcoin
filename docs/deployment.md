@@ -279,28 +279,23 @@ contract id as `serving the request inbox`.
   each script (`script_interests`), and a script stops being scanned only when
   the last requester withdraws. A watch registered before the inbox existed has
   no requester on record, so no unwatch ends it.
-- **A watch lasts a day** after the Watch that last asked for it
-  (`WATCH_LIFETIME_MS`), and then ends as if its requester had withdrawn it.
-  Watching costs an update to the script's address contract every block, and
-  a client typically watches an address for one payment. A client that still
-  wants the script sends the Watch again, with a newer timestamp, well before
-  the day is out. A watch ends only once the observer has scanned its
-  network up to the tip, that tip is past the watch's day by Bitcoin's own
-  clock (its median time past, less two hours' margin), and Bitcoin Core has
-  finished syncing, so downtime, a node cut off from its peers, or a clock
-  stepped forward never leaves blocks from its day unscanned (the bridge warns when the observer is
-  more than 6 blocks behind; #11 is the known exception, a reorg round that
-  fails part-way, and a reorg deeper than the confirmations a watch waits for
-  can still bring in a payment from a day already ended); not while the floor is held;
-  and not while a request from its own requester waits on the removal budget,
-  since that may be its renewal (only while that request is still in the
-  inbox: one the caps push out or the floor passes no longer counts). Expiry
-  needs both clocks past a watch's day, so a wrong host clock delays expiry
-  rather than hastening it, except that a clock behind when a watch is
-  recorded shortens the watch by as much: keep it synchronized (NTP). In
-  practice a watch lasts about 27 hours. The bridge warns when Bitcoin Core
-  has been syncing for ten minutes, or its chain's clock is more than six
-  hours behind, since no watch ends on that network meanwhile. Every scan also covers the scripts of
+- **A watch lasts about a day, counted in blocks**: 144 blocks scanned after
+  the Watch that last asked for it (`WATCH_LIFETIME_BLOCKS`), and then until
+  the last of them is `deep_confirmations` deep (six by default), when it
+  ends as if its requester had withdrawn it. Watching costs an update to the
+  script's address contract every block, and a client typically watches an
+  address for one payment. A client that still wants the script sends the
+  Watch again, with a newer timestamp, well before then. The count is of
+  blocks the observer has scanned, so no clock enters: however long the
+  bridge or Bitcoin Core was down, or cut off from its peers, a watch ends
+  only once every block of its life has been scanned for it (#11 is the known
+  exception, a reorg round that fails part-way, and a reorg deeper than
+  `deep_confirmations` can still bring in a payment after a watch has ended).
+  Nor does a watch end while a payment to it is less than
+  `deep_confirmations` deep, while the floor is held, or while a request from
+  its own requester waits on the removal budget, since that may be its
+  renewal (only while that request is still in the inbox: one the caps push
+  out or the floor passes no longer counts). Every scan also covers the scripts of
   payments a reorg moved out of their block and that have not been seen
   again, watched or not, so such a payment is found where it was re-mined
   rather than left retracted. Where a

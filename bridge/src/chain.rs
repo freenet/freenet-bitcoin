@@ -54,22 +54,6 @@ pub struct ScannedBlock {
     pub found: Vec<FoundOutput>,
 }
 
-/// What [`ChainClient::sync_status`] reads, from one call so it agrees.
-pub struct ChainStatus {
-    pub tip: BlockAnchor,
-    /// See [`is_synced`].
-    pub synced: bool,
-    /// The tip's median time past, Bitcoin's own clock, in milliseconds.
-    pub median_time_ms: i64,
-}
-
-/// Whether a node has finished syncing: out of initial block download, and
-/// holding every block it has a header for. While either is not so, its tip
-/// is only how far it has got.
-pub fn is_synced(initial_block_download: bool, blocks: u64, headers: u64) -> bool {
-    !initial_block_download && blocks == headers
-}
-
 impl ChainClient {
     pub fn connect(cfg: &NetworkConfig) -> Result<Self> {
         let auth = match (&cfg.rpc_cookie_path, &cfg.rpc_user, &cfg.rpc_password) {
@@ -93,20 +77,6 @@ impl ChainClient {
         Ok(BlockAnchor {
             height: info.blocks as u32,
             hash: BlockHash(info.best_block_hash.to_byte_array()),
-        })
-    }
-
-    /// The tip, whether the node has finished syncing, and the tip's median
-    /// time past.
-    pub fn sync_status(&self) -> Result<ChainStatus> {
-        let info = self.rpc.get_blockchain_info()?;
-        Ok(ChainStatus {
-            tip: BlockAnchor {
-                height: info.blocks as u32,
-                hash: BlockHash(info.best_block_hash.to_byte_array()),
-            },
-            synced: is_synced(info.initial_block_download, info.blocks, info.headers),
-            median_time_ms: (info.median_time as i64).saturating_mul(1000),
         })
     }
 
@@ -398,19 +368,6 @@ pub fn merkle_root(txids: &[[u8; 32]]) -> [u8; 32] {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_node_is_synced_only_out_of_ibd_with_every_block_it_has_a_header_for() {
-        assert!(is_synced(false, 900_000, 900_000));
-        assert!(
-            !is_synced(true, 900_000, 900_000),
-            "still in initial block download"
-        );
-        assert!(
-            !is_synced(false, 899_990, 900_000),
-            "headers ahead of blocks"
-        );
-        assert!(!is_synced(false, 900_001, 900_000));
-    }
     use freenet_bitcoin_common::spv::merkle_root_from_branch;
 
     fn txid(n: u8) -> [u8; 32] {
