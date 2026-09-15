@@ -58,10 +58,10 @@
 //!
 //! **A Watch lasts about a day, counted in blocks.** The bridge ends a watch
 //! once it has scanned 144 blocks for it since the last Watch that asked for
-//! it, and five more so the last of them is buried, unless a payment to the
-//! script is still being buried. A sender that still wants the script sends
-//! the Watch again, with a newer `made_at_ms`, well before then: a renewal
-//! still on its way to the bridge's node when the watch ends does not save it.
+//! it and the last is buried as deep as the bridge requires of payments, unless
+//! a payment to the script is still being buried. A sender that still wants
+//! the script sends the Watch again, with a newer `made_at_ms`, well before
+//! then: a renewal on its way to the bridge's node when it ends does not save it.
 //!
 //! A sender sends its entry together with the floor it read
 //! ([`InboxDelta::submission`]), so a peer whose floor lags takes the floor

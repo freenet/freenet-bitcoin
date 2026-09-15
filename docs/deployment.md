@@ -285,7 +285,11 @@ contract id as `serving the request inbox`.
   ends as if its requester had withdrawn it. Watching costs an update to the
   script's address contract every block, and a client typically watches an
   address for one payment. A client that still wants the script sends the
-  Watch again, with a newer timestamp, well before then. The count is of
+  Watch again, with a newer timestamp, well before then. The count starts at the present as
+  the bridge knows it when it reads the Watch, the highest of Bitcoin Core's
+  tip, the headers it holds and the observer's scan, so a Watch read while
+  either is catching up after downtime does not start in the past, and a
+  renewal never moves a watch's start back. The count is of
   blocks the observer has scanned, so no clock enters: however long the
   bridge or Bitcoin Core was down, or cut off from its peers, a watch ends
   only once every block of its life has been scanned for it (#11 is the known

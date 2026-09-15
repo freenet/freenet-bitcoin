@@ -938,10 +938,13 @@ impl Store {
         Ok(rows)
     }
 
-    /// Start one requester's watch counting from `height`, the observer's
-    /// scan height when its Watch was acted on, or leave it to start at the
-    /// next expiry pass if the observer has not scanned yet (`None`). Call
-    /// with the `set_interest` it follows, which leaves this column alone.
+    /// Start one requester's watch counting from `height` (see
+    /// `inbox::watch_start`), never moving an existing start back: a renewal
+    /// read while the observer is behind must not shorten the watch it
+    /// renews. With no height known (`None`) the start is cleared, and the
+    /// count starts again at the next expiry pass, which can only lengthen
+    /// it. Call with the `set_interest` it follows, which leaves this column
+    /// alone.
     pub fn start_watch(
         &self,
         net: BitcoinNetwork,
@@ -950,7 +953,9 @@ impl Store {
         height: Option<u32>,
     ) -> anyhow::Result<()> {
         self.conn.execute(
-            "UPDATE script_interests SET start_height = ?4
+            "UPDATE script_interests
+             SET start_height = CASE WHEN ?4 IS NULL THEN NULL
+                                     ELSE MAX(COALESCE(start_height, ?4), ?4) END
              WHERE network = ?1 AND script_pubkey = ?2 AND ghostkey = ?3",
             params![net.as_str(), script, ghostkey, height.map(i64::from)],
         )?;
@@ -1001,7 +1006,8 @@ impl Store {
     }
 
     /// Whether a payment to `script` has been seen that the chain has not yet
-    /// buried `deep` blocks below `tip`: confirmed fewer than `deep` deep, or
+    /// buried `deep` blocks below `scanned`, the height the observer has
+    /// scanned to: confirmed fewer than `deep` deep, or
     /// moved out of its block by a reorg and not yet seen again.
     ///
     /// A payment a reorg removed for good, double-spent rather than re-mined,
@@ -1011,12 +1017,12 @@ impl Store {
         &self,
         net: BitcoinNetwork,
         script: &[u8],
-        tip: u32,
+        scanned: u32,
         deep: u32,
     ) -> anyhow::Result<bool> {
-        // Depth is tip - height + 1, so fewer than `deep` deep means a height
-        // above tip + 1 - deep.
-        let above = tip as i64 + 1 - deep as i64;
+        // Depth is scanned - height + 1, so fewer than `deep` deep means a
+        // height above scanned + 1 - deep.
+        let above = scanned as i64 + 1 - deep as i64;
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM observed_outputs
              WHERE network = ?1 AND script_pubkey = ?2
@@ -1513,6 +1519,36 @@ mod tests {
             InterestChange::Stale,
             "what was recorded after migrating survives the next open"
         );
+    }
+
+    /// A `script_interests` table from before watches were counted in blocks
+    /// gains the column empty, so its watches start counting at the next
+    /// expiry pass.
+    #[test]
+    fn interests_from_before_block_counting_gain_an_empty_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE script_interests (
+                     network TEXT NOT NULL, script_pubkey BLOB NOT NULL,
+                     ghostkey BLOB NOT NULL, watching INTEGER NOT NULL,
+                     request_ms INTEGER NOT NULL, recorded_ms INTEGER NOT NULL,
+                     PRIMARY KEY (network, script_pubkey, ghostkey));
+                 INSERT INTO script_interests VALUES ('signet', X'00', X'01', 1, 1, 0);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let net = BitcoinNetwork::Signet;
+        assert!(
+            s.watches_started_by(net, u32::MAX).unwrap().is_empty(),
+            "not started yet"
+        );
+        s.start_unstarted_watches(net, 100).unwrap();
+        assert!(s.watches_started_by(net, 99).unwrap().is_empty());
+        assert_eq!(s.watches_started_by(net, 100).unwrap().len(), 1);
     }
 
     /// Only outputs still moved out of their block put a script in doubt,
