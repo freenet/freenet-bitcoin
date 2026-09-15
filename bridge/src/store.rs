@@ -119,7 +119,13 @@ impl Store {
         Ok(s)
     }
 
+    /// One transaction, so two connections opening one database at once
+    /// cannot both run a step meant to run once, such as adding a column.
     fn migrate(&self) -> anyhow::Result<()> {
+        self.with_transaction(|| self.migrate_steps())
+    }
+
+    fn migrate_steps(&self) -> anyhow::Result<()> {
         // `script_interests` first shipped with one `since_ms` column and no
         // record of withdrawals, on a branch that never ran against a real
         // database. Such a table holds nothing worth keeping and would stop
@@ -130,6 +136,42 @@ impl Store {
             .exists([])?
         {
             self.conn.execute_batch("DROP TABLE script_interests;")?;
+        }
+        // `script_interests` first had no `start_height`, when watches ran out
+        // by the clock. A watch without one starts counting at the next
+        // expiry pass (`start_unstarted_watches`), so the column is added
+        // empty rather than the table replaced.
+        let interests_exist = self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('script_interests')")?
+            .exists([])?;
+        let interests_have_start = self
+            .conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('script_interests') WHERE name = 'start_height'",
+            )?
+            .exists([])?;
+        if interests_exist && !interests_have_start {
+            self.conn
+                .execute_batch("ALTER TABLE script_interests ADD COLUMN start_height INTEGER;")?;
+        }
+        // `inbox_handled` first had no requester column. Its rows are still
+        // good (they are what removals are built from), so the column is added
+        // rather than the table replaced; old rows count against the whole
+        // budget and no Ghost Key's share. Added before the batch below,
+        // whose index needs it.
+        let handled_exists = self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('inbox_handled')")?
+            .exists([])?;
+        let handled_has_requester = self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('inbox_handled') WHERE name = 'ghostkey'")?
+            .exists([])?;
+        if handled_exists && !handled_has_requester {
+            self.conn.execute_batch(
+                "ALTER TABLE inbox_handled ADD COLUMN ghostkey BLOB NOT NULL DEFAULT X'';",
+            )?;
         }
         self.conn.execute_batch(
             r#"
@@ -256,10 +298,25 @@ impl Store {
                 watching       INTEGER NOT NULL,
                 request_ms     INTEGER NOT NULL,
                 recorded_ms    INTEGER NOT NULL,
+                -- The height a watch's life is counted from, in blocks (see
+                -- inbox::watch_start); NULL until one is known, and cleared
+                -- when the watch ends.
+                start_height   INTEGER,
                 PRIMARY KEY (network, script_pubkey, ghostkey)
             );
             CREATE INDEX IF NOT EXISTS script_interests_by_ghostkey
                 ON script_interests (ghostkey, watching);
+
+            -- Watch expiry asks, for each watch that ran out, whether a
+            -- payment to its script is still being buried.
+            CREATE INDEX IF NOT EXISTS observed_outputs_by_script
+                ON observed_outputs (network, script_pubkey);
+
+            -- Every observer round asks which scripts have a payment in
+            -- doubt; the table is never pruned, so read only those rows.
+            CREATE INDEX IF NOT EXISTS observed_outputs_in_doubt
+                ON observed_outputs (network, script_pubkey)
+                WHERE block_height IS NULL;
 
             -- The inbox's own bookkeeping. Today only `signed_floor`, the
             -- highest floor this bridge has signed: entries below it are never
@@ -269,16 +326,21 @@ impl Store {
                 value  INTEGER NOT NULL
             );
 
-            -- Inbox entries already acted on. A tombstone can fail to land,
-            -- and without this record a Watch whose tombstone was lost would
+            -- Inbox entries already acted on, from which each removal batch
+            -- is built. A removal can fail to land,
+            -- and without this record a Watch whose removal was lost would
             -- be acted on again after the same requester's later Unwatch had
             -- been, bringing back an interest they withdrew. Pruned once the
             -- inbox floor passes an entry, because the inbox drops the entry
             -- itself from then on.
             CREATE TABLE IF NOT EXISTS inbox_handled (
                 entry_key     BLOB PRIMARY KEY,
-                entry_height  INTEGER NOT NULL
+                entry_height  INTEGER NOT NULL,
+                -- Who sent it, so no one sender spends the removal budget.
+                ghostkey      BLOB NOT NULL DEFAULT X''
             );
+            CREATE INDEX IF NOT EXISTS inbox_handled_by_ghostkey
+                ON inbox_handled (ghostkey);
 
             -- Left behind by the HTTP request service this bridge used to run.
             DROP TABLE IF EXISTS challenges;
@@ -511,6 +573,41 @@ impl Store {
             })
             .collect();
         Ok(rows)
+    }
+
+    /// Scripts with an output a reorg moved out of its block and that no scan
+    /// has seen again since, each once: the observer keeps scanning for them,
+    /// watched or not, until it does. See `observer::scan_set`.
+    pub fn scripts_with_unconfirmed_outputs(
+        &self,
+        net: BitcoinNetwork,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT script_pubkey FROM observed_outputs
+             WHERE network = ?1 AND block_height IS NULL",
+        )?;
+        // A row that fails to read must fail the round, not drop its script
+        // from the scan and leave its payment retracted.
+        let rows = stmt
+            .query_map(params![net.as_str()], |r| r.get::<_, Vec<u8>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Whether this exact output was moved out of its block by a reorg and no
+    /// scan has seen it since.
+    pub fn is_output_in_doubt(
+        &self,
+        net: BitcoinNetwork,
+        txid: &[u8; 32],
+        vout: u32,
+    ) -> anyhow::Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM observed_outputs
+             WHERE network = ?1 AND txid = ?2 AND vout = ?3 AND block_height IS NULL)",
+            params![net.as_str(), txid.to_vec(), vout as i64],
+            |r| r.get::<_, bool>(0),
+        )?)
     }
 
     /// Mark the outputs in orphaned blocks as unconfirmed again.
@@ -816,6 +913,125 @@ impl Store {
         Ok(n as usize)
     }
 
+    /// Requesters on `net` whose latest request is a Watch that started at
+    /// or below `height`, as (script, Ghost Key): the watches that have run
+    /// out, given the cutoff `inbox::watch_cutoff` computes. Operator
+    /// interests never run out and are left out, as are watches not started.
+    pub fn watches_started_by(
+        &self,
+        net: BitcoinNetwork,
+        height: u32,
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT script_pubkey, ghostkey FROM script_interests
+             WHERE network = ?1 AND watching = 1 AND start_height <= ?2 AND ghostkey != ?3
+             ORDER BY script_pubkey, ghostkey",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![net.as_str(), height as i64, OPERATOR_INTEREST.to_vec()],
+                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+            )?
+            // A row that fails to read fails the expiry, which is logged and
+            // tried again, rather than vanishing without a word.
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Start one requester's watch counting from `height` (see
+    /// `inbox::watch_start`), never moving an existing start back: a renewal
+    /// read while the observer is behind must not shorten the watch it
+    /// renews. With no height known (`None`) the start is cleared, and the
+    /// count starts again at the next expiry pass, which can only lengthen
+    /// it. Call with the `set_interest` it follows, which leaves this column
+    /// alone.
+    pub fn start_watch(
+        &self,
+        net: BitcoinNetwork,
+        script: &[u8],
+        ghostkey: &[u8],
+        height: Option<u32>,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE script_interests
+             SET start_height = CASE WHEN ?4 IS NULL THEN NULL
+                                     ELSE MAX(COALESCE(start_height, ?4), ?4) END
+             WHERE network = ?1 AND script_pubkey = ?2 AND ghostkey = ?3",
+            params![net.as_str(), script, ghostkey, height.map(i64::from)],
+        )?;
+        Ok(())
+    }
+
+    /// Start counting, from `height`, every watch on `net` not yet started:
+    /// one acted on before the observer had scanned anything, or recorded
+    /// before watches were counted in blocks. Reads first, so a pass with
+    /// nothing to start takes no write lock.
+    pub fn start_unstarted_watches(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<()> {
+        let any: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM script_interests
+             WHERE network = ?1 AND watching = 1 AND start_height IS NULL AND ghostkey != ?2)",
+            params![net.as_str(), OPERATOR_INTEREST.to_vec()],
+            |r| r.get(0),
+        )?;
+        if any {
+            self.conn.execute(
+                "UPDATE script_interests SET start_height = ?2
+                 WHERE network = ?1 AND watching = 1 AND start_height IS NULL AND ghostkey != ?3",
+                params![net.as_str(), height as i64, OPERATOR_INTEREST.to_vec()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// End one requester's watch because it ran out, returning whether
+    /// anyone still wants the script.
+    ///
+    /// Recorded as a withdrawal made now, with the expired Watch's timestamp,
+    /// so a delayed copy of that Watch cannot bring it back, while any newer
+    /// Watch from the requester renews it. Call inside
+    /// [`Store::with_transaction`] with the watch removal it implies.
+    pub fn expire_interest(
+        &self,
+        net: BitcoinNetwork,
+        script: &[u8],
+        ghostkey: &[u8],
+        now_ms: i64,
+    ) -> anyhow::Result<bool> {
+        self.conn.execute(
+            "UPDATE script_interests SET watching = 0, recorded_ms = ?4, start_height = NULL
+             WHERE network = ?1 AND script_pubkey = ?2 AND ghostkey = ?3 AND watching = 1",
+            params![net.as_str(), script, ghostkey, now_ms],
+        )?;
+        Ok(self.watchers(net, script)? == 0)
+    }
+
+    /// Whether a payment to `script` has been seen that the chain has not yet
+    /// buried `deep` blocks below `scanned`, the height the observer has
+    /// scanned to: confirmed fewer than `deep` deep, or
+    /// moved out of its block by a reorg and not yet seen again.
+    ///
+    /// A payment a reorg removed for good, double-spent rather than re-mined,
+    /// stays in the second case forever, and keeps its watch alive. That
+    /// errs towards watching: it costs updates, never a missed payment.
+    pub fn has_shallow_output(
+        &self,
+        net: BitcoinNetwork,
+        script: &[u8],
+        scanned: u32,
+        deep: u32,
+    ) -> anyhow::Result<bool> {
+        // Depth is scanned - height + 1, so fewer than `deep` deep means a
+        // height above scanned + 1 - deep.
+        let above = scanned as i64 + 1 - deep as i64;
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM observed_outputs
+             WHERE network = ?1 AND script_pubkey = ?2
+               AND (block_height IS NULL OR block_height > ?3))",
+            params![net.as_str(), script, above],
+            |r| r.get::<_, bool>(0),
+        )?)
+    }
+
     /// Forget withdrawals recorded before `cutoff_ms`. A withdrawal only has
     /// to outlive any older request still in the inbox, which is hours.
     pub fn prune_withdrawals_before(&self, cutoff_ms: i64) -> anyhow::Result<()> {
@@ -873,6 +1089,14 @@ impl Store {
         Ok(())
     }
 
+    /// Replace the busy timeout with `handler`, for tests that need to see
+    /// each time a write meets another connection's lock.
+    #[cfg(test)]
+    pub fn busy_handler_for_test(&self, handler: Option<fn(i32) -> bool>) -> anyhow::Result<()> {
+        self.conn.busy_handler(handler)?;
+        Ok(())
+    }
+
     // --- inbox entries already acted on ------------------------------------
 
     pub fn is_handled(&self, entry_key: &[u8; 32]) -> anyhow::Result<bool> {
@@ -887,12 +1111,29 @@ impl Store {
             .unwrap_or(false))
     }
 
-    pub fn mark_handled(&self, entry_key: &[u8; 32], entry_height: u32) -> anyhow::Result<()> {
+    pub fn mark_handled(
+        &self,
+        entry_key: &[u8; 32],
+        entry_height: u32,
+        ghostkey: &[u8],
+    ) -> anyhow::Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO inbox_handled (entry_key, entry_height) VALUES (?1, ?2)",
-            params![entry_key.to_vec(), entry_height as i64],
+            "INSERT OR IGNORE INTO inbox_handled (entry_key, entry_height, ghostkey)
+             VALUES (?1, ?2, ?3)",
+            params![entry_key.to_vec(), entry_height as i64, ghostkey],
         )?;
         Ok(())
+    }
+
+    /// Entries read from one Ghost Key that the floor has not yet passed: its
+    /// part of [`Store::handled_count`].
+    pub fn handled_count_for(&self, ghostkey: &[u8]) -> anyhow::Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM inbox_handled WHERE ghostkey = ?1",
+            params![ghostkey],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// Forget entries dated below `floor`: the inbox has dropped them, so
@@ -904,6 +1145,53 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Entries read that the floor has not yet passed, which is how many
+    /// removals the inbox still has to hold for this bridge. Accurate once
+    /// [`Store::prune_handled_below`] has run for the current floor.
+    ///
+    /// Can undercount what the network holds: it is pruned to the highest
+    /// floor this bridge signed, which may not have landed yet, and a restored
+    /// database starts again from nothing. The bridge's budget is half the
+    /// bound peers enforce to leave room for exactly that.
+    pub fn handled_count(&self) -> anyhow::Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM inbox_handled", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// The keys of every entry read at one height: what one removal batch
+    /// names.
+    pub fn handled_at(&self, entry_height: u32) -> anyhow::Result<Vec<[u8; 32]>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT entry_key FROM inbox_handled WHERE entry_height = ?1")?;
+        // A row that fails to read is logged and left out, not made to fail
+        // the pass: failing would stop the bridge reading anything until the
+        // floor passed the row, while leaving it out costs only that entry's
+        // removal. The entry is then read and acted on again, which changes
+        // nothing: its request is no newer than the one on record.
+        let keys = stmt
+            .query_map(params![entry_height as i64], |r| r.get::<_, Vec<u8>>(0))?
+            .filter_map(|row| match row.map(<[u8; 32]>::try_from) {
+                Ok(Ok(k)) => Some(k),
+                Ok(Err(k)) => {
+                    tracing::warn!(
+                        len = k.len(),
+                        entry_height,
+                        "an entry key on record is not 32 bytes"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(entry_height, "an entry key on record cannot be read: {e}");
+                    None
+                }
+            })
+            .collect();
+        Ok(keys)
+    }
 }
 
 #[cfg(test)]
@@ -912,6 +1200,16 @@ mod tests {
 
     fn store() -> Store {
         Store::open_in_memory().unwrap()
+    }
+
+    /// A watch row that cannot be read fails the expiry, which is logged and
+    /// tried again, rather than being passed over as if it were not there.
+    #[test]
+    fn a_watch_row_that_cannot_be_read_fails_the_expiry() {
+        let s = store();
+        s.execute_for_test("INSERT INTO script_interests VALUES ('signet', X'00', 7, 1, 0, 0, 0);")
+            .unwrap();
+        assert!(s.watches_started_by(BitcoinNetwork::Signet, 1).is_err());
     }
 
     fn watch(script: &[u8], from: u32, demo: bool) -> WatchedScript {
@@ -1123,7 +1421,7 @@ mod tests {
     fn a_failed_transaction_leaves_nothing_behind() {
         let s = store();
         let r: anyhow::Result<()> = s.with_transaction(|| {
-            s.mark_handled(&[1; 32], 100)?;
+            s.mark_handled(&[1; 32], 100, &[])?;
             anyhow::bail!("the step after it failed")
         });
         assert!(r.is_err());
@@ -1223,6 +1521,88 @@ mod tests {
         );
     }
 
+    /// A `script_interests` table from before watches were counted in blocks
+    /// gains the column empty, so its watches start counting at the next
+    /// expiry pass.
+    #[test]
+    fn interests_from_before_block_counting_gain_an_empty_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE script_interests (
+                     network TEXT NOT NULL, script_pubkey BLOB NOT NULL,
+                     ghostkey BLOB NOT NULL, watching INTEGER NOT NULL,
+                     request_ms INTEGER NOT NULL, recorded_ms INTEGER NOT NULL,
+                     PRIMARY KEY (network, script_pubkey, ghostkey));
+                 INSERT INTO script_interests VALUES ('signet', X'00', X'01', 1, 1, 0);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let net = BitcoinNetwork::Signet;
+        assert!(
+            s.watches_started_by(net, u32::MAX).unwrap().is_empty(),
+            "not started yet"
+        );
+        s.start_unstarted_watches(net, 100).unwrap();
+        assert!(s.watches_started_by(net, 99).unwrap().is_empty());
+        assert_eq!(s.watches_started_by(net, 100).unwrap().len(), 1);
+    }
+
+    /// Only outputs still moved out of their block put a script in doubt,
+    /// and each script once.
+    #[test]
+    fn only_payments_a_reorg_moved_and_nobody_found_again_are_in_doubt() {
+        let s = store();
+        let net = BitcoinNetwork::Signet;
+        let at = Some((100, BlockHash([1; 32])));
+        s.record_output(net, b"moved", &[1; 32], 0, 5, None)
+            .unwrap();
+        s.record_output(net, b"moved", &[1; 32], 1, 5, None)
+            .unwrap();
+        s.record_output(net, b"settled", &[2; 32], 0, 5, at)
+            .unwrap();
+        s.record_output(BitcoinNetwork::Bitcoin, b"elsewhere", &[3; 32], 0, 5, None)
+            .unwrap();
+        assert_eq!(
+            s.scripts_with_unconfirmed_outputs(net).unwrap(),
+            vec![b"moved".to_vec()]
+        );
+        s.record_output(net, b"moved", &[1; 32], 0, 5, at).unwrap();
+        s.record_output(net, b"moved", &[1; 32], 1, 5, at).unwrap();
+        assert!(s.scripts_with_unconfirmed_outputs(net).unwrap().is_empty());
+    }
+
+    /// A database whose `inbox_handled` predates the requester column keeps
+    /// its rows, which removals are built from, and gains the column.
+    #[test]
+    fn handled_entries_from_before_their_requester_was_recorded_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE inbox_handled (
+                     entry_key BLOB PRIMARY KEY, entry_height INTEGER NOT NULL);
+                 INSERT INTO inbox_handled VALUES (X'01', 7);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        s.mark_handled(&[2u8; 32], 7, &[9u8; 32]).unwrap();
+        assert_eq!(s.handled_count().unwrap(), 2);
+        assert_eq!(s.handled_count_for(&[9u8; 32]).unwrap(), 1);
+        assert_eq!(
+            s.handled_at(7).unwrap(),
+            vec![[2u8; 32]],
+            "the old key is not 32 bytes"
+        );
+        drop(s);
+        Store::open(&path).expect("and again, once migrated");
+    }
+
     /// The observer and the inbox worker write one database through two
     /// connections. A write that meets the other's lock must wait its turn,
     /// not fail.
@@ -1241,7 +1621,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn(move || {
             a.with_transaction(|| {
-                a.mark_handled(&[1; 32], 100)?;
+                a.mark_handled(&[1; 32], 100, &[])?;
                 locked_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 Ok(())
@@ -1257,7 +1637,7 @@ mod tests {
         });
         b.with_transaction(|| {
             b.is_handled(&[1; 32])?;
-            b.mark_handled(&[2; 32], 100)
+            b.mark_handled(&[2; 32], 100, &[])
         })
         .expect("waits for the lock, then writes");
         releaser.join().unwrap();
@@ -1269,8 +1649,8 @@ mod tests {
     #[test]
     fn handled_entries_are_forgotten_once_the_floor_passes_them() {
         let s = store();
-        s.mark_handled(&[1; 32], 100).unwrap();
-        s.mark_handled(&[2; 32], 110).unwrap();
+        s.mark_handled(&[1; 32], 100, &[]).unwrap();
+        s.mark_handled(&[2; 32], 110, &[]).unwrap();
         s.prune_handled_below(105).unwrap();
         assert!(!s.is_handled(&[1; 32]).unwrap());
         assert!(s.is_handled(&[2; 32]).unwrap());

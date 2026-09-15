@@ -3,8 +3,8 @@
 //! Clients ask this bridge to watch a Bitcoin script by appending a sealed,
 //! Ghost Key signed entry to the bridge's inbox contract (see
 //! `freenet_bitcoin_inbox`). This module reads the inbox, acts on each entry,
-//! removes it with a signed tombstone, and keeps the inbox's floor following
-//! the Bitcoin mainnet tip.
+//! removes it with a signed removal batch, keeps the inbox's floor following
+//! the Bitcoin mainnet tip, and ends watches nobody has renewed for a day.
 //!
 //! # Its own connection
 //!
@@ -25,11 +25,12 @@
 //! request arriving late changes nothing.
 //!
 //! Entries acted on are also recorded (`inbox_handled`), so an entry whose
-//! tombstone failed to land is removed again rather than acted on again, and
+//! removal failed to land is removed again rather than acted on again, and
 //! the highest floor this bridge has signed is stored, so an entry below it is
-//! never acted on even when a stale copy of the inbox presents it.
+//! never acted on even when a stale copy of the inbox presents it. The same
+//! record is what each removal batch is built from.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,8 +40,8 @@ use ed25519_dalek::SigningKey;
 use freenet_bitcoin_common::{from_cbor, to_cbor, BitcoinNetwork, BridgeId};
 use freenet_bitcoin_inbox::seal::unseal;
 use freenet_bitcoin_inbox::{
-    Action, EntryKey, InboxDelta, InboxEntry, InboxParameters, InboxStateV1, SignedFloor,
-    SignedTombstone, FLOOR_LAG_BLOCKS, WINDOW_BLOCKS,
+    Action, EntryKey, InboxDelta, InboxEntry, InboxParameters, InboxStateV1, RemovalBatch,
+    RemovedPrefix, SignedFloor, FLOOR_LAG_BLOCKS, REMOVAL_BUDGET, WINDOW_BLOCKS,
 };
 use freenet_stdlib::client_api::{
     ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse, WebApi,
@@ -78,6 +79,83 @@ const REOPEN_INTERVAL: Duration = Duration::from_secs(60);
 /// request by the same sender still in the inbox, which is hours at most.
 const WITHDRAWAL_MEMORY_MS: i64 = 24 * 60 * 60 * 1000;
 
+/// How much of [`REMOVAL_BUDGET`] one Ghost Key may use: a 64th of it.
+///
+/// Without a share, one Ghost Key sending without pause could spend the whole
+/// budget, and while it is spent the bridge reads nothing, so 64 Ghost Keys
+/// would hold every place in the inbox without sending again. With it,
+/// spending the budget takes 64 Ghost Keys each having 64 requests read within
+/// five blocks, about 50 minutes (about 66 sent each, to hold the inbox as
+/// well), and a
+/// key past its share only makes its own requests
+/// wait. An honest sender watching many addresses names up to 32 in one
+/// request.
+pub const REMOVAL_SHARE_PER_GHOSTKEY: usize = REMOVAL_BUDGET / 64;
+
+/// How many blocks a watch lasts after the Watch that last asked for it:
+/// 144, about a day.
+///
+/// Watching costs the bridge an update to the script's address contract with
+/// every block, and an application typically watches an address for one
+/// payment, so a watch nobody renews ends by itself rather than lasting until
+/// someone remembers to withdraw it. A Watch sent again, with a newer
+/// timestamp as every request must have, starts the count again. Counted in
+/// blocks the observer has scanned, not by any clock, so every block of a
+/// watch's life has been scanned for it before it ends; see
+/// [`Processor::expire_watches`].
+pub const WATCH_LIFETIME_BLOCKS: u32 = 144;
+
+/// The highest height a watch can have started at and have run out, once the
+/// observer has scanned to `scanned`: its [`WATCH_LIFETIME_BLOCKS`], then
+/// `deep - 1` more, so the last of them is `deep` deep and a reorg shallower
+/// than that cannot replace one unseen. `None` while no watch can have run
+/// out.
+fn watch_cutoff(scanned: u32, deep: u32) -> Option<u32> {
+    scanned
+        .checked_sub(WATCH_LIFETIME_BLOCKS)?
+        .checked_sub(deep.saturating_sub(1))
+}
+
+/// Where a watch's life starts counting on `net`: the highest height the
+/// bridge knows of, the node's tip, the headers it holds, or the observer's
+/// checkpoint. The checkpoint is rewound at every start and trails the tip
+/// while the observer catches up, and the tip trails the headers while the
+/// node does, so a Watch read then would otherwise start in the past and end
+/// before its day. `None` unless the node is live (see [`Tips::is_live`]):
+/// without a reading, the checkpoint is where the observer stopped when the
+/// node went away, which may be long past, and a watch not started never
+/// ends, so it waits for one.
+fn watch_start(tips: &Tips, net: BitcoinNetwork, checkpoint: Option<u32>) -> Option<u32> {
+    if !tips.is_live(net) {
+        return None;
+    }
+    let tip = tips.by_network.get(&net).copied();
+    // Headers need only proof of work, which is cheap on the test networks,
+    // where a peer could feed thousands it never backs with blocks and make
+    // every new watch wait weeks. Off mainnet they count for at most a day
+    // ahead of the tip; mainnet headers cost real work.
+    let headers = tips.headers.get(&net).copied().map(|h| match (net, tip) {
+        (BitcoinNetwork::Bitcoin, _) | (_, None) => h,
+        (_, Some(t)) => h.min(t.saturating_add(WATCH_LIFETIME_BLOCKS)),
+    });
+    [tip, headers, checkpoint].into_iter().flatten().max()
+}
+
+/// How long after connecting to its node the bridge waits before raising the
+/// floor.
+///
+/// The node may have been down, or just started, and until it has caught up
+/// with the inbox the requests other peers hold are missing from the copy the
+/// bridge reads. Raising the floor at once would drop any of those dated
+/// below it, unread. A node catches up with one small contract in seconds.
+pub const FLOOR_HOLD_MS: i64 = 2 * 60 * 1000;
+
+/// Whether the floor is still held. The hold is kept on the monotonic clock,
+/// so no step of the wall clock stretches it or cuts it short.
+fn floor_held(until: Option<Instant>) -> bool {
+    until.is_some_and(|t| Instant::now() < t)
+}
+
 // ---------------------------------------------------------------------------
 // One pass over the inbox. No I/O but SQLite, so it is tested directly.
 // ---------------------------------------------------------------------------
@@ -87,6 +165,12 @@ const WITHDRAWAL_MEMORY_MS: i64 = 24 * 60 * 60 * 1000;
 pub struct Tips {
     /// The tip of each network this bridge observes, where it could be read.
     pub by_network: HashMap<BitcoinNetwork, u32>,
+    /// The height of the highest header each network's node holds, fetched
+    /// or not: its tip, or above it while the node catches up.
+    pub headers: HashMap<BitcoinNetwork, u32>,
+    /// How many peers each network's node has. A node with none knows of
+    /// nothing newer than its own tip.
+    pub peers: HashMap<BitcoinNetwork, u32>,
 }
 
 impl Tips {
@@ -94,15 +178,32 @@ impl Tips {
     pub fn mainnet(&self) -> Option<u32> {
         self.by_network.get(&BitcoinNetwork::Bitcoin).copied()
     }
+
+    /// Whether `net`'s node could be read and has peers, so its tip and
+    /// headers say where the chain is now. What this cannot see is the
+    /// moment after the node restarts, before its peers have sent the
+    /// headers it missed.
+    pub fn is_live(&self, net: BitcoinNetwork) -> bool {
+        self.by_network.contains_key(&net) && self.peers.get(&net).is_some_and(|&p| p > 0)
+    }
 }
 
 /// What a pass decided.
 #[derive(Debug, Default)]
 pub struct Pass {
-    /// Tombstones and floor to send back to the inbox.
+    /// Removals and floor to send back to the inbox.
     pub delta: InboxDelta,
     /// Entries acted on for the first time.
     pub acted: usize,
+    /// Entries left unread because the removal budget was spent.
+    pub deferred: usize,
+    /// The Ghost Keys of those entries. Their watches do not end in this
+    /// pass, since a waiting request may be the Watch that renews one.
+    pub waiting: BTreeSet<[u8; 32]>,
+    /// Something was held back that the same state and tips could release:
+    /// the floor was held, or ending watches failed or found the observer
+    /// gone back. Such a pass must run again, not be passed over as quiet.
+    pub gated: bool,
 }
 
 pub struct Processor<'a> {
@@ -113,6 +214,11 @@ pub struct Processor<'a> {
     pub observed: &'a [BitcoinNetwork],
     /// See [`MAX_WATCHES_PER_GHOSTKEY`]; a field so tests can use a small one.
     pub max_watches_per_ghostkey: usize,
+    /// Each observed network's configured `deep_confirmations`: how deep a
+    /// payment must be before the watch that found it may end.
+    pub deep_confirmations: &'a HashMap<BitcoinNetwork, u32>,
+    /// The floor is not raised before this instant; see [`FLOOR_HOLD_MS`].
+    pub floor_hold_until: Option<Instant>,
 }
 
 impl Processor<'_> {
@@ -151,6 +257,8 @@ impl Processor<'_> {
         entries.sort_by_key(|(k, e)| (e.mainnet_height, *k));
 
         let mut pass = Pass::default();
+        let mut handled = self.store.handled_count()?;
+        let mut read_heights: BTreeSet<u32> = BTreeSet::new();
         for (k, e) in entries {
             // Below a floor this bridge signed: a stale copy of the inbox. It
             // was either acted on already or dropped unread when that floor
@@ -163,22 +271,58 @@ impl Processor<'_> {
                 continue;
             }
             if !self.store.is_handled(&k.0)? {
+                // Every entry read is removed, and a removal lasts until the
+                // floor passes it. Past the budget, reading waits for the
+                // floor, so a flood leaves requests waiting in the inbox
+                // rather than growing the removals past what it may hold; and
+                // past its share, a Ghost Key's own requests wait while
+                // everyone else's are read.
+                if handled >= REMOVAL_BUDGET
+                    || self.store.handled_count_for(&e.ghostkey.0)? >= REMOVAL_SHARE_PER_GHOSTKEY
+                {
+                    pass.deferred += 1;
+                    pass.waiting.insert(e.ghostkey.0);
+                    continue;
+                }
                 self.store.with_transaction(|| {
                     self.act(e, tips, now_ms)?;
-                    self.store.mark_handled(&k.0, e.mainnet_height)
+                    self.store
+                        .mark_handled(&k.0, e.mainnet_height, &e.ghostkey.0)
                 })?;
+                handled += 1;
                 pass.acted += 1;
             }
-            // Ed25519 signatures are deterministic, so re-sending a tombstone
-            // that was lost sends the same bytes.
-            pass.delta
-                .tombstones
-                .push(SignedTombstone::for_entry(self.key, k, e));
+            read_heights.insert(e.mainnet_height);
+        }
+        if pass.deferred > 0 {
+            tracing::warn!(
+                deferred = pass.deferred,
+                budget = REMOVAL_BUDGET,
+                "requests wait for the floor: the removal budget, or their Ghost Key's share of it, is spent"
+            );
         }
 
+        // One batch per height, naming every entry ever read at it. It covers
+        // any batch sent for that height before, so the inbox keeps only the
+        // newest, and a batch that failed to land is made good by this one.
+        // Built from the store, which is deterministic, and signed with
+        // Ed25519, which is too: an unchanged set is sent as the same bytes.
+        for h in read_heights {
+            let removed: BTreeSet<RemovedPrefix> = self
+                .store
+                .handled_at(h)?
+                .into_iter()
+                .map(|k| EntryKey(k).removal_prefix())
+                .collect();
+            pass.delta
+                .removals
+                .push(RemovalBatch::sign(self.key, h, &removed));
+        }
+
+        let held = floor_held(self.floor_hold_until);
         let target = match tips.mainnet() {
-            Some(tip) => known.max(Some(tip.saturating_sub(FLOOR_LAG_BLOCKS))),
-            None => known,
+            Some(tip) if !held => known.max(Some(tip.saturating_sub(FLOOR_LAG_BLOCKS))),
+            _ => known,
         };
         if let Some(t) = target {
             if state_floor.is_none_or(|cur| t > cur) {
@@ -186,13 +330,171 @@ impl Processor<'_> {
                 pass.delta.floor = Some(SignedFloor::sign(self.key, t));
             }
         }
+
+        // Last, and never allowed to cost the pass its removals and floor.
+        // Not while the floor is held, because a node that has just connected
+        // may not yet hold the Watch that renews a watch. And a Ghost Key with
+        // a request waiting on the removal budget keeps its watches for now,
+        // since that request may be the renewal: only its own, so no one
+        // sender can hold back every watch on the bridge.
+        pass.gated = held;
+        if !held {
+            match self.expire_watches(tips, now_ms, &pass.waiting) {
+                Ok(lagging) => pass.gated |= lagging,
+                Err(e) => {
+                    pass.gated = true;
+                    tracing::warn!(
+                        "ending watches that ran out failed; the next pass tries again: {e:#}"
+                    );
+                }
+            }
+        }
         Ok(pass)
+    }
+
+    /// End watches that have run out: each lasts [`WATCH_LIFETIME_BLOCKS`]
+    /// scanned from the Watch that last asked for it, then until the last of
+    /// those is `deep_confirmations` deep (see [`watch_cutoff`]).
+    ///
+    /// Counted in blocks the observer has scanned, from its checkpoint, so
+    /// neither the chain's tip nor any clock enters: however long the bridge
+    /// or its node was down, and whatever either clock says, a watch ends
+    /// only once every block of its life has been scanned for it.
+    ///
+    /// And not while a payment to the script has been seen and is not yet
+    /// `deep_confirmations` deep, so the watch lasts until the payment's
+    /// proof is complete. A reorg after that finds a moved payment anyway:
+    /// every scan also covers the scripts of payments a reorg moved out of
+    /// their block and no scan has found since (`observer::scan_set`).
+    ///
+    /// Not for a Ghost Key in `waiting`, whose request waiting on the removal
+    /// budget may be the renewal.
+    ///
+    /// Returns whether a watch that ran out was kept because something failed
+    /// or the observer went back, so the caller runs the pass again.
+    fn expire_watches(
+        &self,
+        tips: &Tips,
+        now_ms: i64,
+        waiting: &BTreeSet<[u8; 32]>,
+    ) -> Result<bool> {
+        enum Expiry {
+            Ended { last: bool },
+            Kept,
+            Unscanned,
+        }
+        let (mut ended, mut stopped, mut lagging) = (0usize, 0usize, false);
+        'networks: for &net in self.observed {
+            // Every configured network has a value, since the field has a
+            // default; a missing one means a build that disagrees with its
+            // config, so keep watches while any payment to them is on record.
+            let deep = self
+                .deep_confirmations
+                .get(&net)
+                .copied()
+                .unwrap_or(u32::MAX);
+            let scanned = match self.store.checkpoint(net) {
+                Ok(Some(c)) => c.height,
+                Ok(None) => continue,
+                // A checkpoint that cannot be read stops expiry on its own
+                // network only.
+                Err(e) => {
+                    lagging = true;
+                    tracing::warn!(network = ?net, "reading the scan checkpoint failed: {e:#}");
+                    continue;
+                }
+            };
+            // A row that fails to read stops expiry on its own network only.
+            let candidates = match self.watches_run_out(tips, net, scanned, deep) {
+                Ok(c) => c,
+                Err(e) => {
+                    lagging = true;
+                    tracing::warn!(network = ?net, "reading the watches that ran out failed: {e:#}");
+                    continue;
+                }
+            };
+            for (script, ghostkey) in candidates {
+                if <[u8; 32]>::try_from(ghostkey.as_slice()).is_ok_and(|g| waiting.contains(&g)) {
+                    continue;
+                }
+                // Checked again inside the transaction that ends the watch, so
+                // the observer's progress and outputs are read as they stand.
+                let outcome = self.store.with_transaction(|| {
+                    let still_scanned = self
+                        .store
+                        .checkpoint(net)?
+                        .is_some_and(|c| c.height >= scanned);
+                    if !still_scanned {
+                        return Ok(Expiry::Unscanned);
+                    }
+                    if self.store.has_shallow_output(net, &script, scanned, deep)? {
+                        return Ok(Expiry::Kept);
+                    }
+                    let last = self
+                        .store
+                        .expire_interest(net, &script, &ghostkey, now_ms)?;
+                    if last {
+                        self.store.remove_watch(net, &script)?;
+                    }
+                    Ok(Expiry::Ended { last })
+                });
+                match outcome {
+                    Ok(Expiry::Ended { last }) => {
+                        ended += 1;
+                        stopped += usize::from(last);
+                    }
+                    Ok(Expiry::Kept) => {}
+                    // The observer went back since the read above, in a
+                    // reorg: tried again next pass.
+                    Ok(Expiry::Unscanned) => lagging = true,
+                    // One watch that cannot end must not keep the rest from
+                    // ending; it is tried again on the next pass.
+                    Err(e) => {
+                        lagging = true;
+                        tracing::warn!(network = ?net, "ending a watch that ran out failed: {e:#}");
+                        // A database too busy to write fails every watch in
+                        // turn, each after the busy timeout; stop until the
+                        // next pass rather than wait out one per watch.
+                        if is_busy(&e) {
+                            break 'networks;
+                        }
+                    }
+                }
+            }
+        }
+        if ended > 0 {
+            tracing::info!(
+                ended,
+                stopped,
+                "watches nobody renewed for a day of blocks ended; `stopped` scripts are no longer scanned"
+            );
+        }
+        Ok(lagging)
+    }
+
+    /// The watches on `net` that have run out, the observer having scanned to
+    /// `scanned`; see [`watch_cutoff`]. Any watch not yet started starts
+    /// counting here first.
+    fn watches_run_out(
+        &self,
+        tips: &Tips,
+        net: BitcoinNetwork,
+        scanned: u32,
+        deep: u32,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if let Some(start) = watch_start(tips, net, Some(scanned)) {
+            self.store.start_unstarted_watches(net, start)?;
+        }
+        match watch_cutoff(scanned, deep) {
+            Some(cutoff) => self.store.watches_started_by(net, cutoff),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Act on one entry. An error here is the store failing, and rolls back
     /// the entry; anything wrong with the entry itself is logged and the entry
-    /// is removed like any other, so it stops holding its sender's slot. The
-    /// tombstone therefore says the entry was read, not what came of it.
+    /// is removed like any other, so it stops holding its sender's place. The
+    /// removal therefore says the entry was read, not what came of it.
     fn act(&self, e: &InboxEntry, tips: &Tips, now_ms: i64) -> Result<()> {
         let body = match e.body() {
             Ok(b) => b,
@@ -224,11 +526,21 @@ impl Processor<'_> {
                 // `scan_from_height` hint is not acted on yet:
                 // freenet/freenet-bitcoin#7 has why, and the design it needs.
                 // The height recorded with the watch is informational, the tip
-                // when it began, or `u32::MAX` when no tip was known.
-                let tip = match tips.by_network.get(&net) {
-                    Some(&t) => Some(t),
-                    None => self.store.checkpoint(net)?.map(|a| a.height),
+                // when it began, the checkpoint without one, or `u32::MAX`
+                // with neither.
+                // One read, contained: a checkpoint that cannot be read costs
+                // this request its heights, not the whole pass.
+                let checkpoint = match self.store.checkpoint(net) {
+                    Ok(c) => c.map(|a| a.height),
+                    Err(err) => {
+                        tracing::warn!(network = ?net, "reading the scan checkpoint failed: {err:#}");
+                        None
+                    }
                 };
+                let tip = tips.by_network.get(&net).copied().or(checkpoint);
+                // See `watch_start`; with no height known, the watch starts
+                // counting at the first expiry pass that knows one.
+                let start = watch_start(tips, net, checkpoint);
                 if req.scan_from_height.is_some() {
                     tracing::debug!(network = ?net, "a watch's rescan hint was not acted on (freenet-bitcoin#7)");
                 }
@@ -245,6 +557,8 @@ impl Processor<'_> {
                         .set_interest(&i, self.max_watches_per_ghostkey, now_ms)?
                     {
                         InterestChange::Watching => {
+                            self.store
+                                .start_watch(net, &script.0, &e.ghostkey.0, start)?;
                             self.store.add_watch(
                                 &WatchedScript {
                                     network: net,
@@ -532,12 +846,21 @@ impl InboxWorker {
         let mut api = WebApi::start(stream);
         let store = Store::open(&self.db_path)?;
         let observed: Vec<BitcoinNetwork> = self.networks.iter().map(|n| n.network).collect();
+        let deep: HashMap<BitcoinNetwork, u32> = self
+            .networks
+            .iter()
+            .map(|n| (n.network, n.deep_confirmations))
+            .collect();
         let processor = Processor {
             params: &self.params,
             key: &self.key,
             store: &store,
             observed: &observed,
             max_watches_per_ghostkey: MAX_WATCHES_PER_GHOSTKEY,
+            deep_confirmations: &deep,
+            floor_hold_until: Some(
+                Instant::now() + std::time::Duration::from_millis(FLOOR_HOLD_MS as u64),
+            ),
         };
         let key = self.contract_key()?;
         let mut session = Session {
@@ -566,7 +889,7 @@ impl InboxWorker {
                         )
                         .await?
                     }
-                    Step::Open => self.open(&mut api, &mut session).await?,
+                    Step::Open => self.open(&mut api, &mut session, &store).await?,
                     Step::Process(bytes) => {
                         self.on_state(&mut api, key, &processor, &mut session, &bytes)
                             .await?
@@ -586,7 +909,8 @@ impl InboxWorker {
         bytes: &[u8],
     ) -> Result<()> {
         let tips = session.tips(&self.networks);
-        let fingerprint = QuietCache::fingerprint(bytes, &tips);
+        let held = floor_held(processor.floor_hold_until);
+        let fingerprint = QuietCache::fingerprint(bytes, &tips, held);
         if session.quiet.is_quiet(&fingerprint) {
             return Ok(());
         }
@@ -610,7 +934,7 @@ impl InboxWorker {
         };
         session
             .quiet
-            .after_pass(fingerprint, !pass.delta.is_empty());
+            .after_pass(fingerprint, !pass.delta.is_empty() || pass.gated);
         if pass.acted > 0 {
             tracing::info!(acted = pass.acted, "read the request inbox");
         }
@@ -630,8 +954,9 @@ impl InboxWorker {
     }
 
     /// PUT the inbox with its first floor. Nothing is admitted before a floor
-    /// exists, so until this runs nobody can write to it.
-    async fn open(&self, api: &mut WebApi, session: &mut Session) -> Result<()> {
+    /// exists, so until this runs nobody can write to it. See
+    /// [`opening_floor`] for which floor.
+    async fn open(&self, api: &mut WebApi, session: &mut Session, store: &Store) -> Result<()> {
         let Some(tip) = session.tips(&self.networks).mainnet() else {
             tracing::warn!("cannot open the request inbox: the Bitcoin mainnet tip is unreadable");
             return Ok(());
@@ -639,7 +964,7 @@ impl InboxWorker {
         let state = InboxStateV1 {
             floor: Some(SignedFloor::sign(
                 &self.key,
-                tip.saturating_sub(FLOOR_LAG_BLOCKS),
+                opening_floor(store.signed_floor()?, tip),
             )),
             ..Default::default()
         };
@@ -663,13 +988,42 @@ impl InboxWorker {
     }
 }
 
-/// A state's bytes, by hash, and the mainnet tip it was read against.
-pub type Fingerprint = ([u8; 32], Option<u32>);
+/// Whether `e` is SQLite reporting the database busy past its timeout: a
+/// fault of the database, not of whatever row was being written.
+fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(f, _)) if f.code == rusqlite::ErrorCode::DatabaseBusy
+        )
+    })
+}
+
+/// The floor to open the inbox with.
+///
+/// A node answers NotFound when it has lost the inbox, after a restart or a
+/// wiped store, while other peers may still hold it. Opening at the tip's
+/// floor would then raise the floor past every request sent while it was
+/// away, and the higher floor wins every merge. So a bridge that has signed a
+/// floor before opens at that one, and passes raise it once the hold is over.
+pub fn opening_floor(signed: Option<u32>, mainnet_tip: u32) -> u32 {
+    signed.unwrap_or(mainnet_tip.saturating_sub(FLOOR_LAG_BLOCKS))
+}
+
+/// A state's bytes, by hash; every network's tip it was read against, since
+/// whether a watch may end depends on its own network's tip; and whether the
+/// floor was held, so the first pass after the hold is not passed over.
+pub type Fingerprint = (
+    [u8; 32],
+    Vec<(BitcoinNetwork, u32, Option<u32>, bool)>,
+    bool,
+);
 
 /// Which state needs no processing again.
 ///
-/// Only a pass that had nothing to send is remembered. One that sent
-/// tombstones or a floor may have had them refused after sending, so its state
+/// Only a pass that had nothing to send and held nothing back (see
+/// [`Pass::gated`]) is remembered. One that sent
+/// removals or a floor may have had them refused after sending, so its state
 /// is processed again, and they are sent again, until a pass finds nothing
 /// left to send. Processing a settled state again would cost an RSA check per
 /// certificate for nothing.
@@ -677,8 +1031,17 @@ pub type Fingerprint = ([u8; 32], Option<u32>);
 pub struct QuietCache(Option<Fingerprint>);
 
 impl QuietCache {
-    pub fn fingerprint(bytes: &[u8], tips: &Tips) -> Fingerprint {
-        (*blake3::hash(bytes).as_bytes(), tips.mainnet())
+    pub fn fingerprint(bytes: &[u8], tips: &Tips, held: bool) -> Fingerprint {
+        // Everything a pass can turn on: each network's tip, the headers its
+        // node holds and whether it is live, which decide where and whether
+        // a watch starts.
+        let mut t: Vec<(BitcoinNetwork, u32, Option<u32>, bool)> = tips
+            .by_network
+            .iter()
+            .map(|(n, h)| (*n, *h, tips.headers.get(n).copied(), tips.is_live(*n)))
+            .collect();
+        t.sort();
+        (*blake3::hash(bytes).as_bytes(), t, held)
     }
 
     pub fn is_quiet(&self, fp: &Fingerprint) -> bool {
@@ -716,9 +1079,18 @@ impl Session {
                     }
                 },
             };
-            match client.tip() {
-                Ok(a) => {
+            match client.tip_and_headers() {
+                Ok((a, headers)) => {
                     tips.by_network.insert(n.network, a.height);
+                    tips.headers.insert(n.network, headers);
+                    match client.peers() {
+                        Ok(p) => {
+                            tips.peers.insert(n.network, p);
+                        }
+                        Err(e) => {
+                            tracing::warn!(network = ?n.network, "cannot read the peer count: {e}")
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(network = ?n.network, "cannot read the chain tip: {e}");
@@ -807,6 +1179,8 @@ mod tests {
                 (BitcoinNetwork::Bitcoin, MAINNET_TIP),
                 (SIGNET, SIGNET_TIP),
             ]),
+            peers: HashMap::from([(BitcoinNetwork::Bitcoin, 8), (SIGNET, 8)]),
+            ..Default::default()
         }
     }
 
@@ -831,11 +1205,34 @@ mod tests {
             &InboxDelta {
                 floor: Some(SignedFloor::sign(&bridge_key(), floor)),
                 entries,
-                tombstones: vec![],
+                removals: vec![],
             },
         )
         .unwrap();
         s
+    }
+
+    fn try_run_held(
+        store: &Store,
+        state: &InboxStateV1,
+        tips: &Tips,
+        cap: usize,
+        now_ms: i64,
+        floor_hold_until: Option<Instant>,
+    ) -> Result<Pass> {
+        let params = params();
+        let key = bridge_key();
+        let deep = HashMap::from([(BitcoinNetwork::Bitcoin, 6), (SIGNET, 6)]);
+        Processor {
+            params: &params,
+            key: &key,
+            store,
+            observed: OBSERVED,
+            max_watches_per_ghostkey: cap,
+            deep_confirmations: &deep,
+            floor_hold_until,
+        }
+        .pass(state, tips, now_ms)
     }
 
     fn try_run(
@@ -845,16 +1242,12 @@ mod tests {
         cap: usize,
         now_ms: i64,
     ) -> Result<Pass> {
-        let params = params();
-        let key = bridge_key();
-        Processor {
-            params: &params,
-            key: &key,
-            store,
-            observed: OBSERVED,
-            max_watches_per_ghostkey: cap,
-        }
-        .pass(state, tips, now_ms)
+        try_run_held(store, state, tips, cap, now_ms, None)
+    }
+
+    /// Entries a pass removes, across its batches.
+    fn removed(pass: &Pass) -> usize {
+        pass.delta.removals.iter().map(RemovalBatch::len).sum()
     }
 
     fn run_with(store: &Store, state: &InboxStateV1, tips: &Tips, cap: usize) -> Pass {
@@ -899,7 +1292,524 @@ mod tests {
         let mut after = state.clone();
         after.apply_delta(&params(), &pass.delta).unwrap();
         assert!(after.entries.is_empty());
-        assert_eq!(after.tombstones.len(), 1);
+        assert_eq!(after.removals.len(), 1);
+        after.verify(&params()).unwrap();
+    }
+
+    /// A second pass reads a new entry at a height already read at, and signs
+    /// one batch naming both: it covers the first, which the inbox drops.
+    #[test]
+    fn one_batch_per_height_names_everything_read_there_and_replaces_the_last() {
+        let store = Store::open_in_memory().unwrap();
+        let (a, b) = (&ghostkeys()[0], &ghostkeys()[1]);
+        let wa = entry(a, FLOOR + 1, &request(Action::Watch, b"a", 1));
+        let wb = entry(b, FLOOR + 1, &request(Action::Watch, b"b", 1));
+        let mut state = inbox(FLOOR, vec![wa]);
+        let first = run(&store, &state, &tips());
+        state.apply_delta(&params(), &first.delta).unwrap();
+
+        state
+            .apply_delta(&params(), &InboxDelta::submission(None, wb))
+            .unwrap();
+        let second = run(&store, &state, &tips());
+        assert_eq!(second.delta.removals.len(), 1);
+        assert_eq!(removed(&second), 2);
+        assert!(first.delta.removals[0].covered_by(&second.delta.removals[0]));
+        state.apply_delta(&params(), &second.delta).unwrap();
+        assert!(state.entries.is_empty());
+        assert_eq!(
+            state.removals.len(),
+            1,
+            "the first batch is covered and goes"
+        );
+        state.verify(&params()).unwrap();
+    }
+
+    /// Filled to one short of the budget with entries already read; the pass
+    /// reads one more and leaves the other waiting, until the floor passes the
+    /// old removals and frees the budget.
+    #[test]
+    fn past_the_removal_budget_reading_waits_for_the_floor() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .with_transaction(|| {
+                for i in 0..(REMOVAL_BUDGET - 1) as u64 {
+                    let mut k = [0u8; 32];
+                    k[..8].copy_from_slice(&i.to_be_bytes());
+                    // Many senders, each within its share.
+                    store.mark_handled(&k, FLOOR + 1, &k)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let (a, b) = (&ghostkeys()[0], &ghostkeys()[1]);
+        let two = vec![
+            entry(a, FLOOR + 2, &request(Action::Watch, b"a", 1)),
+            entry(b, FLOOR + 2, &request(Action::Watch, b"b", 1)),
+        ];
+        let pass = run(&store, &inbox(FLOOR, two.clone()), &tips());
+        assert_eq!((pass.acted, pass.deferred), (1, 1));
+        assert_eq!(watched(&store).len(), 1);
+        assert_eq!(removed(&pass), 1, "only what was read is removed");
+
+        let pass = run(&store, &inbox(FLOOR + 2, two), &tips());
+        assert_eq!((pass.acted, pass.deferred), (1, 0));
+        assert_eq!(watched(&store).len(), 2);
+    }
+
+    /// One Ghost Key at its share: its next request waits, and another
+    /// sender's is read.
+    #[test]
+    fn one_ghostkey_cannot_spend_the_removal_budget_for_everyone() {
+        let store = Store::open_in_memory().unwrap();
+        let (a, b) = (&ghostkeys()[0], &ghostkeys()[1]);
+        store
+            .with_transaction(|| {
+                for i in 0..REMOVAL_SHARE_PER_GHOSTKEY as u64 {
+                    let mut k = [0u8; 32];
+                    k[..8].copy_from_slice(&i.to_be_bytes());
+                    store.mark_handled(&k, FLOOR + 1, &a.id().0)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let from_a = entry(a, FLOOR + 2, &request(Action::Watch, b"a", 1));
+        let from_b = entry(b, FLOOR + 2, &request(Action::Watch, b"b", 1));
+        let pass = run(&store, &inbox(FLOOR, vec![from_a, from_b]), &tips());
+        assert_eq!((pass.acted, pass.deferred), (1, 1));
+        assert_eq!(watched(&store), vec![b"b".to_vec()]);
+    }
+
+    #[test]
+    fn the_floor_is_held_for_a_while_after_connecting_and_then_follows_the_tip() {
+        let store = Store::open_in_memory().unwrap();
+        let state = inbox(FLOOR - 10, vec![]);
+        let held = try_run_held(
+            &store,
+            &state,
+            &tips(),
+            3,
+            1_000,
+            Some(Instant::now() + Duration::from_secs(3600)),
+        )
+        .unwrap();
+        assert!(held.delta.floor.is_none());
+        let moved = try_run_held(&store, &state, &tips(), 3, 2_000, Some(Instant::now())).unwrap();
+        assert_eq!(moved.delta.floor.map(|f| f.height), Some(FLOOR));
+    }
+
+    // --- how long a watch lasts ------------------------------------------------
+
+    const HOUR: i64 = 3_600_000;
+    const T0: i64 = 1_700_000_000_000;
+
+    /// Test time as blocks: the observer's scan height at `now_ms`, one block
+    /// every ten minutes from the signet tip at [`T0`]. A watch made at T0
+    /// runs out once the observer reaches 149 blocks on: its 144, then five
+    /// more so the last is six deep. So 23 hours on it is kept, 25 on it ends.
+    fn height_at(now_ms: i64) -> u32 {
+        SIGNET_TIP + ((now_ms - T0).max(0) / (10 * 60 * 1000)) as u32
+    }
+
+    /// The observer has scanned signet up to its height at `now_ms`.
+    fn scanned_at(store: &Store, now_ms: i64) {
+        store
+            .set_checkpoint(
+                SIGNET,
+                &BlockAnchor {
+                    height: height_at(now_ms),
+                    hash: BlockHash([0; 32]),
+                },
+            )
+            .unwrap();
+    }
+
+    fn watch_at(store: &Store, gk: &TestGhostkey, made_at_ms: u64, now_ms: i64) {
+        scanned_at(store, now_ms);
+        let w = entry(gk, FLOOR + 1, &request(Action::Watch, b"spk", made_at_ms));
+        run_at(store, &inbox(FLOOR, vec![w]), &tips(), now_ms);
+    }
+
+    /// The observer has scanned far enough past [`T0`] that a watch made then
+    /// has run out.
+    fn caught_up(store: &Store) {
+        scanned_at(store, T0 + 25 * HOUR);
+    }
+
+    /// A pass over an empty inbox, with the observer scanned to `now_ms`.
+    fn tick(store: &Store, tips: &Tips, now_ms: i64) {
+        scanned_at(store, now_ms);
+        run_at(store, &inbox(FLOOR, vec![]), tips, now_ms);
+    }
+
+    fn payment(store: &Store, height: Option<u32>) {
+        store
+            .record_output(
+                SIGNET,
+                b"spk",
+                &[7u8; 32],
+                0,
+                10_000,
+                height.map(|h| (h, BlockHash([1; 32]))),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_watch_ends_a_day_after_it_was_last_asked_for() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        tick(&store, &tips(), T0 + 23 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert!(watched(&store).is_empty());
+    }
+
+    /// A watch lasts its blocks, counted as the observer scans them: 144,
+    /// then five more so the last is buried six deep. No clock enters, so a
+    /// watch waits for the observer however late the clock says it is.
+    #[test]
+    fn a_watch_ends_once_its_blocks_are_scanned_and_its_last_is_buried() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        let at = |h: u32| {
+            store
+                .set_checkpoint(
+                    SIGNET,
+                    &BlockAnchor {
+                        height: h,
+                        hash: BlockHash([0; 32]),
+                    },
+                )
+                .unwrap()
+        };
+        at(SIGNET_TIP + WATCH_LIFETIME_BLOCKS + 4);
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0 + 1000 * HOUR);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "weeks later by the clock, but not yet scanned"
+        );
+        at(SIGNET_TIP + WATCH_LIFETIME_BLOCKS + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0);
+        assert!(
+            watched(&store).is_empty(),
+            "scanned, whatever the clock says"
+        );
+    }
+
+    /// A watch acted on before the observer had scanned anything starts
+    /// counting at its first scan.
+    #[test]
+    fn a_watch_made_before_the_observer_has_scanned_starts_counting_at_its_first_scan() {
+        let store = Store::open_in_memory().unwrap();
+        let w = entry(
+            &ghostkeys()[0],
+            FLOOR + 1,
+            &request(Action::Watch, b"spk", 1),
+        );
+        run_at(&store, &inbox(FLOOR, vec![w]), &tips(), T0);
+        tick(&store, &tips(), T0);
+        tick(&store, &tips(), T0 + 24 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert!(watched(&store).is_empty());
+    }
+
+    #[test]
+    fn a_watch_runs_out_after_its_blocks_and_its_burial() {
+        assert_eq!(watch_cutoff(1000, 6), Some(1000 - 144 - 5));
+        assert_eq!(watch_cutoff(1000, 1), Some(1000 - 144), "no burial asked");
+        assert_eq!(watch_cutoff(1000, 0), Some(1000 - 144));
+        assert_eq!(watch_cutoff(149, 6), Some(0));
+        assert_eq!(watch_cutoff(148, 6), None, "no watch can have run out yet");
+        assert_eq!(watch_cutoff(100, 6), None);
+        assert_eq!(
+            watch_cutoff(u32::MAX, u32::MAX),
+            None,
+            "an unknown depth keeps every watch"
+        );
+    }
+
+    fn checkpoint_at(store: &Store, height: u32) {
+        store
+            .set_checkpoint(
+                SIGNET,
+                &BlockAnchor {
+                    height,
+                    hash: BlockHash([0; 32]),
+                },
+            )
+            .unwrap();
+    }
+
+    /// Every start rewinds the observer a day below the tip, and a Watch
+    /// read then must still count its day from the present.
+    #[test]
+    fn a_watch_read_while_the_observer_is_behind_starts_at_the_tip() {
+        let store = Store::open_in_memory().unwrap();
+        checkpoint_at(&store, SIGNET_TIP - WATCH_LIFETIME_BLOCKS);
+        let w = entry(
+            &ghostkeys()[0],
+            FLOOR + 1,
+            &request(Action::Watch, b"spk", 1),
+        );
+        run_at(&store, &inbox(FLOOR, vec![w]), &tips(), T0);
+        checkpoint_at(&store, SIGNET_TIP + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "counted from the tip"
+        );
+        checkpoint_at(&store, SIGNET_TIP + WATCH_LIFETIME_BLOCKS + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0);
+        assert!(watched(&store).is_empty());
+    }
+
+    /// A node catching up after downtime has headers above its tip, and a
+    /// Watch read then counts from them.
+    #[test]
+    fn a_watch_read_while_its_node_catches_up_starts_at_its_headers() {
+        let store = Store::open_in_memory().unwrap();
+        checkpoint_at(&store, SIGNET_TIP);
+        let mut catching_up = tips();
+        catching_up.headers.insert(SIGNET, SIGNET_TIP + 100);
+        let w = entry(
+            &ghostkeys()[0],
+            FLOOR + 1,
+            &request(Action::Watch, b"spk", 1),
+        );
+        run_at(&store, &inbox(FLOOR, vec![w]), &catching_up, T0);
+        checkpoint_at(&store, SIGNET_TIP + WATCH_LIFETIME_BLOCKS + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "counted from the headers"
+        );
+        checkpoint_at(&store, SIGNET_TIP + 100 + WATCH_LIFETIME_BLOCKS + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0);
+        assert!(watched(&store).is_empty());
+    }
+
+    /// A renewal read while the observer and the node both report heights
+    /// below the watch's start must not move it back and so shorten it.
+    #[test]
+    fn a_renewal_never_moves_a_watchs_start_back() {
+        let store = Store::open_in_memory().unwrap();
+        let a = &ghostkeys()[0];
+        watch_at(&store, a, 1, T0);
+        checkpoint_at(&store, SIGNET_TIP - WATCH_LIFETIME_BLOCKS);
+        let mut behind = tips();
+        behind
+            .by_network
+            .insert(SIGNET, SIGNET_TIP - WATCH_LIFETIME_BLOCKS);
+        let renewal = entry(a, FLOOR + 1, &request(Action::Watch, b"spk", 2));
+        run_at(&store, &inbox(FLOOR, vec![renewal]), &behind, T0);
+        checkpoint_at(&store, SIGNET_TIP + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+    }
+
+    /// With the node unreadable, the checkpoint is where the observer stopped
+    /// when the node went away. A Watch read then waits to start until the
+    /// node can be read again, and a watch not started never ends.
+    #[test]
+    fn a_watch_read_while_its_node_is_unreachable_starts_once_it_is_back() {
+        let store = Store::open_in_memory().unwrap();
+        checkpoint_at(&store, SIGNET_TIP - WATCH_LIFETIME_BLOCKS);
+        let mut unreachable = tips();
+        unreachable.by_network.remove(&SIGNET);
+        let w = entry(
+            &ghostkeys()[0],
+            FLOOR + 1,
+            &request(Action::Watch, b"spk", 1),
+        );
+        run_at(&store, &inbox(FLOOR, vec![w]), &unreachable, T0);
+        checkpoint_at(&store, SIGNET_TIP + WATCH_LIFETIME_BLOCKS + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &unreachable, T0);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "not started, so not ended"
+        );
+        // Back, with the node's tip above the observer's checkpoint: the
+        // count starts at the tip.
+        let back_at = SIGNET_TIP + 200;
+        let mut back = tips();
+        back.by_network.insert(SIGNET, back_at);
+        run_at(&store, &inbox(FLOOR, vec![]), &back, T0);
+        checkpoint_at(&store, back_at + WATCH_LIFETIME_BLOCKS + 4);
+        run_at(&store, &inbox(FLOOR, vec![]), &back, T0);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "counted from the node's tip, not the checkpoint"
+        );
+        checkpoint_at(&store, back_at + WATCH_LIFETIME_BLOCKS + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &back, T0);
+        assert!(watched(&store).is_empty());
+    }
+
+    /// A renewal read with no height known clears its watch's start, so the
+    /// count starts again once one is known, which can only lengthen it.
+    #[test]
+    fn a_renewal_read_with_no_height_known_starts_its_count_again() {
+        let store = Store::open_in_memory().unwrap();
+        let a = &ghostkeys()[0];
+        watch_at(&store, a, 1, T0);
+        let mut unreachable = tips();
+        unreachable.by_network.remove(&SIGNET);
+        let renewal = entry(a, FLOOR + 1, &request(Action::Watch, b"spk", 2));
+        run_at(&store, &inbox(FLOOR, vec![renewal]), &unreachable, T0);
+        checkpoint_at(&store, SIGNET_TIP + WATCH_LIFETIME_BLOCKS + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &unreachable, T0);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "the old start was cleared, not kept"
+        );
+    }
+
+    /// On a test network a peer can feed headers it never backs with blocks;
+    /// they count for at most a day ahead of the tip.
+    #[test]
+    fn a_test_network_node_fed_headers_starts_a_watch_at_most_a_day_ahead() {
+        let store = Store::open_in_memory().unwrap();
+        checkpoint_at(&store, SIGNET_TIP);
+        let mut fed = tips();
+        fed.headers.insert(SIGNET, SIGNET_TIP + 1000);
+        let w = entry(
+            &ghostkeys()[0],
+            FLOOR + 1,
+            &request(Action::Watch, b"spk", 1),
+        );
+        run_at(&store, &inbox(FLOOR, vec![w]), &fed, T0);
+        let start = SIGNET_TIP + WATCH_LIFETIME_BLOCKS;
+        checkpoint_at(&store, start + WATCH_LIFETIME_BLOCKS + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0);
+        assert!(watched(&store).is_empty());
+    }
+
+    /// A node with no peers knows of nothing newer than its own tip, which
+    /// may be long past.
+    #[test]
+    fn a_watch_read_while_its_node_has_no_peers_is_not_started() {
+        let store = Store::open_in_memory().unwrap();
+        checkpoint_at(&store, SIGNET_TIP);
+        let mut isolated = tips();
+        isolated.peers.insert(SIGNET, 0);
+        let w = entry(
+            &ghostkeys()[0],
+            FLOOR + 1,
+            &request(Action::Watch, b"spk", 1),
+        );
+        run_at(&store, &inbox(FLOOR, vec![w]), &isolated, T0);
+        checkpoint_at(&store, SIGNET_TIP + WATCH_LIFETIME_BLOCKS + 5);
+        run_at(&store, &inbox(FLOOR, vec![]), &isolated, T0);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+    }
+
+    #[test]
+    fn a_watch_sent_again_starts_the_day_again() {
+        let store = Store::open_in_memory().unwrap();
+        let a = &ghostkeys()[0];
+        watch_at(&store, a, 1, T0);
+        watch_at(&store, a, 2, T0 + 20 * HOUR);
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        tick(&store, &tips(), T0 + 45 * HOUR);
+        assert!(watched(&store).is_empty());
+    }
+
+    /// Ended by running out, it is a withdrawal like any other: a delayed copy
+    /// of the Watch it ended cannot bring it back, a newer Watch can.
+    #[test]
+    fn a_watch_that_ran_out_comes_back_only_for_a_newer_request() {
+        let store = Store::open_in_memory().unwrap();
+        let a = &ghostkeys()[0];
+        watch_at(&store, a, 10, T0);
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        watch_at(&store, a, 5, T0 + 26 * HOUR);
+        assert!(
+            watched(&store).is_empty(),
+            "older than the one that ran out"
+        );
+        watch_at(&store, a, 20, T0 + 26 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+    }
+
+    #[test]
+    fn a_watch_whose_payment_is_still_being_buried_outlives_its_day() {
+        // Five deep, one short of `deep_confirmations`.
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        payment(&store, Some(height_at(T0 + 25 * HOUR) - 4));
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+
+        // Six deep: buried, and the watch ends.
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        payment(&store, Some(height_at(T0 + 25 * HOUR) - 5));
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert!(watched(&store).is_empty());
+
+        // Moved out of its block by a reorg and not seen again.
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        payment(&store, None);
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+    }
+
+    /// A reorg can move the observer back between the read before expiry and
+    /// the check inside a watch's transaction. That watch is kept, and the
+    /// pass marked to run again rather than cached as quiet. A trigger moves
+    /// the checkpoint back as the first watch ends.
+    #[test]
+    fn a_watch_the_observer_goes_back_on_mid_pass_is_tried_again() {
+        let store = Store::open_in_memory().unwrap();
+        let (a, b) = (&ghostkeys()[0], &ghostkeys()[1]);
+        watch_at(&store, a, 1, T0);
+        let second = entry(b, FLOOR + 1, &request(Action::Watch, b"spk2", 1));
+        run_at(&store, &inbox(FLOOR, vec![second]), &tips(), T0);
+        caught_up(&store);
+        store
+            .execute_for_test(
+                "CREATE TRIGGER moved AFTER UPDATE ON script_interests
+                 WHEN NEW.watching = 0
+                 BEGIN UPDATE chain_checkpoint SET height = height - 10
+                 WHERE network = 'signet'; END;",
+            )
+            .unwrap();
+        let pass = run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0 + 25 * HOUR);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk2".to_vec()],
+            "the first ended, the second was kept"
+        );
+        assert!(pass.gated, "the kept watch is tried again");
+    }
+
+    #[test]
+    fn a_watch_from_before_the_inbox_never_runs_out() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .add_watch(
+                &WatchedScript {
+                    network: SIGNET,
+                    script_pubkey: b"spk".to_vec(),
+                    scan_from_height: 0,
+                    is_public_demo: false,
+                },
+                0,
+            )
+            .unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
     }
 
     #[test]
@@ -958,7 +1868,7 @@ mod tests {
     }
 
     #[test]
-    fn a_watch_whose_tombstone_was_lost_is_removed_again_not_acted_on_again() {
+    fn a_watch_whose_removal_was_lost_is_removed_again_not_acted_on_again() {
         let store = Store::open_in_memory().unwrap();
         let w = entry(
             &ghostkeys()[0],
@@ -968,11 +1878,7 @@ mod tests {
         run(&store, &inbox(FLOOR, vec![w.clone()]), &tips());
         let pass = run(&store, &inbox(FLOOR, vec![w]), &tips());
         assert_eq!(pass.acted, 0);
-        assert_eq!(
-            pass.delta.tombstones.len(),
-            1,
-            "the lost tombstone is sent again"
-        );
+        assert_eq!(removed(&pass), 1, "the lost removal is sent again");
     }
 
     #[test]
@@ -998,7 +1904,7 @@ mod tests {
         let pass = run(&store, &state, &tips());
         assert!(watched(&store).is_empty());
         assert!(store.watched(BitcoinNetwork::Regtest).unwrap().is_empty());
-        assert_eq!(pass.delta.tombstones.len(), 2, "both are removed");
+        assert_eq!(removed(&pass), 2, "both are removed");
     }
 
     /// The inbox is dated by mainnet whatever network a request is for, so a
@@ -1020,7 +1926,7 @@ mod tests {
         let pass = run(&store, &state, &no_signet);
         assert_eq!(pass.acted, 1);
         assert_eq!(watched(&store), vec![b"spk".to_vec()]);
-        assert_eq!(pass.delta.tombstones.len(), 1);
+        assert_eq!(removed(&pass), 1);
         assert_eq!(
             store.watched(SIGNET).unwrap()[0].scan_from_height,
             u32::MAX,
@@ -1330,20 +2236,315 @@ mod tests {
     #[test]
     fn a_state_is_passed_over_only_after_a_pass_that_sent_nothing() {
         let mut q = QuietCache::default();
-        let fp = QuietCache::fingerprint(b"state", &tips());
+        let fp = QuietCache::fingerprint(b"state", &tips(), false);
         assert!(!q.is_quiet(&fp));
-        q.after_pass(fp, true);
+        q.after_pass(fp.clone(), true);
         assert!(
             !q.is_quiet(&fp),
             "it sent something, which the node may have refused"
         );
-        q.after_pass(fp, false);
+        q.after_pass(fp.clone(), false);
         assert!(q.is_quiet(&fp));
         let mut moved = tips();
         moved
             .by_network
             .insert(BitcoinNetwork::Bitcoin, MAINNET_TIP + 1);
-        assert!(!q.is_quiet(&QuietCache::fingerprint(b"state", &moved)));
+        assert!(!q.is_quiet(&QuietCache::fingerprint(b"state", &moved, false)));
+        let mut signet_moved = tips();
+        signet_moved.by_network.insert(SIGNET, SIGNET_TIP + 1);
+        assert!(
+            !q.is_quiet(&QuietCache::fingerprint(b"state", &signet_moved, false)),
+            "whether a watch may end depends on its own network's tip"
+        );
+        assert!(
+            !q.is_quiet(&QuietCache::fingerprint(b"state", &tips(), true)),
+            "the pass that ends the hold must not be passed over"
+        );
+        let mut headers_moved = tips();
+        headers_moved.headers.insert(SIGNET, SIGNET_TIP + 10);
+        assert!(
+            !q.is_quiet(&QuietCache::fingerprint(b"state", &headers_moved, false)),
+            "a watch may now start higher"
+        );
+        let mut isolated = tips();
+        isolated.peers.insert(SIGNET, 0);
+        assert!(
+            !q.is_quiet(&QuietCache::fingerprint(b"state", &isolated, false)),
+            "whether a watch may start at all"
+        );
+    }
+
+    #[test]
+    fn an_inbox_opened_again_keeps_the_floor_it_had() {
+        assert_eq!(opening_floor(Some(FLOOR - 50), MAINNET_TIP), FLOOR - 50);
+        assert_eq!(opening_floor(None, MAINNET_TIP), FLOOR);
+    }
+
+    #[test]
+    fn a_script_another_requester_still_wants_stays_scanned() {
+        let store = Store::open_in_memory().unwrap();
+        let (a, b) = (&ghostkeys()[0], &ghostkeys()[1]);
+        watch_at(&store, a, 1, T0);
+        watch_at(&store, b, 1, T0 + 20 * HOUR);
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()], "b still wants it");
+        tick(&store, &tips(), T0 + 45 * HOUR);
+        assert!(watched(&store).is_empty());
+    }
+
+    /// A node that has just connected may not yet hold the Watch that renews
+    /// a watch, so nothing ends while the floor is held; and a request
+    /// waiting on the budget may be that Watch, so its sender's watches wait
+    /// with it, and only its sender's.
+    #[test]
+    fn a_watch_is_kept_while_the_floor_is_held_or_its_renewal_waits() {
+        let store = Store::open_in_memory().unwrap();
+        let (owner, other) = (&ghostkeys()[0], &ghostkeys()[2]);
+        watch_at(&store, owner, 1, T0);
+        run_at(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![entry(other, FLOOR + 1, &request(Action::Watch, b"spk2", 1))],
+            ),
+            &tips(),
+            T0,
+        );
+        caught_up(&store);
+        let later = T0 + 25 * HOUR;
+        let held = try_run_held(
+            &store,
+            &inbox(FLOOR, vec![]),
+            &tips(),
+            MAX_WATCHES_PER_GHOSTKEY,
+            later,
+            Some(Instant::now() + Duration::from_secs(3600)),
+        )
+        .unwrap();
+        assert!(held.gated, "a held pass is not passed over as quiet");
+        assert_eq!(watched(&store).len(), 2, "held");
+
+        store
+            .with_transaction(|| {
+                for i in 0..REMOVAL_BUDGET as u64 {
+                    let mut k = [0xffu8; 32];
+                    k[..8].copy_from_slice(&i.to_be_bytes());
+                    store.mark_handled(&k, FLOOR + 1, &k)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        // The owner's renewal waits on the spent budget.
+        let renewal = entry(owner, FLOOR + 1, &request(Action::Watch, b"spk", 2));
+        let pass = run_at(&store, &inbox(FLOOR, vec![renewal]), &tips(), later);
+        assert_eq!(pass.deferred, 1);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "the owner's watch waits for its renewal; the other one ends"
+        );
+
+        tick(&store, &tips(), later);
+        assert!(watched(&store).is_empty());
+    }
+
+    #[test]
+    fn a_failure_ending_watches_still_sends_the_removals_and_floor() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .with_transaction(|| {
+                store.set_interest(
+                    &Interest {
+                        network: SIGNET,
+                        script: b"spk",
+                        ghostkey: &[9u8; 32],
+                        watching: true,
+                        request_ms: 1,
+                    },
+                    MAX_WATCHES_PER_GHOSTKEY,
+                    T0,
+                )?;
+                store.start_watch(SIGNET, b"spk", &[9u8; 32], Some(SIGNET_TIP))?;
+                store.add_watch(
+                    &WatchedScript {
+                        network: SIGNET,
+                        script_pubkey: b"spk".to_vec(),
+                        scan_from_height: 0,
+                        is_public_demo: false,
+                    },
+                    T0,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        caught_up(&store);
+        // Fails where ending the watch starts: its network's checkpoint, far
+        // enough on for the watch to have run out, cannot be read. The Watch
+        // acted on below still is.
+        store
+            .execute_for_test(
+                "UPDATE chain_checkpoint SET height = 'not a height' WHERE network = 'signet'",
+            )
+            .unwrap();
+        let fresh = entry(
+            &ghostkeys()[1],
+            FLOOR - 4,
+            &request(Action::Watch, b"other", 1),
+        );
+        let pass = run_at(
+            &store,
+            &inbox(FLOOR - 5, vec![fresh]),
+            &tips(),
+            T0 + 25 * HOUR,
+        );
+        assert_eq!(removed(&pass), 1);
+        assert_eq!(pass.delta.floor.map(|f| f.height), Some(FLOOR));
+        assert!(pass.gated, "the pass runs again");
+        assert!(
+            watched(&store).contains(&b"spk".to_vec()),
+            "the failed expiry changed nothing"
+        );
+        assert!(
+            watched(&store).contains(&b"other".to_vec()),
+            "the Watch was still acted on"
+        );
+    }
+
+    /// One watch whose ending fails keeps no other watch from ending. The
+    /// failing one comes first, since watches are tried in script order.
+    #[test]
+    fn one_watch_that_cannot_end_keeps_no_other_from_ending() {
+        let store = Store::open_in_memory().unwrap();
+        let (a, b) = (&ghostkeys()[0], &ghostkeys()[1]);
+        watch_at(&store, b, 1, T0);
+        let stuck = entry(a, FLOOR + 1, &request(Action::Watch, b"boom", 1));
+        run_at(&store, &inbox(FLOOR, vec![stuck]), &tips(), T0);
+        store
+            .execute_for_test(
+                "CREATE TRIGGER boom BEFORE UPDATE ON script_interests
+                 WHEN NEW.script_pubkey = X'626f6f6d'
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+        caught_up(&store);
+        let pass = run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"boom".to_vec()]);
+        assert!(
+            pass.gated,
+            "the watch that failed is tried again, so the pass is not quiet"
+        );
+    }
+
+    #[test]
+    fn only_a_busy_database_counts_as_a_fault_of_the_database() {
+        let busy = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(5), None);
+        assert!(is_busy(
+            &anyhow::Error::from(busy).context("ending a watch")
+        ));
+        let constraint = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(19), None);
+        assert!(!is_busy(&anyhow::Error::from(constraint)));
+        assert!(!is_busy(&anyhow!("anything else")));
+    }
+
+    /// A database too busy to write fails every watch in turn, so the first
+    /// busy failure ends expiry for the pass, on every network, rather than
+    /// costing the busy timeout once per watch. Watches are tried mainnet
+    /// first, then two on signet: one busy failure is right, two means the
+    /// stop reached only its own network, three that nothing stopped.
+    #[test]
+    fn a_busy_database_stops_expiry_on_every_network() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static BUSY: AtomicUsize = AtomicUsize::new(0);
+        fn refuse(attempt: i32) -> bool {
+            if attempt == 0 {
+                BUSY.fetch_add(1, Ordering::SeqCst);
+            }
+            false
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        let store = Store::open(&path).unwrap();
+        let (a, b) = (&ghostkeys()[0], &ghostkeys()[1]);
+        let mainnet_at = |h: u32| {
+            store
+                .set_checkpoint(
+                    BitcoinNetwork::Bitcoin,
+                    &BlockAnchor {
+                        height: h,
+                        hash: BlockHash([0; 32]),
+                    },
+                )
+                .unwrap()
+        };
+        mainnet_at(MAINNET_TIP);
+        let mainnet = InboxRequest {
+            network: BitcoinNetwork::Bitcoin,
+            ..request(Action::Watch, b"spk", 1)
+        };
+        run_at(
+            &store,
+            &inbox(FLOOR, vec![entry(a, FLOOR + 1, &mainnet)]),
+            &tips(),
+            T0,
+        );
+        watch_at(&store, a, 1, T0);
+        watch_at(&store, b, 1, T0);
+        caught_up(&store);
+        mainnet_at(MAINNET_TIP + 150);
+
+        // Another connection holds the write lock throughout.
+        let other = rusqlite::Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        store.busy_handler_for_test(Some(refuse)).unwrap();
+        let params = params();
+        let key = bridge_key();
+        let deep = HashMap::from([(BitcoinNetwork::Bitcoin, 6), (SIGNET, 6)]);
+        let processor = Processor {
+            params: &params,
+            key: &key,
+            store: &store,
+            observed: OBSERVED,
+            max_watches_per_ghostkey: MAX_WATCHES_PER_GHOSTKEY,
+            deep_confirmations: &deep,
+            floor_hold_until: None,
+        };
+        let lagging = processor
+            .expire_watches(&tips(), T0 + 25 * HOUR, &BTreeSet::new())
+            .unwrap();
+        assert!(lagging, "the watches are tried again next pass");
+        assert_eq!(
+            BUSY.load(Ordering::SeqCst),
+            1,
+            "one busy failure, then no more tries"
+        );
+        other.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(watched(&store), vec![b"spk".to_vec()], "nothing ended");
+    }
+
+    /// Mainnet is tried first, so its unreadable row must not keep signet's
+    /// watch from ending.
+    #[test]
+    fn a_watch_row_that_cannot_be_read_stops_expiry_on_its_network_alone() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        store
+            .execute_for_test(
+                "INSERT INTO script_interests VALUES ('bitcoin', X'00', 7, 1, 0, 0, 0);",
+            )
+            .unwrap();
+        store
+            .set_checkpoint(
+                BitcoinNetwork::Bitcoin,
+                &BlockAnchor {
+                    height: MAINNET_TIP + 500,
+                    hash: BlockHash([0; 32]),
+                },
+            )
+            .unwrap();
+        caught_up(&store);
+        let pass = run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0 + 25 * HOUR);
+        assert!(watched(&store).is_empty(), "signet's watch ended");
+        assert!(pass.gated, "mainnet's expiry is tried again");
     }
 
     // --- the driver ------------------------------------------------------------

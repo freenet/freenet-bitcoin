@@ -1,6 +1,8 @@
-//! Tests. The merge-law tests are the ones that matter most: they are what
-//! would catch a cap or removal rule that stopped commuting.
+//! Tests. The merge tests are the ones that matter most: they are what would
+//! catch a cap or removal rule that broke the laws below the caps, or stopped
+//! two peers agreeing above them.
 
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -12,6 +14,7 @@ use ghostkey_lib::ghost_key_certificate::GhostkeyCertificateV1;
 use ghostkey_lib::notary_certificate::NotaryCertificateV1;
 use ghostkey_lib::util::create_keypair;
 use rand::rngs::{OsRng, StdRng};
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
 use crate::*;
@@ -49,7 +52,7 @@ fn ghostkeys() -> &'static Vec<Gk> {
     static G: OnceLock<Vec<Gk>> = OnceLock::new();
     G.get_or_init(|| {
         let a = authority();
-        (0..(MAX_RECORDS + 4))
+        (0..(MAX_ENTRIES + 4))
             .map(|_| {
                 let (cert, sk) = GhostkeyCertificateV1::new(&a.notary, &a.notary_sk);
                 Gk {
@@ -137,6 +140,51 @@ fn bytes(s: &InboxStateV1) -> Vec<u8> {
     to_cbor(s).unwrap()
 }
 
+/// The batch the bridge signs to remove `es`, all dated `height`.
+fn removal(height: u32, es: &[&WireEntry]) -> RemovalBatch {
+    let set: BTreeSet<RemovedPrefix> = es.iter().map(|w| w.entry.key().removal_prefix()).collect();
+    RemovalBatch::sign(&bridge_sk(), height, &set)
+}
+
+fn apply_removals(s: &mut InboxStateV1, removals: Vec<RemovalBatch>) -> Result<(), String> {
+    s.apply_delta(
+        &params(),
+        &InboxDelta {
+            removals,
+            ..Default::default()
+        },
+    )
+}
+
+fn add_entries(s: &mut InboxStateV1, entries: Vec<WireEntry>) {
+    s.apply_delta(
+        &params(),
+        &InboxDelta {
+            entries,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
+/// A state that received `es` one delta each, as peers receive a stream of
+/// submissions: a single delta may carry at most two entries from one Ghost
+/// Key.
+fn one_by_one(floor: u32, es: &[WireEntry]) -> InboxStateV1 {
+    let mut s = open_at(floor);
+    for w in es {
+        add_entries(&mut s, vec![w.clone()]);
+    }
+    s
+}
+
+/// `n` prefixes naming no entry, from `start`: removals still count them.
+fn prefixes(start: u64, n: usize) -> BTreeSet<RemovedPrefix> {
+    (start..start + n as u64)
+        .map(|i| RemovedPrefix(i.to_be_bytes()))
+        .collect()
+}
+
 // --- certificates -------------------------------------------------------------
 
 #[test]
@@ -170,7 +218,9 @@ fn a_delegate_may_request_as_well_as_a_web_app() {
 #[test]
 fn tampering_with_any_field_is_refused() {
     let gk = &ghostkeys()[0];
-    let good = entry(gk, 104, 1);
+    // One below the window's top, so the tampered height is still inside it
+    // and must be refused rather than dropped.
+    let good = entry(gk, 100 + WINDOW_BLOCKS - 1, 1);
     let admit = |w: WireEntry| {
         let mut s = open_at(100);
         s.apply_delta(
@@ -323,52 +373,184 @@ fn an_entry_below_the_floor_is_dropped_not_rejected() {
 // --- removal ---------------------------------------------------------------------
 
 #[test]
-fn a_tombstone_removes_its_entry_and_lasts_until_the_floor_passes_the_entry() {
+fn a_removal_removes_its_entry_and_lasts_until_the_floor_passes_the_entry() {
     let w = entry(&ghostkeys()[0], 100, 1);
     let key = w.entry.key();
-    let mut s = with_entries(95, std::slice::from_ref(&w));
-    let t = SignedTombstone::for_entry(&bridge_sk(), key, &w.entry);
-    s.apply_delta(
-        &params(),
-        &InboxDelta {
-            tombstones: vec![t],
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut s = with_entries(97, std::slice::from_ref(&w));
+    apply_removals(&mut s, vec![removal(100, &[&w])]).unwrap();
     assert!(s.entries.is_empty());
-    assert!(s.tombstones.contains_key(&key));
+    assert!(s.is_removed(&key, 100));
+    s.verify(&params()).unwrap();
 
-    // A peer that still holds the entry cannot bring it back.
-    let holder = with_entries(95, std::slice::from_ref(&w));
+    // A peer that still holds the entry cannot bring it back, and nor can its
+    // sender by sending it again.
+    let holder = with_entries(97, std::slice::from_ref(&w));
     let mut merged = s.clone();
     merged.merge(&params(), &holder).unwrap();
     assert!(
         merged.entries.is_empty(),
         "a removed entry must not resurrect"
     );
+    merged
+        .apply_delta(&params(), &InboxDelta::submission(None, w.clone()))
+        .unwrap();
+    assert!(merged.entries.is_empty(), "nor be sent again");
 
-    // Floor at the entry's height: tombstone kept.
+    // Floor at the entry's height: removal kept.
     let at = InboxDelta {
         floor: Some(SignedFloor::sign(&bridge_sk(), 100)),
         ..Default::default()
     };
     s.apply_delta(&params(), &at).unwrap();
-    assert!(s.tombstones.contains_key(&key));
+    assert!(s.is_removed(&key, 100));
 
-    // Floor past it: tombstone gone, and the old entry can no longer return.
+    // Floor past it: removal gone, and the old entry can no longer return.
     let past = InboxDelta {
         floor: Some(SignedFloor::sign(&bridge_sk(), 101)),
         ..Default::default()
     };
     s.apply_delta(&params(), &past).unwrap();
-    assert!(s.tombstones.is_empty());
+    assert!(s.removals.is_empty());
     s.merge(&params(), &holder).unwrap();
     assert!(
         s.entries.is_empty(),
         "below the floor, the entry is gone for good"
     );
     s.verify(&params()).unwrap();
+}
+
+#[test]
+fn a_removal_is_admitted_only_as_the_bridge_signed_it() {
+    let w = entry(&ghostkeys()[0], 102, 1);
+    let mut s = with_entries(100, std::slice::from_ref(&w));
+    let before = bytes(&s);
+    let set: BTreeSet<RemovedPrefix> = [w.entry.key().removal_prefix()].into();
+    let forged = RemovalBatch::sign(&SigningKey::from_bytes(&[1u8; 32]), 102, &set);
+    assert!(apply_removals(&mut s, vec![forged]).is_err());
+    let mut moved = removal(102, &[&w]);
+    moved.height = 103;
+    assert!(
+        apply_removals(&mut s, vec![moved]).is_err(),
+        "the height is signed: moved later, a removal would outlive its entry's window"
+    );
+    assert_eq!(bytes(&s), before);
+}
+
+/// One set of removals has one spelling, or two peers holding the same
+/// removals could hold different bytes.
+#[test]
+fn a_removal_batch_in_any_shape_but_its_one_form_is_refused() {
+    let signed = |raw: Vec<u8>| RemovalBatch {
+        height: 101,
+        signature: ByteBuf(
+            bridge_sk()
+                .sign(&crate::removal_message(&bridge(), 101, &raw))
+                .to_bytes()
+                .to_vec(),
+        ),
+        removed: ByteBuf(raw),
+    };
+    let (a, b) = ([1u8; 8], [2u8; 8]);
+    let too_many: Vec<u8> = (0..=MAX_REMOVED as u64)
+        .flat_map(|i| i.to_be_bytes())
+        .collect();
+    for (raw, why) in [
+        (vec![], "empty"),
+        ([a, a].concat(), "a repeat"),
+        ([b, a].concat(), "out of order"),
+        (vec![1u8; 7], "a partial prefix"),
+        (too_many, "more than a state may hold"),
+    ] {
+        let mut s = open_at(100);
+        assert!(apply_removals(&mut s, vec![signed(raw)]).is_err(), "{why}");
+    }
+    let mut s = open_at(100);
+    apply_removals(&mut s, vec![signed([a, b].concat())]).unwrap();
+    s.verify(&params()).unwrap();
+}
+
+#[test]
+fn a_larger_batch_for_a_height_replaces_the_smaller_one_it_covers() {
+    let gks = ghostkeys();
+    let (x, y) = (entry(&gks[0], 102, 1), entry(&gks[1], 102, 2));
+    let mut s = with_entries(100, &[x.clone(), y.clone()]);
+    apply_removals(&mut s, vec![removal(102, &[&x])]).unwrap();
+    assert_eq!((s.removals.len(), s.entries.len()), (1, 1));
+    apply_removals(&mut s, vec![removal(102, &[&x, &y])]).unwrap();
+    assert_eq!(s.removals.len(), 1, "the smaller batch is covered and goes");
+    assert!(s.entries.is_empty());
+    s.verify(&params()).unwrap();
+
+    let before = bytes(&s);
+    apply_removals(&mut s, vec![removal(102, &[&x])]).unwrap();
+    assert_eq!(bytes(&s), before, "arriving late, it changes nothing");
+}
+
+#[test]
+fn a_batch_is_covered_only_by_one_at_its_height_that_removes_as_much() {
+    let x = entry(&ghostkeys()[0], 102, 1);
+    let y = entry(&ghostkeys()[1], 102, 2);
+    assert!(
+        !removal(101, &[&x]).covered_by(&removal(103, &[&x])),
+        "a batch at another height names other entries"
+    );
+    assert!(!removal(103, &[&x]).covered_by(&removal(101, &[&x])));
+    assert!(!removal(102, &[&x, &y]).covered_by(&removal(102, &[&x])));
+    assert!(!removal(102, &[&x]).covered_by(&removal(102, &[&y])));
+    assert!(removal(102, &[&x]).covered_by(&removal(102, &[&y, &x])));
+}
+
+/// What `verify` would have to be told: a state with a covered batch still in
+/// it is not in normal form.
+#[test]
+fn verify_refuses_a_covered_batch_left_in_place() {
+    let (x, y) = (
+        entry(&ghostkeys()[0], 102, 1),
+        entry(&ghostkeys()[1], 102, 2),
+    );
+    let mut s = open_at(100);
+    apply_removals(&mut s, vec![removal(102, &[&x, &y])]).unwrap();
+    let small = removal(102, &[&x]);
+    s.removals.insert(small.key(), small);
+    assert!(s.verify(&params()).is_err());
+}
+
+#[test]
+fn removals_past_their_bound_are_refused_whole() {
+    let mut s = open_at(100);
+    let a = RemovalBatch::sign(&bridge_sk(), 101, &prefixes(0, MAX_REMOVED / 2));
+    let b = RemovalBatch::sign(&bridge_sk(), 102, &prefixes(1 << 32, MAX_REMOVED / 2));
+    apply_removals(&mut s, vec![a, b]).unwrap();
+    s.verify(&params()).unwrap();
+    let before = bytes(&s);
+    let one_more = RemovalBatch::sign(&bridge_sk(), 103, &prefixes(1 << 40, 1));
+    assert!(apply_removals(&mut s, vec![one_more]).is_err());
+    assert_eq!(bytes(&s), before);
+
+    // Removals the floor has passed no longer count.
+    s.apply_delta(
+        &params(),
+        &InboxDelta {
+            floor: Some(SignedFloor::sign(&bridge_sk(), 102)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let one_more = RemovalBatch::sign(&bridge_sk(), 103, &prefixes(1 << 40, 1));
+    apply_removals(&mut s, vec![one_more]).unwrap();
+}
+
+#[test]
+fn removal_batches_past_their_count_are_refused() {
+    // Batches at one height naming one different prefix each: none covers
+    // another, so none is dropped.
+    let batch = |i: u64| RemovalBatch::sign(&bridge_sk(), 101, &prefixes(i, 1));
+    let mut s = open_at(100);
+    apply_removals(&mut s, (0..MAX_REMOVAL_BATCHES as u64).map(batch).collect()).unwrap();
+    assert_eq!(s.removals.len(), MAX_REMOVAL_BATCHES);
+    let before = bytes(&s);
+    assert!(apply_removals(&mut s, vec![batch(MAX_REMOVAL_BATCHES as u64)]).is_err());
+    assert_eq!(bytes(&s), before);
 }
 
 #[test]
@@ -390,11 +572,11 @@ fn a_floor_never_goes_down() {
 #[test]
 fn one_ghostkey_keeps_only_its_newest_records() {
     let gk = &ghostkeys()[0];
-    let es: Vec<WireEntry> = (0..(MAX_RECORDS_PER_GHOSTKEY as u32 + 3))
+    let es: Vec<WireEntry> = (0..(MAX_ENTRIES_PER_GHOSTKEY as u32 + 3))
         .map(|i| entry(gk, 100 + (i % WINDOW_BLOCKS), i as u8))
         .collect();
-    let s = with_entries(100, &es);
-    assert_eq!(s.entries.len(), MAX_RECORDS_PER_GHOSTKEY);
+    let s = one_by_one(100, &es);
+    assert_eq!(s.entries.len(), MAX_ENTRIES_PER_GHOSTKEY);
     let lowest_kept = s.entries.values().map(|e| e.mainnet_height).min().unwrap();
     let highest_dropped = es
         .iter()
@@ -416,90 +598,253 @@ fn the_inbox_as_a_whole_keeps_only_its_newest_records() {
         .enumerate()
         .map(|(i, gk)| entry(gk, 100 + (i as u32 % WINDOW_BLOCKS), 1))
         .collect();
-    assert!(es.len() > MAX_RECORDS);
+    assert!(es.len() > MAX_ENTRIES);
     // More than one delta may carry, so in two.
-    let mut s = with_entries(100, &es[..MAX_RECORDS]);
-    s.apply_delta(
-        &params(),
-        &InboxDelta {
-            entries: es[MAX_RECORDS..].to_vec(),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(s.entries.len(), MAX_RECORDS);
+    let mut s = with_entries(100, &es[..MAX_ENTRIES]);
+    add_entries(&mut s, es[MAX_ENTRIES..].to_vec());
+    assert_eq!(s.entries.len(), MAX_ENTRIES);
     s.verify(&params()).unwrap();
 }
 
+/// The point of the change from tombstones: a read entry gives its place
+/// back at once, rather than holding it until the floor passes.
 #[test]
-fn a_tombstone_keeps_its_entrys_slot() {
-    // Fill one Ghost Key's allowance, tombstone the newest, then offer one more:
-    // it must not fit, or removal would be freeing slots.
+fn a_removal_frees_its_entrys_place_under_either_cap() {
+    // One Ghost Key's allowance.
     let gk = &ghostkeys()[0];
-    let es: Vec<WireEntry> = (0..MAX_RECORDS_PER_GHOSTKEY as u32)
-        .map(|i| entry(gk, 110, i as u8))
+    let es: Vec<WireEntry> = (0..MAX_ENTRIES_PER_GHOSTKEY as u32)
+        .map(|i| entry(gk, 103, i as u8))
         .collect();
     let mut s = with_entries(100, &es);
-    let w = &es[0];
-    let t = SignedTombstone::for_entry(&bridge_sk(), w.entry.key(), &w.entry);
-    s.apply_delta(
-        &params(),
-        &InboxDelta {
-            tombstones: vec![t],
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let older = entry(gk, 105, 200);
+    let older = entry(gk, 101, 200);
+    add_entries(&mut s, vec![older.clone()]);
+    assert!(!s.entries.contains_key(&older.entry.key()), "full");
+    apply_removals(&mut s, vec![removal(103, &[&es[0]])]).unwrap();
+    add_entries(&mut s, vec![older.clone()]);
+    assert!(
+        s.entries.contains_key(&older.entry.key()),
+        "one read, one free"
+    );
+    s.verify(&params()).unwrap();
+
+    // Arriving together, as in any whole-state merge: the removal is applied
+    // before the caps, so the removed entry's place goes to the older one.
+    let mut s = with_entries(100, &es);
     s.apply_delta(
         &params(),
         &InboxDelta {
             entries: vec![older.clone()],
+            removals: vec![removal(103, &[&es[0]])],
             ..Default::default()
         },
     )
     .unwrap();
     assert!(
-        !s.entries.contains_key(&older.entry.key()),
-        "a tombstone must hold its slot until the floor passes it"
+        s.entries.contains_key(&older.entry.key()),
+        "removal first, then the caps"
     );
+
+    // The whole inbox.
+    let gks = ghostkeys();
+    let full: Vec<WireEntry> = gks[..MAX_ENTRIES]
+        .iter()
+        .map(|g| entry(g, 103, 1))
+        .collect();
+    let mut s = with_entries(100, &full);
+    let late = entry(&gks[MAX_ENTRIES], 101, 1);
+    add_entries(&mut s, vec![late.clone()]);
+    assert!(!s.entries.contains_key(&late.entry.key()), "full");
+    apply_removals(&mut s, vec![removal(103, &[&full[0]])]).unwrap();
+    add_entries(&mut s, vec![late.clone()]);
+    assert!(s.entries.contains_key(&late.entry.key()));
     s.verify(&params()).unwrap();
 }
 
-// --- merge laws, on exact bytes ------------------------------------------------------
+/// Superseded batches stay signed and public, so a peer must not verify one
+/// that a batch it holds already covers. A corrupted signature shows it was
+/// not verified, and the state shows it changed nothing.
+#[test]
+fn a_batch_already_covered_is_passed_over_without_being_checked() {
+    let (x, y) = (
+        entry(&ghostkeys()[0], 102, 1),
+        entry(&ghostkeys()[1], 102, 2),
+    );
+    let mut s = open_at(100);
+    apply_removals(&mut s, vec![removal(102, &[&x, &y])]).unwrap();
+    let before = bytes(&s);
+    let mut stale = removal(102, &[&x]);
+    stale.signature.0[0] ^= 1;
+    apply_removals(&mut s, vec![stale]).unwrap();
+    assert_eq!(bytes(&s), before);
+}
 
-/// A random valid state drawn from a shared pool of records, so different
-/// states overlap, collide on caps, and tombstone each other's entries.
-fn random_state(rng: &mut StdRng, pool: &[WireEntry]) -> InboxStateV1 {
+/// A batch removes only entries of its own height. One dated below an entry
+/// whose prefix it shares, as a collision between a sender's own entries
+/// would make it, neither hides the entry nor lets the grouping of a three-way
+/// merge decide whether it survives; so below the caps the merge laws hold
+/// exactly, even under a collision.
+#[test]
+fn a_batch_at_another_height_leaves_an_entry_sharing_its_prefix_alone() {
+    let e = entry(&ghostkeys()[0], 103, 1);
+    let named: BTreeSet<RemovedPrefix> = [e.entry.key().removal_prefix()].into();
+    let a = with_entries(100, std::slice::from_ref(&e));
+    let mut b = open_at(100);
+    apply_removals(&mut b, vec![RemovalBatch::sign(&bridge_sk(), 100, &named)]).unwrap();
+    let c = open_at(101);
+    let left = merged(&merged(&a, &b), &c);
+    let right = merged(&a, &merged(&b, &c));
+    assert_eq!(bytes(&left), bytes(&right), "associative");
+    assert!(left.entries.contains_key(&e.entry.key()));
+    merged(&a, &b).verify(&params()).unwrap();
+
+    // At the entry's own height, the same prefix does remove it.
+    let mut d = a.clone();
+    apply_removals(&mut d, vec![RemovalBatch::sign(&bridge_sk(), 103, &named)]).unwrap();
+    assert!(d.entries.is_empty());
+}
+
+/// An honest delta carries at most two entries from one Ghost Key: it comes
+/// from a state in normal form, or is one sender's submission. More is
+/// refused before anything is verified, so one Ghost Key cannot make every
+/// peer check a hundred of its entries per delta.
+#[test]
+fn a_delta_with_more_entries_from_one_ghostkey_than_a_state_holds_is_refused() {
+    let gk = &ghostkeys()[0];
+    let es: Vec<WireEntry> = (0..=MAX_ENTRIES_PER_GHOSTKEY as u8)
+        .map(|i| entry(gk, 103, i))
+        .collect();
+    let mut s = open_at(100);
+    let before = bytes(&s);
+    let err = s
+        .apply_delta(
+            &params(),
+            &InboxDelta {
+                entries: es,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(err.contains("from one Ghost Key"), "{err}");
+    assert_eq!(bytes(&s), before);
+}
+
+/// A state can carry batches built so that every comparison between them
+/// walks to the end, and needs no signature to do it. The total is bounded
+/// first: two batches, one covering the other, and too many prefixes between
+/// them, must fail on the total rather than on the covering.
+#[test]
+fn verify_bounds_the_removals_before_comparing_them() {
+    let mut s = open_at(100);
+    for n in [MAX_REMOVED / 2 + 1, MAX_REMOVED / 2 + 2] {
+        let b = RemovalBatch::sign(&bridge_sk(), 101, &prefixes(0, n));
+        s.removals.insert(b.key(), b);
+    }
+    let err = s.verify(&params()).unwrap_err();
+    assert!(err.contains("removed entries"), "{err}");
+}
+
+/// A batch the floor has passed removes nothing, even in the merge that
+/// raises the floor past it, so below the caps the laws hold exactly. The
+/// batch names the entry's prefix, as an 8-byte prefix collision would.
+#[test]
+fn a_batch_below_a_newly_raised_floor_removes_nothing_in_that_merge() {
+    let e = entry(&ghostkeys()[0], 103, 1);
+    let named: BTreeSet<RemovedPrefix> = [e.entry.key().removal_prefix()].into();
+    let mut a = open_at(100);
+    apply_removals(&mut a, vec![RemovalBatch::sign(&bridge_sk(), 100, &named)]).unwrap();
+    let c = with_entries(101, std::slice::from_ref(&e));
+    assert_eq!(bytes(&merged(&a, &c)), bytes(&merged(&c, &a)));
+    assert!(merged(&a, &c).entries.contains_key(&e.entry.key()));
+
+    // Likewise when the delta that raises the floor carries a removal too.
+    let other = entry(&ghostkeys()[1], 103, 2);
+    let mut d = a.clone();
+    d.apply_delta(
+        &params(),
+        &InboxDelta {
+            floor: Some(SignedFloor::sign(&bridge_sk(), 101)),
+            entries: vec![e.clone()],
+            removals: vec![removal(103, &[&other])],
+        },
+    )
+    .unwrap();
+    assert!(d.entries.contains_key(&e.entry.key()));
+}
+
+/// Certificates are public, so a state carrying ones no entry uses must be
+/// refused before any of them costs an RSA check. This one would fail its
+/// RSA-backed check, so the error shows which check came first.
+#[test]
+fn verify_refuses_an_unused_certificate_before_checking_any() {
+    let mut s = with_entries(100, &[entry(&ghostkeys()[0], 103, 1)]);
+    let weak = certify(ed25519_dalek::VerifyingKey::from_bytes(&[0u8; 32]).unwrap());
+    s.certificates.insert(cert_key(&weak), weak);
+    let err = s.verify(&params()).unwrap_err();
+    assert!(err.contains("no entry uses"), "{err}");
+}
+
+// --- the merge, on exact bytes -------------------------------------------------------
+
+/// Entries from `gks`, `per_key` each, dated across the window above 100,
+/// and removal batches over them: for each height, nested batches (so one
+/// covers another) and disjoint ones (so neither does).
+fn pool(gks: &[Gk], per_key: usize) -> (Vec<WireEntry>, Vec<RemovalBatch>) {
+    let mut entries = Vec::new();
+    for (gi, gk) in gks.iter().enumerate() {
+        for i in 0..per_key {
+            entries.push(entry(
+                gk,
+                100 + ((i * 3 + gi) as u32 % (WINDOW_BLOCKS + 1)),
+                (i + 10 * gi) as u8,
+            ));
+        }
+    }
+    let mut batches = Vec::new();
+    for h in 100..=100 + WINDOW_BLOCKS {
+        let at: Vec<&WireEntry> = entries
+            .iter()
+            .filter(|w| w.entry.mainnet_height == h)
+            .collect();
+        if at.is_empty() {
+            continue;
+        }
+        let half = at.len().div_ceil(2);
+        batches.push(removal(h, &at[..half]));
+        batches.push(removal(
+            h,
+            &at[half..].iter().copied().take(1).collect::<Vec<_>>(),
+        ));
+        batches.push(removal(h, &at));
+        if at.len() > 2 {
+            batches.push(removal(h, &at[1..2]));
+        }
+    }
+    batches.retain(|b| !b.is_empty());
+    (entries, batches)
+}
+
+/// A random valid state drawn from a shared pool, so different states
+/// overlap, collide on caps, and remove each other's entries.
+fn random_state(rng: &mut StdRng, entries: &[WireEntry], batches: &[RemovalBatch]) -> InboxStateV1 {
     // Sometimes a peer that has never seen the inbox opened: the commonest
     // first contact, and a different path through the merge.
     if rng.gen_bool(0.15) {
         return InboxStateV1::default();
     }
-    let floor = 100 + rng.gen_range(0..6);
+    let floor = 100 + rng.gen_range(0..3);
     let mut s = open_at(floor);
-    let chosen: Vec<WireEntry> = pool.iter().filter(|_| rng.gen_bool(0.5)).cloned().collect();
-    s.apply_delta(
-        &params(),
-        &InboxDelta {
-            entries: chosen.clone(),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let tombs: Vec<SignedTombstone> = pool
+    let chosen: Vec<WireEntry> = entries
         .iter()
-        .filter(|_| rng.gen_bool(0.2))
-        .map(|w| SignedTombstone::for_entry(&bridge_sk(), w.entry.key(), &w.entry))
+        .filter(|_| rng.gen_bool(0.5))
+        .cloned()
         .collect();
-    s.apply_delta(
-        &params(),
-        &InboxDelta {
-            tombstones: tombs,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    add_entries(&mut s, chosen);
+    let chosen: Vec<RemovalBatch> = batches
+        .iter()
+        .filter(|_| rng.gen_bool(0.3))
+        .cloned()
+        .collect();
+    apply_removals(&mut s, chosen).unwrap();
     s
 }
 
@@ -509,26 +854,18 @@ fn merged(a: &InboxStateV1, b: &InboxStateV1) -> InboxStateV1 {
     x
 }
 
+/// Below the caps nothing is discarded, and the merge laws hold exactly.
 #[test]
-fn merge_is_commutative_associative_and_idempotent_on_exact_bytes() {
-    // Few Ghost Keys, many records each, heights across several floors: every
-    // cap and every removal path gets exercised.
-    let gks = &ghostkeys()[..4];
-    let mut pool = Vec::new();
-    for (gi, gk) in gks.iter().enumerate() {
-        for i in 0..(MAX_RECORDS_PER_GHOSTKEY + 6) {
-            pool.push(entry(
-                gk,
-                100 + ((i * 3 + gi) as u32 % WINDOW_BLOCKS),
-                (i + 10 * gi) as u8,
-            ));
-        }
-    }
+fn below_the_caps_the_merge_is_commutative_associative_and_idempotent() {
+    // Two entries per Ghost Key and far fewer than the inbox holds: no cap
+    // binds, and every removal path is exercised.
+    let (entries, batches) = pool(&ghostkeys()[..24], MAX_ENTRIES_PER_GHOSTKEY);
+    assert!(entries.len() < MAX_ENTRIES);
     let mut rng = StdRng::seed_from_u64(0x1b0c);
     for round in 0..40 {
-        let a = random_state(&mut rng, &pool);
-        let b = random_state(&mut rng, &pool);
-        let c = random_state(&mut rng, &pool);
+        let a = random_state(&mut rng, &entries, &batches);
+        let b = random_state(&mut rng, &entries, &batches);
+        let c = random_state(&mut rng, &entries, &batches);
         for s in [&a, &b, &c] {
             s.verify(&params()).unwrap();
         }
@@ -551,15 +888,184 @@ fn merge_is_commutative_associative_and_idempotent_on_exact_bytes() {
     }
 }
 
+/// The case the crate documentation describes: above the caps, the order
+/// records arrive in decides which entry survives. And the recovery: a peer
+/// that kept the entry gives it back.
+#[test]
+fn an_entry_discarded_for_want_of_room_comes_back_from_a_peer_that_kept_it() {
+    let gk = &ghostkeys()[0];
+    let (hi1, hi2, lo) = (entry(gk, 103, 1), entry(gk, 103, 2), entry(gk, 101, 3));
+    let all = [hi1.clone(), hi2.clone(), lo.clone()];
+
+    // Entries first: `lo` ranks third of three and is discarded, and the
+    // removal that would have made room comes too late.
+    let mut early = one_by_one(100, &all);
+    apply_removals(&mut early, vec![removal(103, &[&hi1])]).unwrap();
+    assert!(!early.entries.contains_key(&lo.entry.key()));
+
+    // Removal first: there is room for `lo` when it arrives.
+    let mut late = open_at(100);
+    apply_removals(&mut late, vec![removal(103, &[&hi1])]).unwrap();
+    for w in &all {
+        add_entries(&mut late, vec![w.clone()]);
+    }
+    assert!(late.entries.contains_key(&lo.entry.key()));
+    assert_ne!(bytes(&early), bytes(&late), "the order decided");
+
+    // One exchange, and both hold the same bytes, with `lo` back.
+    assert_eq!(bytes(&merged(&early, &late)), bytes(&merged(&late, &early)));
+    assert!(merged(&early, &late).entries.contains_key(&lo.entry.key()));
+    merged(&early, &late).verify(&params()).unwrap();
+}
+
+/// Above the caps, what still holds: a merge is commutative and idempotent,
+/// two peers that exchange state hold the same bytes afterwards, and peers
+/// gossiping settle on one state.
+#[test]
+fn above_the_caps_peers_that_exchange_state_agree_and_gossip_settles() {
+    let (entries, batches) = pool(&ghostkeys()[..4], MAX_ENTRIES_PER_GHOSTKEY + 5);
+    let mut rng = StdRng::seed_from_u64(0x5eed);
+    for round in 0..30 {
+        // Each peer receives a random selection one record at a time, in its
+        // own order, which is how the discarding happens.
+        let mut peers: Vec<InboxStateV1> = (0..4)
+            .map(|_| {
+                let mut s = open_at(100);
+                let mut records: Vec<Result<&WireEntry, &RemovalBatch>> = entries
+                    .iter()
+                    .filter(|_| rng.gen_bool(0.6))
+                    .map(Ok)
+                    .collect();
+                records.extend(batches.iter().filter(|_| rng.gen_bool(0.4)).map(Err));
+                records.shuffle(&mut rng);
+                for r in records {
+                    match r {
+                        Ok(w) => add_entries(&mut s, vec![w.clone()]),
+                        Err(b) => apply_removals(&mut s, vec![b.clone()]).unwrap(),
+                    }
+                }
+                s.verify(&params()).unwrap();
+                s
+            })
+            .collect();
+
+        for a in &peers {
+            assert_eq!(bytes(&merged(a, a)), bytes(a), "idempotent, round {round}");
+            for b in &peers {
+                assert_eq!(
+                    bytes(&merged(a, b)),
+                    bytes(&merged(b, a)),
+                    "commutative, round {round}"
+                );
+            }
+        }
+
+        let mut passes = 0;
+        loop {
+            let mut changed = false;
+            for i in 0..peers.len() {
+                for j in 0..peers.len() {
+                    let m = merged(&peers[i], &peers[j]);
+                    if m != peers[i] || m != peers[j] {
+                        peers[i] = m.clone();
+                        peers[j] = m;
+                        changed = true;
+                    }
+                }
+            }
+            passes += 1;
+            if !changed {
+                break;
+            }
+            assert!(passes < 10, "gossip did not settle, round {round}");
+        }
+        for p in &peers {
+            assert_eq!(bytes(p), bytes(&peers[0]), "round {round}");
+        }
+        peers[0].verify(&params()).unwrap();
+    }
+}
+
 #[test]
 fn state_bytes_do_not_depend_on_arrival_order() {
     let gk = &ghostkeys()[0];
     let es: Vec<WireEntry> = (0..6).map(|i| entry(gk, 100 + i, i as u8)).collect();
     let mut rev = es.clone();
     rev.reverse();
-    assert_eq!(
-        bytes(&with_entries(100, &es)),
-        bytes(&with_entries(100, &rev))
+    assert_eq!(bytes(&one_by_one(100, &es)), bytes(&one_by_one(100, &rev)));
+}
+
+/// As above, but closer to how peers really meet: enough Ghost Keys that the
+/// inbox-wide cap binds as well as the per-key one (with four only the
+/// per-key cap ever does), peers at different floors, and peers exchanging
+/// summaries and deltas rather than whole states. Fewer rounds, since every
+/// entry costs an RSA check.
+#[test]
+fn above_both_caps_summary_and_delta_exchange_settles_on_one_full_inbox() {
+    let (entries, batches) = pool(&ghostkeys()[..100], MAX_ENTRIES_PER_GHOSTKEY + 1);
+    let mut rng = StdRng::seed_from_u64(0xf1_11);
+    let mut filled = false;
+    let mut varied = false;
+    // One direction of an exchange: `to` asks `from` for what it lacks.
+    let pull = |to: &mut InboxStateV1, from: &InboxStateV1| {
+        if let Some(d) = from.delta(&to.summarize()) {
+            to.apply_delta(&params(), &d).unwrap();
+        }
+    };
+    for round in 0..3 {
+        let mut peers: Vec<InboxStateV1> = (0..3)
+            .map(|_| {
+                let mut s = open_at(100 + rng.gen_range(0..2));
+                let mut records: Vec<Result<&WireEntry, &RemovalBatch>> = entries
+                    .iter()
+                    .filter(|_| rng.gen_bool(0.8))
+                    .map(Ok)
+                    .collect();
+                records.extend(batches.iter().filter(|_| rng.gen_bool(0.15)).map(Err));
+                records.shuffle(&mut rng);
+                for r in records {
+                    match r {
+                        Ok(w) => add_entries(&mut s, vec![w.clone()]),
+                        Err(b) => apply_removals(&mut s, vec![b.clone()]).unwrap(),
+                    }
+                }
+                s
+            })
+            .collect();
+        filled |= peers.iter().any(|p| p.entries.len() == MAX_ENTRIES);
+        varied |= peers
+            .iter()
+            .any(|p| p.floor_height() != peers[0].floor_height());
+
+        let mut settled = false;
+        for _ in 0..20 {
+            let before: Vec<Vec<u8>> = peers.iter().map(bytes).collect();
+            for i in 0..peers.len() {
+                for j in 0..peers.len() {
+                    if i != j {
+                        let from = peers[j].clone();
+                        pull(&mut peers[i], &from);
+                    }
+                }
+            }
+            if peers.iter().map(bytes).collect::<Vec<_>>() == before {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "exchange did not settle, round {round}");
+        for p in &peers {
+            assert_eq!(bytes(p), bytes(&peers[0]), "round {round}");
+        }
+        peers[0].verify(&params()).unwrap();
+    }
+    assert!(
+        filled,
+        "the inbox-wide cap never bound, so this tested nothing new"
+    );
+    assert!(
+        varied,
+        "every peer shared one floor, so differing floors went untested"
     );
 }
 
@@ -568,8 +1074,13 @@ fn state_bytes_do_not_depend_on_arrival_order() {
 #[test]
 fn two_peers_converge_through_summaries_and_deltas() {
     let gks = ghostkeys();
-    let a = with_entries(100, &[entry(&gks[0], 104, 1), entry(&gks[1], 105, 2)]);
-    let b = with_entries(102, &[entry(&gks[2], 106, 3), entry(&gks[0], 104, 1)]);
+    let a = with_entries(100, &[entry(&gks[0], 103, 1), entry(&gks[1], 104, 2)]);
+    let b = with_entries(102, &[entry(&gks[2], 105, 3), entry(&gks[0], 103, 1)]);
+    assert_eq!(
+        (a.entries.len(), b.entries.len()),
+        (2, 2),
+        "all inside the window"
+    );
     let mut a2 = a.clone();
     let mut b2 = b.clone();
     if let Some(d) = b.delta(&a.summarize()) {
@@ -611,7 +1122,7 @@ fn a_peer_behind_only_on_the_floor_is_sent_the_floor() {
     behind.floor = Some(100);
     let d = s.delta(&behind).unwrap();
     assert_eq!(d.floor.map(|f| f.height), Some(105));
-    assert!(d.entries.is_empty() && d.tombstones.is_empty());
+    assert!(d.entries.is_empty() && d.removals.is_empty());
 }
 
 #[test]
@@ -640,20 +1151,165 @@ fn a_summary_is_the_same_small_size_whatever_the_inbox_holds() {
 #[test]
 fn a_delta_larger_than_the_caps_is_refused_before_anything_is_checked() {
     let w = entry(&ghostkeys()[0], 104, 1);
-    let t = SignedTombstone::for_entry(&bridge_sk(), w.entry.key(), &w.entry);
+    let r = removal(104, &[&w]);
     let mut s = open_at(100);
     let before = bytes(&s);
-    let many_tombstones = InboxDelta {
-        tombstones: vec![t; MAX_RECORDS + 1],
+    let many_removals = InboxDelta {
+        removals: vec![r; MAX_REMOVAL_BATCHES + 1],
         ..Default::default()
     };
-    assert!(s.apply_delta(&params(), &many_tombstones).is_err());
+    assert!(s.apply_delta(&params(), &many_removals).is_err());
     let many_entries = InboxDelta {
-        entries: vec![w; MAX_RECORDS + 1],
+        entries: vec![w; MAX_ENTRIES + 1],
         ..Default::default()
     };
     assert!(s.apply_delta(&params(), &many_entries).is_err());
     assert_eq!(bytes(&s), before);
+}
+
+/// Each batch is hashed whole before it can be passed over, so a delta's
+/// total length is bounded before any is. Without that, batches dated below
+/// the floor, which change nothing and are accepted, could be sent at any size.
+#[test]
+fn a_delta_naming_more_removals_than_a_state_may_is_refused() {
+    let at =
+        |h: u32, start: u64, n: usize| RemovalBatch::sign(&bridge_sk(), h, &prefixes(start, n));
+    let mut s = open_at(100);
+    let before = bytes(&s);
+    let half = MAX_REMOVED / 2;
+    apply_removals(&mut s, vec![at(90, 0, half), at(91, 1 << 32, half)]).unwrap();
+    assert_eq!(bytes(&s), before, "batches below the floor change nothing");
+    assert!(apply_removals(&mut s, vec![at(90, 0, half), at(91, 1 << 32, half + 1)]).is_err());
+    assert_eq!(bytes(&s), before);
+}
+
+/// Certificates and the floor are public, so anyone can pair real ones with
+/// forged entries. Such a delta or state must fail on the entries' own
+/// signatures, before any certificate's RSA check is spent on it.
+#[test]
+fn a_forged_entry_fails_before_its_certificate_is_checked() {
+    // Under another master key every certificate fails, so which error comes
+    // back says which check ran first.
+    let mut other = params();
+    other.ghostkey_master.0 = SigningKey::from_bytes(&[9u8; 32])
+        .verifying_key()
+        .to_bytes();
+
+    let w = entry(&ghostkeys()[0], 104, 1);
+    let mut forged = w.clone();
+    let mut sig = forged.entry.signature.as_ref().to_vec();
+    sig[0] ^= 1;
+    forged.entry.signature = ByteBuf(sig);
+
+    let submit = |d: &WireEntry| {
+        open_at(100).apply_delta(
+            &other,
+            &InboxDelta {
+                entries: vec![d.clone()],
+                ..Default::default()
+            },
+        )
+    };
+    let err = submit(&w).unwrap_err();
+    assert!(err.contains("does not chain"), "{err}");
+    let err = submit(&forged).unwrap_err();
+    assert!(err.contains("did not sign"), "{err}");
+
+    let s = with_entries(100, &[w]);
+    let err = s.verify(&other).unwrap_err();
+    assert!(err.contains("does not chain"), "{err}");
+    let mut bad = s.clone();
+    bad.entries.clear();
+    bad.entries.insert(forged.entry.key(), forged.entry.clone());
+    let err = bad.verify(&other).unwrap_err();
+    assert!(err.contains("did not sign"), "{err}");
+}
+
+/// A certificate for the attacker's own key, carrying someone else's notary
+/// signature: it names the key that signs the entry, so only its RSA check
+/// refuses it. A message of such entries costs one RSA check however many it
+/// carries, since validation stops at the first that fails.
+#[test]
+fn fabricated_certificates_cost_one_rsa_check_per_message() {
+    let rsa = || RSA_CHECKS.with(|c| c.get());
+    let fakes: Vec<WireEntry> = (0..3u8)
+        .map(|i| {
+            let sk = SigningKey::from_bytes(&[20 + i; 32]);
+            let mut cert = GhostkeyCertificateV1::from_armored_string(&ghostkeys()[0].pem).unwrap();
+            cert.verifying_key = sk.verifying_key();
+            let gk = Gk {
+                sk,
+                pem: cert.to_armored_string().unwrap(),
+            };
+            entry(&gk, 104, i)
+        })
+        .collect();
+
+    let before = rsa();
+    let err = open_at(100)
+        .apply_delta(
+            &params(),
+            &InboxDelta {
+                entries: fakes.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(err.contains("does not chain"), "{err}");
+    assert_eq!(rsa() - before, 1, "apply_delta");
+
+    let mut s = open_at(100);
+    for w in &fakes {
+        s.certificates
+            .insert(w.entry.cert, w.certificate_pem.clone());
+        s.entries.insert(w.entry.key(), w.entry.clone());
+    }
+    let before = rsa();
+    let err = s.verify(&params()).unwrap_err();
+    assert!(err.contains("does not chain"), "{err}");
+    assert_eq!(rsa() - before, 1, "verify");
+}
+
+/// An entry signed by a key nobody certified, carrying someone else's real
+/// certificate. Its signature checks out under the key it claims, so only
+/// reading the certificate shows the mismatch, and every path that reads
+/// entries must do that before spending the certificate's RSA check.
+#[test]
+fn an_uncertified_signer_carrying_a_real_certificate_costs_no_rsa_check() {
+    let rsa = || RSA_CHECKS.with(|c| c.get());
+    let impostor = SigningKey::from_bytes(&[11u8; 32]);
+    let mut w = entry(&ghostkeys()[0], 104, 1);
+    w.entry.ghostkey = GhostkeyId(impostor.verifying_key().to_bytes());
+    w.entry.signature = ByteBuf(impostor.sign(&w.entry.scoped_payload).to_bytes().to_vec());
+    assert!(
+        verify_entry_signature(&w.entry, &params()).is_ok(),
+        "the entry is validly signed under the key it claims"
+    );
+
+    let mut s = open_at(100);
+    let before = rsa();
+    let err = s
+        .apply_delta(
+            &params(),
+            &InboxDelta {
+                entries: vec![w.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(err.contains("different Ghost Key"), "{err}");
+    assert_eq!(rsa(), before, "apply_delta spent an RSA check");
+
+    // The same entry in a whole state, as a peer or the bridge receives it.
+    let mut bad = with_entries(100, &[entry(&ghostkeys()[0], 104, 1)]);
+    bad.entries.clear();
+    bad.entries.insert(w.entry.key(), w.entry.clone());
+    let before = rsa();
+    let err = bad.verify(&params()).unwrap_err();
+    assert!(err.contains("different Ghost Key"), "{err}");
+    assert_eq!(rsa(), before, "verify spent an RSA check");
+    assert!(bad.verified_entries(&params()).is_empty());
+    assert_eq!(rsa(), before, "verified_entries spent an RSA check");
 }
 
 /// A delta refused part-way must leave nothing of itself behind.
@@ -691,8 +1347,8 @@ fn a_certificate_is_stored_in_its_one_form_however_it_was_sent() {
 #[test]
 fn one_certificate_spelled_two_ways_is_stored_once() {
     let g = &ghostkeys()[0];
-    let a = entry(g, 104, 1);
-    let mut b = entry(g, 105, 2);
+    let a = entry(g, 103, 1);
+    let mut b = entry(g, 104, 2);
     b.certificate_pem = format!("a prefix\n{}", g.pem);
     let s = with_entries(100, &[a, b]);
     assert_eq!(s.entries.len(), 2);
@@ -821,13 +1477,13 @@ fn verify_refuses_a_certificate_not_in_its_one_form() {
 }
 
 #[test]
-fn a_floor_and_tombstones_arriving_together_apply_as_one_after_the_other() {
+fn a_floor_and_removals_arriving_together_apply_as_one_after_the_other() {
     let g = &ghostkeys()[0];
-    let low = entry(g, 104, 1);
-    let high = entry(g, 110, 2);
+    let low = entry(g, 101, 1);
+    let high = entry(g, 104, 2);
     let base = with_entries(100, &[low, high.clone()]);
-    let floor = SignedFloor::sign(&bridge_sk(), 105);
-    let t = SignedTombstone::for_entry(&bridge_sk(), high.entry.key(), &high.entry);
+    let floor = SignedFloor::sign(&bridge_sk(), 102);
+    let t = removal(104, &[&high]);
 
     let mut together = base.clone();
     together
@@ -835,22 +1491,14 @@ fn a_floor_and_tombstones_arriving_together_apply_as_one_after_the_other() {
             &params(),
             &InboxDelta {
                 floor: Some(floor.clone()),
-                tombstones: vec![t.clone()],
+                removals: vec![t.clone()],
                 ..Default::default()
             },
         )
         .unwrap();
 
     let mut apart = base;
-    apart
-        .apply_delta(
-            &params(),
-            &InboxDelta {
-                tombstones: vec![t],
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    apply_removals(&mut apart, vec![t]).unwrap();
     apart
         .apply_delta(
             &params(),
@@ -866,7 +1514,7 @@ fn a_floor_and_tombstones_arriving_together_apply_as_one_after_the_other() {
         together.entries.is_empty(),
         "one below the floor, one removed"
     );
-    assert_eq!(together.tombstones.len(), 1);
+    assert_eq!(together.removals.len(), 1);
     together.verify(&params()).unwrap();
 }
 
@@ -898,9 +1546,16 @@ fn verify_refuses_a_state_that_is_not_in_normal_form() {
     assert!(s.verify(&params()).is_err(), "entry under the wrong key");
 
     let mut s = good.clone();
-    let t = SignedTombstone::for_entry(&bridge_sk(), w.entry.key(), &w.entry);
-    s.tombstones.insert(t.entry, t);
+    let r = removal(104, &[&w]);
+    s.removals.insert(r.key(), r);
     assert!(s.verify(&params()).is_err(), "removed entry still present");
+
+    let mut s = good.clone();
+    let r = removal(104, &[&w]);
+    s.removals.insert(BatchKey([6u8; 32]), r);
+    s.entries.clear();
+    s.certificates.clear();
+    assert!(s.verify(&params()).is_err(), "batch under the wrong key");
 
     let mut s = good.clone();
     let pem = s.certificates.values().next().unwrap().clone();
@@ -913,9 +1568,14 @@ fn verify_refuses_a_state_that_is_not_in_normal_form() {
 
     let mut s = open_at(100);
     let old = entry(&ghostkeys()[1], 99, 3);
-    let t = SignedTombstone::for_entry(&bridge_sk(), old.entry.key(), &old.entry);
-    s.tombstones.insert(t.entry, t);
-    assert!(s.verify(&params()).is_err(), "tombstone below the floor");
+    let r = removal(99, &[&old]);
+    s.removals.insert(r.key(), r);
+    assert!(s.verify(&params()).is_err(), "removal below the floor");
+
+    let mut s = open_at(100);
+    let r = removal(100 + WINDOW_BLOCKS + 1, &[&old]);
+    s.removals.insert(r.key(), r);
+    assert!(s.verify(&params()).is_err(), "removal beyond the window");
 }
 
 // --- sealing ----------------------------------------------------------------------

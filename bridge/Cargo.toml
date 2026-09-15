@@ -23,8 +23,8 @@ futures = "0.3"
 bitcoin = { version = "0.32", features = ["serde"] }
 bitcoincore-rpc = "0.19"
 
-# The request inbox: reading it, opening sealed requests, signing tombstones
-# and the floor. Ghost Key verification comes with it.
+# The request inbox: reading it, opening sealed requests, signing removal
+# batches and the floor. Ghost Key verification comes with it.
 freenet-bitcoin-inbox = { workspace = true, features = ["seal"] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }

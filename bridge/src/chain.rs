@@ -80,6 +80,24 @@ impl ChainClient {
         })
     }
 
+    /// The tip, and the height of the highest header the node holds: the
+    /// tip, or above it while the node catches up. From one call.
+    pub fn tip_and_headers(&self) -> Result<(BlockAnchor, u32)> {
+        let info = self.rpc.get_blockchain_info()?;
+        Ok((
+            BlockAnchor {
+                height: info.blocks as u32,
+                hash: BlockHash(info.best_block_hash.to_byte_array()),
+            },
+            info.headers as u32,
+        ))
+    }
+
+    /// How many peers the node has.
+    pub fn peers(&self) -> Result<u32> {
+        Ok(self.rpc.get_connection_count()? as u32)
+    }
+
     pub fn in_initial_block_download(&self) -> Result<bool> {
         Ok(self.rpc.get_blockchain_info()?.initial_block_download)
     }
@@ -367,6 +385,7 @@ pub fn merkle_root(txids: &[[u8; 32]]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use freenet_bitcoin_common::spv::merkle_root_from_branch;
 
     fn txid(n: u8) -> [u8; 32] {
