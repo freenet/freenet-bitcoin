@@ -63,7 +63,9 @@
 //!
 //! A sender sends its entry together with the floor it read
 //! ([`InboxDelta::submission`]), so a peer whose floor lags takes the floor
-//! first and then admits the entry.
+//! first and then admits the entry. Each entry goes in its own delta: a delta
+//! carrying more than [`MAX_ENTRIES_PER_GHOSTKEY`] entries from one Ghost Key
+//! is refused whole.
 //!
 //! # The merge, and the one subtle part
 //!
@@ -199,8 +201,8 @@ pub const MAX_ENTRIES_PER_GHOSTKEY: usize = 2;
 /// [`MAX_ENTRIES`] pending entries to aim at, that is about 2^57 tries, each a
 /// signature and a hash, against entries that live about half an hour. Two
 /// of an attacker's own entries colliding, about 2^32 tries, harms nobody
-/// else. A removal matches a prefix whatever height its entry is dated,
-/// which only matters after such a collision.
+/// else. A removal names entries of its own height only, so a collision
+/// matters only between two entries dated at the same height.
 pub const REMOVED_PREFIX_BYTES: usize = 8;
 
 /// Removed entries the inbox may name, across all its removal batches.
@@ -221,7 +223,9 @@ pub const MAX_REMOVED: usize = 8192;
 /// the floor has not yet passed reach this; new requests then wait for the
 /// floor. The bridge also gives each Ghost Key only a share of it (a 64th,
 /// `REMOVAL_SHARE_PER_GHOSTKEY` in the bridge), so reaching it takes 64
-/// Ghost Keys each sending 64 requests within about half an hour.
+/// Ghost Keys each having 64 requests read within about half an hour (about
+/// 66 sent each, to hold every place in the inbox as well; see
+/// [`MAX_ENTRIES`]).
 pub const REMOVAL_BUDGET: usize = MAX_REMOVED / 2;
 
 /// Removal batches the inbox may hold.
@@ -747,15 +751,16 @@ impl RemovalBatch {
         })
     }
 
-    /// Whether `other` makes this batch redundant: it lasts at least as long
-    /// and removes everything this one does. Both must pass
+    /// Whether `other` makes this batch redundant: it is for the same height
+    /// and removes everything this one does. A batch at another height names
+    /// other entries, however its prefixes compare. Both must pass
     /// [`Self::check_shape`]. A batch covers itself, so callers compare keys.
     ///
     /// Dropping covered batches keeps the batches that nothing covers, which
     /// is the same set whichever order batches arrive in: that is what lets it
     /// sit inside the merge.
     pub fn covered_by(&self, other: &RemovalBatch) -> bool {
-        if other.height < self.height || other.len() < self.len() {
+        if other.height != self.height || other.len() < self.len() {
             return false;
         }
         let mut theirs = other.removed.0.chunks_exact(REMOVED_PREFIX_BYTES);

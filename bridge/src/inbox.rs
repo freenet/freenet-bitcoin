@@ -84,8 +84,9 @@ const WITHDRAWAL_MEMORY_MS: i64 = 24 * 60 * 60 * 1000;
 /// Without a share, one Ghost Key sending without pause could spend the whole
 /// budget, and while it is spent the bridge reads nothing, so 64 Ghost Keys
 /// would hold every place in the inbox without sending again. With it,
-/// spending the budget takes 64 Ghost Keys each sending 64 requests within
-/// about half an hour, and a key past its share only makes its own requests
+/// spending the budget takes 64 Ghost Keys each having 64 requests read within
+/// about half an hour (about 66 sent each, to hold the inbox as well), and a
+/// key past its share only makes its own requests
 /// wait. An honest sender watching many addresses names up to 32 in one
 /// request.
 pub const REMOVAL_SHARE_PER_GHOSTKEY: usize = REMOVAL_BUDGET / 64;
@@ -164,6 +165,9 @@ pub struct Processor<'a> {
     pub deep_confirmations: &'a HashMap<BitcoinNetwork, u32>,
     /// The floor is not raised before this time; see [`FLOOR_HOLD_MS`].
     pub floor_hold_until_ms: i64,
+    /// The observer lag last warned about, per network, so a stuck observer
+    /// is reported when its lag changes rather than on every pass.
+    pub lag_warned: std::cell::RefCell<HashMap<BitcoinNetwork, Option<u32>>>,
 }
 
 impl Processor<'_> {
@@ -346,7 +350,10 @@ impl Processor<'_> {
             if scanned_to.is_none_or(|h| h < tip) {
                 lagging = true;
                 let behind = scanned_to.map(|h| tip - h);
-                if behind.is_none_or(|b| b > OBSERVER_LAG_WARN_BLOCKS) {
+                // Once per lag, not once per pass: a stuck observer is
+                // reported each time it falls further behind.
+                let new_lag = self.lag_warned.borrow_mut().insert(net, behind) != Some(behind);
+                if new_lag && behind.is_none_or(|b| b > OBSERVER_LAG_WARN_BLOCKS) {
                     tracing::warn!(
                         network = ?net,
                         ?behind,
@@ -356,6 +363,7 @@ impl Processor<'_> {
                 }
                 continue;
             }
+            self.lag_warned.borrow_mut().remove(&net);
             for (script, ghostkey) in candidates {
                 if <[u8; 32]>::try_from(ghostkey.as_slice()).is_ok_and(|g| waiting.contains(&g)) {
                     continue;
@@ -386,6 +394,12 @@ impl Processor<'_> {
                     Err(e) => {
                         lagging = true;
                         tracing::warn!(network = ?net, "ending a watch that ran out failed: {e:#}");
+                        // A database too busy to write fails every watch in
+                        // turn, each after the busy timeout; stop until the
+                        // next pass rather than wait out one per watch.
+                        if is_busy(&e) {
+                            break;
+                        }
                     }
                 }
             }
@@ -756,6 +770,7 @@ impl InboxWorker {
             max_watches_per_ghostkey: MAX_WATCHES_PER_GHOSTKEY,
             deep_confirmations: &deep,
             floor_hold_until_ms: now_ms().saturating_add(FLOOR_HOLD_MS),
+            lag_warned: Default::default(),
         };
         let key = self.contract_key()?;
         let mut session = Session {
@@ -881,6 +896,17 @@ impl InboxWorker {
         )
         .await
     }
+}
+
+/// Whether `e` is SQLite reporting the database busy past its timeout: a
+/// fault of the database, not of whatever row was being written.
+fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(f, _)) if f.code == rusqlite::ErrorCode::DatabaseBusy
+        )
+    })
 }
 
 /// The floor to open the inbox with.
@@ -1094,6 +1120,7 @@ mod tests {
             max_watches_per_ghostkey: cap,
             deep_confirmations: &deep,
             floor_hold_until_ms,
+            lag_warned: Default::default(),
         }
         .pass(state, tips, now_ms)
     }
@@ -2005,8 +2032,24 @@ mod tests {
                  BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             )
             .unwrap();
-        tick(&store, &tips(), T0 + 25 * HOUR);
+        caught_up(&store);
+        let pass = run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0 + 25 * HOUR);
         assert_eq!(watched(&store), vec![b"boom".to_vec()]);
+        assert!(
+            pass.gated,
+            "the watch that failed is tried again, so the pass is not quiet"
+        );
+    }
+
+    #[test]
+    fn only_a_busy_database_counts_as_a_fault_of_the_database() {
+        let busy = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(5), None);
+        assert!(is_busy(
+            &anyhow::Error::from(busy).context("ending a watch")
+        ));
+        let constraint = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(19), None);
+        assert!(!is_busy(&anyhow::Error::from(constraint)));
+        assert!(!is_busy(&anyhow!("anything else")));
     }
 
     // --- the driver ------------------------------------------------------------

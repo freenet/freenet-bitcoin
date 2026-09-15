@@ -288,14 +288,15 @@ contract id as `serving the request inbox`.
   downtime never leaves blocks from its day unscanned (the bridge warns when
   the observer is more than 6 blocks behind); not while the floor is held;
   and not while a request from its own requester waits on the removal budget,
-  since that may be its renewal. Every scan also covers the scripts of
+  since that may be its renewal (only while that request is still in the
+  inbox: one the caps push out or the floor passes no longer counts). Every scan also covers the scripts of
   payments a reorg moved out of their block and that have not been seen
   again, watched or not, so such a payment is found where it was re-mined
   rather than left retracted. Where a
   payment to the script has been seen and is not yet `deep_confirmations`
-  deep, the watch lasts until it is: after a reorg the observer rescans only
-  watched scripts, so ending the watch sooner could have it retract a payment
-  that was only moved to another block. Watches registered before the inbox
+  deep, the watch lasts until it is, erring towards watching while a reorg
+  could still move the payment; a moved payment is found again by the scan
+  of scripts in doubt either way. Watches registered before the inbox
   existed never end this way.
 - **Acted-on entries are recorded** (`inbox_handled`) until the floor passes
   them, so an entry whose removal failed to land is removed again rather than

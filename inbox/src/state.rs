@@ -187,17 +187,24 @@ impl InboxStateV1 {
         self.floor.as_ref().map(|f| f.height)
     }
 
-    /// Every prefix any removal batch names.
-    fn removed(&self) -> BTreeSet<RemovedPrefix> {
-        self.removals.values().flat_map(|b| b.prefixes()).collect()
+    /// Every (height, prefix) a removal batch names. A batch removes entries
+    /// of its own height only, so it and the entries it removes leave the
+    /// window together, and a batch can never hide an entry that outlives it.
+    fn removed(&self) -> BTreeSet<(u32, RemovedPrefix)> {
+        self.removals
+            .values()
+            .flat_map(|b| b.prefixes().map(move |p| (b.height, p)))
+            .collect()
     }
 
-    /// Whether the bridge has read the entry with this key, which is how a
-    /// sender learns its request arrived. Holds until the floor passes the
-    /// entry's height; after that the entry is gone either way.
-    pub fn is_removed(&self, key: &EntryKey) -> bool {
+    /// Whether the bridge has read the entry with this key, dated `height`,
+    /// which is how a sender learns its request arrived. Holds until the
+    /// floor passes that height; after that the entry is gone either way.
+    pub fn is_removed(&self, key: &EntryKey, height: u32) -> bool {
         let p = key.removal_prefix();
-        self.removals.values().any(|b| b.prefixes().any(|q| q == p))
+        self.removals
+            .values()
+            .any(|b| b.height == height && b.prefixes().any(|q| q == p))
     }
 
     /// Drop every batch another batch covers. Of any set of batches, the ones
@@ -302,7 +309,7 @@ impl InboxStateV1 {
             if e.mainnet_height > floor.saturating_add(WINDOW_BLOCKS) {
                 return Err("entry dated beyond the window above the floor".into());
             }
-            if removed.contains(&k.removal_prefix()) {
+            if removed.contains(&(e.mainnet_height, k.removal_prefix())) {
                 return Err("a removed entry is still present".into());
             }
             referenced.insert(e.cert);
@@ -370,7 +377,7 @@ impl InboxStateV1 {
 
         let removed = self.removed();
         self.entries
-            .retain(|k, _| !removed.contains(&k.removal_prefix()));
+            .retain(|k, e| !removed.contains(&(e.mainnet_height, k.removal_prefix())));
 
         let mut ranked: Vec<Ranked> = self
             .entries
@@ -463,11 +470,9 @@ impl InboxStateV1 {
             }
         }
 
-        // Batches the floor has passed go before anything below is decided on
-        // their strength, whatever this delta carries: otherwise a floor that
-        // rose in this very delta could leave a stale batch hiding an entry
-        // that `normalize` would then keep, and which entry survived would
-        // depend on the order the two peers merged in.
+        // Batches the floor has passed go first. A batch names entries of its
+        // own height only, so one below the floor names nothing in the window
+        // and this changes no result; it keeps them out of the work below.
         if let Some(floor) = next.floor_height() {
             next.removals.retain(|_, b| b.height >= floor);
         }
@@ -519,7 +524,7 @@ impl InboxStateV1 {
             for w in &delta.entries {
                 let key = w.entry.key();
                 if next.entries.get(&key) == Some(&w.entry)
-                    || removed.contains(&key.removal_prefix())
+                    || removed.contains(&(w.entry.mainnet_height, key.removal_prefix()))
                     || w.entry.mainnet_height < floor
                     || w.entry.mainnet_height > floor.saturating_add(WINDOW_BLOCKS)
                 {
@@ -600,7 +605,7 @@ impl InboxStateV1 {
         let mut certified: BTreeMap<CertKey, Option<VerifyingKey>> = BTreeMap::new();
         let mut out = Vec::new();
         for (k, e) in &self.entries {
-            if e.key() != *k || removed.contains(&k.removal_prefix()) {
+            if e.key() != *k || removed.contains(&(e.mainnet_height, k.removal_prefix())) {
                 continue;
             }
             let vk = *certified.entry(e.cert).or_insert_with(|| {

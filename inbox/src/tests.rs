@@ -379,7 +379,7 @@ fn a_removal_removes_its_entry_and_lasts_until_the_floor_passes_the_entry() {
     let mut s = with_entries(97, std::slice::from_ref(&w));
     apply_removals(&mut s, vec![removal(100, &[&w])]).unwrap();
     assert!(s.entries.is_empty());
-    assert!(s.is_removed(&key));
+    assert!(s.is_removed(&key, 100));
     s.verify(&params()).unwrap();
 
     // A peer that still holds the entry cannot bring it back, and nor can its
@@ -402,7 +402,7 @@ fn a_removal_removes_its_entry_and_lasts_until_the_floor_passes_the_entry() {
         ..Default::default()
     };
     s.apply_delta(&params(), &at).unwrap();
-    assert!(s.is_removed(&key));
+    assert!(s.is_removed(&key, 100));
 
     // Floor past it: removal gone, and the old entry can no longer return.
     let past = InboxDelta {
@@ -487,14 +487,14 @@ fn a_larger_batch_for_a_height_replaces_the_smaller_one_it_covers() {
 }
 
 #[test]
-fn a_batch_is_covered_only_by_one_that_lasts_as_long_and_removes_as_much() {
+fn a_batch_is_covered_only_by_one_at_its_height_that_removes_as_much() {
     let x = entry(&ghostkeys()[0], 102, 1);
     let y = entry(&ghostkeys()[1], 102, 2);
-    assert!(removal(101, &[&x]).covered_by(&removal(103, &[&x])));
     assert!(
-        !removal(103, &[&x]).covered_by(&removal(101, &[&x])),
-        "one that expires sooner would let the entry back"
+        !removal(101, &[&x]).covered_by(&removal(103, &[&x])),
+        "a batch at another height names other entries"
     );
+    assert!(!removal(103, &[&x]).covered_by(&removal(101, &[&x])));
     assert!(!removal(102, &[&x, &y]).covered_by(&removal(102, &[&x])));
     assert!(!removal(102, &[&x]).covered_by(&removal(102, &[&y])));
     assert!(removal(102, &[&x]).covered_by(&removal(102, &[&y, &x])));
@@ -676,6 +676,31 @@ fn a_batch_already_covered_is_passed_over_without_being_checked() {
     stale.signature.0[0] ^= 1;
     apply_removals(&mut s, vec![stale]).unwrap();
     assert_eq!(bytes(&s), before);
+}
+
+/// A batch removes only entries of its own height. One dated below an entry
+/// whose prefix it shares, as a collision between a sender's own entries
+/// would make it, neither hides the entry nor lets the grouping of a three-way
+/// merge decide whether it survives; so below the caps the merge laws hold
+/// exactly, even under a collision.
+#[test]
+fn a_batch_at_another_height_leaves_an_entry_sharing_its_prefix_alone() {
+    let e = entry(&ghostkeys()[0], 103, 1);
+    let named: BTreeSet<RemovedPrefix> = [e.entry.key().removal_prefix()].into();
+    let a = with_entries(100, std::slice::from_ref(&e));
+    let mut b = open_at(100);
+    apply_removals(&mut b, vec![RemovalBatch::sign(&bridge_sk(), 100, &named)]).unwrap();
+    let c = open_at(101);
+    let left = merged(&merged(&a, &b), &c);
+    let right = merged(&a, &merged(&b, &c));
+    assert_eq!(bytes(&left), bytes(&right), "associative");
+    assert!(left.entries.contains_key(&e.entry.key()));
+    merged(&a, &b).verify(&params()).unwrap();
+
+    // At the entry's own height, the same prefix does remove it.
+    let mut d = a.clone();
+    apply_removals(&mut d, vec![RemovalBatch::sign(&bridge_sk(), 103, &named)]).unwrap();
+    assert!(d.entries.is_empty());
 }
 
 /// An honest delta carries at most two entries from one Ghost Key: it comes

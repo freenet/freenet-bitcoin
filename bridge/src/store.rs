@@ -290,6 +290,12 @@ impl Store {
             CREATE INDEX IF NOT EXISTS observed_outputs_by_script
                 ON observed_outputs (network, script_pubkey);
 
+            -- Every observer round asks which scripts have a payment in
+            -- doubt; the table is never pruned, so read only those rows.
+            CREATE INDEX IF NOT EXISTS observed_outputs_in_doubt
+                ON observed_outputs (network, script_pubkey)
+                WHERE block_height IS NULL;
+
             -- The inbox's own bookkeeping. Today only `signed_floor`, the
             -- highest floor this bridge has signed: entries below it are never
             -- acted on, even if a stale copy of the inbox presents them again.
@@ -558,11 +564,28 @@ impl Store {
             "SELECT DISTINCT script_pubkey FROM observed_outputs
              WHERE network = ?1 AND block_height IS NULL",
         )?;
+        // A row that fails to read must fail the round, not drop its script
+        // from the scan and leave its payment retracted.
         let rows = stmt
             .query_map(params![net.as_str()], |r| r.get::<_, Vec<u8>>(0))?
-            .filter_map(|row| row.ok())
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Whether this exact output was moved out of its block by a reorg and no
+    /// scan has seen it since.
+    pub fn is_output_in_doubt(
+        &self,
+        net: BitcoinNetwork,
+        txid: &[u8; 32],
+        vout: u32,
+    ) -> anyhow::Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM observed_outputs
+             WHERE network = ?1 AND txid = ?2 AND vout = ?3 AND block_height IS NULL)",
+            params![net.as_str(), txid.to_vec(), vout as i64],
+            |r| r.get::<_, bool>(0),
+        )?)
     }
 
     /// Mark the outputs in orphaned blocks as unconfirmed again.

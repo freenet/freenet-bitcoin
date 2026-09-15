@@ -186,8 +186,9 @@ impl ReorgOutcome {
 /// stand for a payment still on the chain. Scanning the scripts in doubt as
 /// well finds it, and a later confirmation supersedes the retraction. A
 /// script stays in doubt until then; one whose payment was double-spent stays
-/// for good, which costs a comparison per output scanned and publishes
-/// nothing.
+/// for good, which costs a comparison per output scanned. Only the payment in
+/// doubt is ever recorded or published for a script nobody watches
+/// ([`Observer::claims_from_block`]), so its other payments stay unreported.
 ///
 /// For the scan only: a script scanned here because it is in doubt is not
 /// watched, and must not be given a scan watermark, which would claim
@@ -416,17 +417,29 @@ impl Observer {
     /// Every outpoint confirmed here is added to `confirmed`, which
     /// [`Observer::retraction_claims`] uses to suppress the retraction of an
     /// output a reorg orphaned and this same rescan put back.
+    ///
+    /// A block is also scanned for scripts nobody watches, when a payment to
+    /// them is in doubt (see [`scan_set`]). For such a script that payment is
+    /// the bridge's only business: any other output to it is skipped, neither
+    /// recorded nor published, so an address whose watch has ended is not
+    /// reported on for good because one payment to it was double-spent.
     pub fn claims_from_block(
         &self,
         store: &Store,
         signer: &Signer,
         block: &ScannedBlock,
         tip: &BlockAnchor,
+        watched: &[Vec<u8>],
         round: &mut RoundClaims,
     ) -> Result<()> {
         store.record_block(self.cfg.network, block.anchor.height, &block.anchor.hash)?;
 
         for found in &block.found {
+            if !watched.contains(&found.script_pubkey)
+                && !store.is_output_in_doubt(self.cfg.network, &found.txid.0, found.vout)?
+            {
+                continue;
+            }
             store.record_output(
                 self.cfg.network,
                 &found.script_pubkey,
@@ -811,8 +824,15 @@ mod tests {
         let found_outpoint = OutPoint { txid, vout: 0 };
 
         let mut round = RoundClaims::default();
-        obs.claims_from_block(&store, &signer, &block, &tip, &mut round)
-            .unwrap();
+        obs.claims_from_block(
+            &store,
+            &signer,
+            &block,
+            &tip,
+            std::slice::from_ref(&script),
+            &mut round,
+        )
+        .unwrap();
 
         assert!(
             round.was_reconfirmed(&found_outpoint),
@@ -830,6 +850,68 @@ mod tests {
             !round.is_empty(),
             "the confirmation itself is still recorded"
         );
+    }
+
+    /// Scanned only because one payment to it is in doubt, an unwatched script
+    /// yields that payment and nothing else: another output to it in the same
+    /// block is neither recorded nor published.
+    #[test]
+    fn an_unwatched_script_yields_only_its_payment_in_doubt() {
+        use crate::chain::FoundOutput;
+
+        let obs = observer();
+        let dir = tempfile::tempdir().unwrap();
+        let signer = Signer::load_or_create(&dir.path().join("key")).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let tip = BlockAnchor {
+            height: 105,
+            hash: BlockHash([7; 32]),
+        };
+        let script = vec![0x51u8];
+        let (proof, txid, block_hash) =
+            freenet_bitcoin_common::spv::testing::payment_proof(&script, 50_000, 1, [0xbb; 32]);
+        // Output 0 was confirmed once, then moved out of its block.
+        store
+            .record_output(obs.network(), &script, &txid.0, 0, 50_000, None)
+            .unwrap();
+        let found = |vout| FoundOutput {
+            script_pubkey: script.clone(),
+            txid,
+            vout,
+            value_sats: 50_000,
+            raw_tx: proof.raw_tx.clone(),
+            merkle_branch: proof.merkle_branch.clone(),
+            tx_index: proof.tx_index,
+        };
+        let block = ScannedBlock {
+            anchor: BlockAnchor {
+                height: 104,
+                hash: block_hash,
+            },
+            prev_hash: BlockHash([0xbb; 32]),
+            header: proof.header,
+            time: 1_700_000_000,
+            median_time: 1_700_000_000,
+            tx_count: 1,
+            found: vec![found(0), found(1)],
+        };
+
+        let mut round = RoundClaims::default();
+        obs.claims_from_block(&store, &signer, &block, &tip, &[], &mut round)
+            .unwrap();
+
+        assert!(round.was_reconfirmed(&OutPoint { txid, vout: 0 }));
+        assert!(
+            !round.was_reconfirmed(&OutPoint { txid, vout: 1 }),
+            "a payment to an unwatched script that was never in doubt is not published"
+        );
+        let recorded: Vec<u32> = store
+            .outputs_above(obs.network(), 0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, vout)| vout)
+            .collect();
+        assert_eq!(recorded, vec![0], "nor recorded");
     }
 
     /// A claim that is not a confirmation must NOT enter the reconfirmation
