@@ -570,7 +570,7 @@ async fn observe_once(
         round.record(script, &freenet_bitcoin_common::Claim::ScannedTo, wm);
     }
 
-    store.prune_blocks(obs.network(), tip.height, 1000)?;
+    store.prune_blocks(obs.network(), 1000)?;
 
     let Some(publisher) = publisher else {
         tracing::debug!("no Freenet connection; observations recorded but not published");

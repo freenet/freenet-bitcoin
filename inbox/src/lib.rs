@@ -376,8 +376,12 @@ pub fn production_master() -> MasterKey {
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     /// Start, or keep, synchronizing these scripts for a day of block time
-    /// from the later of `made_at_ms` and when the bridge reads it. Send it
-    /// again, with a newer `made_at_ms`, to keep a script watched longer.
+    /// from the later of `made_at_ms` and when the bridge reads it (by its
+    /// clock, or the newest block it has scanned where that is later),
+    /// counting `made_at_ms` at most a week past that. Send it again, with a
+    /// newer `made_at_ms`, to keep a script watched longer, and keep doing so
+    /// until any payment awaited is buried: a transaction still unmined when
+    /// the day ends is not found.
     Watch,
     /// Stop wanting these scripts synchronized. Removes only the sender's own
     /// interest: the bridge stops scanning a script when nobody still wants it.
@@ -401,7 +405,9 @@ pub struct InboxRequest {
     ///
     /// It must strictly increase across one sender's requests: a sender making
     /// two in one millisecond adds one to the second. On a tie the bridge
-    /// takes a withdrawal over a watch.
+    /// takes a withdrawal over a watch. So a sender whose clock ran ahead
+    /// keeps its timestamps above those it sent meanwhile: until its clock
+    /// passes them, a request dated lower is ignored, a renewal included.
     pub made_at_ms: u64,
 }
 

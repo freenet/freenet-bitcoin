@@ -152,6 +152,24 @@ impl Store {
         if seen_exist && !seen_have_time {
             self.conn
                 .execute_batch("ALTER TABLE seen_blocks ADD COLUMN block_time_ms INTEGER;")?;
+            // Such a bridge ended no watch by block time, and one from before
+            // watches ended at all promised its requesters none. So each
+            // watch it held is read again now, and has a day from the upgrade
+            // rather than ending as soon as the blocks carry their times.
+            let interests_exist = self
+                .conn
+                .prepare("SELECT 1 FROM pragma_table_info('script_interests')")?
+                .exists([])?;
+            if interests_exist {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as i64);
+                self.conn.execute(
+                    "UPDATE script_interests SET recorded_ms = MAX(recorded_ms, ?1)
+                     WHERE watching = 1",
+                    params![now_ms],
+                )?;
+            }
         }
         // `inbox_handled` first had no requester column. Its rows are still
         // good (they are what removals are built from), so the column is added
@@ -534,13 +552,17 @@ impl Store {
         Ok(())
     }
 
-    /// Drop block records older than `keep` blocks below the tip, so the table
-    /// does not grow without bound over years of operation.
-    pub fn prune_blocks(&self, net: BitcoinNetwork, tip: u32, keep: u32) -> anyhow::Result<()> {
-        let floor = tip.saturating_sub(keep);
+    /// Drop block records more than `keep` blocks below the observer's
+    /// checkpoint, so the table does not grow without bound over years of
+    /// operation. Measured from the checkpoint rather than the node's tip, so
+    /// a catch-up after long downtime keeps the blocks it scans, whose times
+    /// date Watches and end them, and a reorg among them is still seen.
+    /// Without a checkpoint nothing is dropped.
+    pub fn prune_blocks(&self, net: BitcoinNetwork, keep: u32) -> anyhow::Result<()> {
         self.conn.execute(
-            "DELETE FROM seen_blocks WHERE network = ?1 AND height < ?2",
-            params![net.as_str(), floor as i64],
+            "DELETE FROM seen_blocks WHERE network = ?1
+             AND height < (SELECT height FROM chain_checkpoint WHERE network = ?1) - ?2",
+            params![net.as_str(), i64::from(keep)],
         )?;
         Ok(())
     }
@@ -1533,9 +1555,64 @@ mod tests {
         let s = Store::open(&path).unwrap();
         let net = BitcoinNetwork::Signet;
         assert_eq!(s.block_time_ms(net, 100).unwrap(), None);
+        assert_eq!(s.latest_block_time_ms(net).unwrap(), None);
         s.record_block(net, 101, &BlockHash([1; 32]), Some(1_000))
             .unwrap();
         assert_eq!(s.block_time_ms(net, 101).unwrap(), Some(1_000));
+        assert_eq!(s.latest_block_time_ms(net).unwrap(), Some(1_000));
+    }
+
+    /// A bridge upgraded from one that ended no watch by block time gives
+    /// each watch it held a day from the upgrade, rather than ending it as
+    /// soon as the blocks carry their times.
+    #[test]
+    fn watches_held_before_block_times_get_a_day_from_the_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE seen_blocks (
+                     network TEXT NOT NULL, height INTEGER NOT NULL,
+                     block_hash BLOB NOT NULL, PRIMARY KEY (network, height));
+                 CREATE TABLE script_interests (
+                     network TEXT NOT NULL, script_pubkey BLOB NOT NULL,
+                     ghostkey BLOB NOT NULL, watching INTEGER NOT NULL,
+                     request_ms INTEGER NOT NULL, recorded_ms INTEGER NOT NULL,
+                     PRIMARY KEY (network, script_pubkey, ghostkey));
+                 INSERT INTO script_interests VALUES ('signet', X'01', X'02', 1, 1, 1);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        // Any time before this test ran: the watch was read again since.
+        let before_the_upgrade = 1_700_000_000_000;
+        assert!(s
+            .watches_run_out(BitcoinNetwork::Signet, before_the_upgrade, 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The newest block time is that of the highest block on its network
+    /// that has one, whatever order the blocks were recorded in.
+    #[test]
+    fn the_newest_block_time_is_the_highest_timed_block_on_its_network() {
+        let s = store();
+        let net = BitcoinNetwork::Signet;
+        assert_eq!(s.latest_block_time_ms(net).unwrap(), None, "nothing yet");
+        s.record_block(net, 200, &BlockHash([2; 32]), Some(2_000))
+            .unwrap();
+        s.record_block(net, 100, &BlockHash([1; 32]), Some(1_000))
+            .unwrap();
+        s.record_block(net, 300, &BlockHash([3; 32]), None).unwrap();
+        s.record_block(
+            BitcoinNetwork::Bitcoin,
+            900,
+            &BlockHash([9; 32]),
+            Some(9_000),
+        )
+        .unwrap();
+        assert_eq!(s.latest_block_time_ms(net).unwrap(), Some(2_000));
     }
 
     /// A reorg forgets the blocks above its fork, and their times with them,
@@ -1548,9 +1625,11 @@ mod tests {
             s.record_block(net, h, &BlockHash([h as u8; 32]), Some(i64::from(h)))
                 .unwrap();
         }
+        assert_eq!(s.latest_block_time_ms(net).unwrap(), Some(110));
         s.forget_blocks_above(net, 105).unwrap();
         assert_eq!(s.block_time_ms(net, 105).unwrap(), Some(105));
         assert_eq!(s.block_time_ms(net, 106).unwrap(), None);
+        assert_eq!(s.latest_block_time_ms(net).unwrap(), Some(105));
     }
 
     /// Only outputs still moved out of their block put a script in doubt,
@@ -1790,17 +1869,33 @@ mod tests {
         assert!(!s.mark_published(net, b"spk", &[3; 32]).unwrap());
     }
 
+    /// Pruning keeps the blocks near the observer's checkpoint, however far
+    /// the node's tip is ahead, and drops nothing before there is one.
     #[test]
-    fn block_pruning_keeps_the_recent_window() {
+    fn block_pruning_keeps_the_window_below_the_checkpoint() {
         let s = store();
         let net = BitcoinNetwork::Signet;
         for h in 0..200u32 {
             s.record_block(net, h, &BlockHash([h as u8; 32]), None)
                 .unwrap();
         }
-        s.prune_blocks(net, 199, 50).unwrap();
-        assert!(s.block_at(net, 100).unwrap().is_none());
-        assert!(s.block_at(net, 180).unwrap().is_some());
+        s.prune_blocks(net, 50).unwrap();
+        assert!(s.block_at(net, 0).unwrap().is_some(), "no checkpoint yet");
+        s.set_checkpoint(
+            net,
+            &BlockAnchor {
+                height: 120,
+                hash: BlockHash([120; 32]),
+            },
+        )
+        .unwrap();
+        s.prune_blocks(net, 50).unwrap();
+        assert!(s.block_at(net, 60).unwrap().is_none());
+        assert!(
+            s.block_at(net, 70).unwrap().is_some(),
+            "50 below the checkpoint"
+        );
+        assert!(s.block_at(net, 199).unwrap().is_some());
     }
 }
 

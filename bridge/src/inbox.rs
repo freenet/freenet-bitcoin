@@ -104,9 +104,10 @@ pub const REMOVAL_SHARE_PER_GHOSTKEY: usize = REMOVAL_BUDGET / 64;
 /// ends once a block it has scanned is dated a day after the Watch (see
 /// [`Processor::expire_watches`]). A block may be dated at most two hours
 /// ahead of the nodes that accept it, so by then every block published
-/// within 22 hours of the Watch has been scanned for it, however long the
-/// bridge or its node was down. The bridge's clock enters only in dating
-/// when it read the Watch (see [`REQUEST_AHEAD_MAX_MS`]).
+/// after the bridge read the Watch and within 22 hours of it has been
+/// scanned for it, however long the bridge or its node was down. The bridge's clock enters only through the
+/// time it read the Watch, which a clock behind cannot make earlier than the
+/// newest block scanned (see [`REQUEST_AHEAD_MAX_MS`]).
 pub const WATCH_LIFETIME_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// How far past the time the bridge read it a Watch's timestamp may count.
@@ -367,8 +368,9 @@ impl Processor<'_> {
                     continue;
                 }
             };
-            // The block that decides, buried `deep` deep; none while the
-            // observer has scanned fewer blocks than that.
+            // The block that decides, buried `deep` deep (0 counts as 1, the
+            // checkpoint's own block); none while the observer has scanned
+            // fewer blocks than that.
             let Some(at) = scanned.checked_sub(deep.saturating_sub(1)) else {
                 continue;
             };
@@ -511,6 +513,9 @@ impl Processor<'_> {
                 // next pass. This can only lengthen a watch.
                 let read_ms = match self.store.latest_block_time_ms(net) {
                     Ok(t) => t.map_or(now_ms, |t| t.max(now_ms)),
+                    // Unreadable, the Watch is dated by the clock alone, as
+                    // before this floor, rather than failing the pass and
+                    // stalling the inbox on every retry.
                     Err(err) => {
                         tracing::warn!(network = ?net, "reading the newest block's time failed: {err:#}");
                         now_ms
@@ -1557,6 +1562,34 @@ mod tests {
         );
         scanned_to(&store, SIGNET, height_at(T0 + 25 * HOUR), T0 + 25 * HOUR);
         run_at(&store, &inbox(FLOOR, vec![]), &tips(), 0);
+        assert!(watched(&store).is_empty());
+    }
+
+    /// A newest block time that cannot be read costs a Watch its floor, not
+    /// the request: it is recorded, and counts from the bridge's clock.
+    #[test]
+    fn a_watch_read_while_the_newest_block_time_is_unreadable_counts_from_the_clock() {
+        let store = Store::open_in_memory().unwrap();
+        scanned_to(&store, SIGNET, SIGNET_TIP, T0);
+        store
+            .execute_for_test(
+                "UPDATE seen_blocks SET block_time_ms = 'not a time' WHERE network = 'signet'",
+            )
+            .unwrap();
+        let w = entry(
+            &ghostkeys()[0],
+            FLOOR + 1,
+            &request(Action::Watch, b"spk", 1),
+        );
+        run_at(&store, &inbox(FLOOR, vec![w]), &tips(), T0);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()], "recorded");
+        tick(&store, &tips(), T0 + 23 * HOUR);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "a day from the clock"
+        );
+        tick(&store, &tips(), T0 + 25 * HOUR);
         assert!(watched(&store).is_empty());
     }
 
