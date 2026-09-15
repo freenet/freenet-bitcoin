@@ -616,6 +616,23 @@ fn a_removal_frees_its_entrys_place_under_either_cap() {
     );
     s.verify(&params()).unwrap();
 
+    // Arriving together, as in any whole-state merge: the removal is applied
+    // before the caps, so the removed entry's place goes to the older one.
+    let mut s = with_entries(100, &es);
+    s.apply_delta(
+        &params(),
+        &InboxDelta {
+            entries: vec![older.clone()],
+            removals: vec![removal(103, &[&es[0]])],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        s.entries.contains_key(&older.entry.key()),
+        "removal first, then the caps"
+    );
+
     // The whole inbox.
     let gks = ghostkeys();
     let full: Vec<WireEntry> = gks[..MAX_ENTRIES]
