@@ -59,7 +59,8 @@
 //! **A Watch lasts a day.** The bridge ends a watch 24 hours after the last
 //! Watch that asked for it, unless a payment to the script is still being
 //! buried. A sender that still wants the script sends the Watch again, with a
-//! newer `made_at_ms`, before the day is out.
+//! newer `made_at_ms`, well before the day is out: a renewal still on its way
+//! to the bridge's node when the day ends does not save the watch.
 //!
 //! A sender sends its entry together with the floor it read
 //! ([`InboxDelta::submission`]), so a peer whose floor lags takes the floor
@@ -83,8 +84,10 @@
 //!
 //! What holds regardless, and what this crate's tests assert on exact bytes:
 //!
-//! * **Below the caps the merge laws hold exactly.** Union, removal, the floor
-//!   and the ranking are each independent of order, and nothing is discarded.
+//! * **While no cap discards anything, the merge laws hold exactly.** Union,
+//!   removal, the floor and the ranking are each independent of order. That
+//!   means at no step of a merge, not only in its result: a third entry from
+//!   one Ghost Key is discarded on arrival even if a removal later makes room.
 //! * **Two peers that exchange state agree afterwards**, because the normal
 //!   form is a function of the records present and the floor alone. An entry
 //!   one peer discarded comes back from any peer that kept it, if it still
@@ -130,8 +133,12 @@ use serde::{Deserialize, Serialize};
 // Sized from a measurement, not a guess. A contract re-verifies its whole state
 // on validation, and each distinct certificate costs a full chain check ending
 // in an RSA signature: 344 us natively per certificate (2026-09-10), more in
-// WASM. Certificates are stored once and shared, so the worst case is one
-// distinct Ghost Key per entry, which an attacker pays a donation for each.
+// WASM. Certificates are stored once and shared, and a certificate's check is
+// spent only on an entry that claims the key it names and is signed under it,
+// so the worst case is one distinct genuine Ghost Key per entry. An attacker
+// without Ghost Keys can reach it only by replaying genuine entries, which are
+// public while they wait; a fabricated certificate costs one RSA check per
+// message, since validation stops at the first that fails.
 // ---------------------------------------------------------------------------
 
 /// How far behind the mainnet tip the bridge keeps its floor, in blocks.
@@ -513,6 +520,28 @@ pub fn canonical_certificate(pem: &str) -> Result<String, String> {
         .map_err(|e| format!("certificate does not armour: {e:?}"))
 }
 
+/// Check that a certificate names the Ghost Key an entry claims, reading the
+/// certificate without checking its chain.
+///
+/// No RSA, so callers run it before [`verify_certificate`]. Otherwise real
+/// certificates, which are public, paired with entries signed by keys nobody
+/// certified would pass [`verify_entry_signature`] and cost a peer the RSA
+/// check before [`certifies`] refused them.
+pub(crate) fn names_claimed_key(pem: &str, entry: &InboxEntry) -> Result<(), String> {
+    if pem.len() > MAX_CERTIFICATE_BYTES {
+        return Err(format!(
+            "certificate is {} bytes, limit is {MAX_CERTIFICATE_BYTES}",
+            pem.len()
+        ));
+    }
+    let cert = GhostkeyCertificateV1::from_armored_string(pem)
+        .map_err(|e| format!("certificate does not parse: {e:?}"))?;
+    if *cert.verifying_key.as_bytes() != entry.ghostkey.0 {
+        return Err("entry names a different Ghost Key than its certificate certifies".into());
+    }
+    Ok(())
+}
+
 /// A certificate's identity: a digest of its armoured text, which the state
 /// holds only in canonical form (see [`canonical_certificate`]).
 pub fn cert_key(pem: &str) -> CertKey {
@@ -521,11 +550,20 @@ pub fn cert_key(pem: &str) -> CertKey {
     CertKey(*h.finalize().as_bytes())
 }
 
+// Certificate chain checks made on this thread, so a test can assert that a
+// forgery cost none.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RSA_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Check a certificate chains to `master`, returning the Ghost Key it certifies.
 ///
 /// This is the expensive check (it ends in an RSA signature), so callers verify
 /// each distinct certificate once and share the result.
 pub fn verify_certificate(pem: &str, master: &MasterKey) -> Result<VerifyingKey, String> {
+    #[cfg(test)]
+    RSA_CHECKS.with(|c| c.set(c.get() + 1));
     if pem.len() > MAX_CERTIFICATE_BYTES {
         return Err(format!(
             "certificate is {} bytes, limit is {MAX_CERTIFICATE_BYTES}",
@@ -555,17 +593,6 @@ pub(crate) fn check_ghostkey(key: &VerifyingKey) -> Result<(), String> {
     Ok(())
 }
 
-/// Check one entry against the Ghost Key its (already verified) certificate
-/// certifies, returning the signed body.
-pub(crate) fn verify_entry(
-    entry: &InboxEntry,
-    certified: &VerifyingKey,
-    params: &InboxParameters,
-) -> Result<InboxEntryBody, String> {
-    certifies(certified, entry)?;
-    verify_entry_signature(entry, params)
-}
-
 /// Check that a verified certificate certifies the Ghost Key an entry claims.
 pub(crate) fn certifies(certified: &VerifyingKey, entry: &InboxEntry) -> Result<(), String> {
     if entry.ghostkey.0 != *certified.as_bytes() {
@@ -578,9 +605,10 @@ pub(crate) fn certifies(certified: &VerifyingKey, entry: &InboxEntry) -> Result<
 /// the signed body. The claim means nothing until [`certifies`] ties it to a
 /// verified certificate.
 ///
-/// Callers run this before any certificate check. Certificates are public, so
-/// anyone can pair real ones with forged entries; checked in this order, such
-/// a forgery costs a peer an Ed25519 check rather than an RSA check.
+/// Callers run this, after [`names_claimed_key`], before any certificate's
+/// chain. Certificates are public, so anyone can pair real ones with entries
+/// of their own; checked in this order, such an entry costs a peer a
+/// certificate parse and an Ed25519 check, not an RSA check.
 pub(crate) fn verify_entry_signature(
     entry: &InboxEntry,
     params: &InboxParameters,

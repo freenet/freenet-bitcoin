@@ -184,7 +184,10 @@ impl ReorgOutcome {
 /// scripts would then miss the payment where it was re-mined, in this round
 /// or any later one, and the retraction signed when the reorg was found would
 /// stand for a payment still on the chain. Scanning the scripts in doubt as
-/// well finds it, and a later confirmation supersedes the retraction. A
+/// well finds it, and a later confirmation supersedes the retraction. It
+/// finds the payment only under its original txid: one replaced by a fee bump
+/// or other conflicting spend has a new txid, which a watch that has ended does
+/// not see. A
 /// script stays in doubt until then; one whose payment was double-spent stays
 /// for good, which costs a comparison per output scanned. Only the payment in
 /// doubt is ever recorded or published for a script nobody watches

@@ -8,7 +8,7 @@ use ghostkey_lib::ghost_key_certificate::GhostkeyCertificateV1;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    canonical_certificate, cert_key, certifies, verify_certificate, verify_entry,
+    canonical_certificate, cert_key, certifies, names_claimed_key, verify_certificate,
     verify_entry_signature, BatchKey, ByteBuf, CertKey, EntryKey, GhostkeyId, InboxEntry,
     InboxEntryBody, InboxParameters, RemovalBatch, RemovedPrefix, SignedFloor, MAX_ENTRIES,
     MAX_ENTRIES_PER_GHOSTKEY, MAX_REMOVAL_BATCHES, MAX_REMOVED, WINDOW_BLOCKS,
@@ -270,8 +270,12 @@ impl InboxStateV1 {
                 "inbox names {removed_count} removed entries, cap is {MAX_REMOVED}"
             ));
         }
-        for (k, b) in &self.removals {
+        // Every batch's shape first, so the comparisons below read only
+        // well-formed batches, and a malformed one is refused as that.
+        for b in self.removals.values() {
             b.check_shape()?;
+        }
+        for (k, b) in &self.removals {
             if b.key() != *k {
                 return Err("removal batch filed under a key that is not its digest".into());
             }
@@ -325,11 +329,14 @@ impl InboxStateV1 {
             return Err("state holds a certificate no entry uses".into());
         }
 
-        // Each entry's own signature before any certificate. Certificates and
-        // the floor are public, so anyone can build a state of real ones and
-        // forged entries; checked in this order, that costs a peer Ed25519
-        // checks and no RSA.
+        // Cheapest first, and all before any certificate's chain: the key an
+        // entry claims must be the one its certificate names, which reading
+        // the certificate shows, and the entry must be signed under it.
+        // Certificates and the floor are public, so without both anyone could
+        // pair real certificates with entries of their own and make every
+        // peer run each certificate's RSA check before refusing the state.
         for e in self.entries.values() {
+            names_claimed_key(&self.certificates[&e.cert], e)?;
             verify_entry_signature(e, params)?;
         }
 
@@ -368,8 +375,8 @@ impl InboxStateV1 {
     /// place, and an entry discarded earlier for lack of room could now fit.
     /// When the caps overflow, the merge is therefore not associative: which
     /// entry survives can depend on whether a peer saw the removal before or
-    /// after the entry it displaced. Below the caps nothing is discarded and
-    /// the merge laws hold exactly. See the crate documentation, and the tests,
+    /// after the entry it displaced. While no cap discards anything, at any
+    /// step, the merge laws hold exactly. See the crate documentation, and the tests,
     /// which assert both halves on exact bytes.
     pub fn normalize(&mut self) {
         let Some(floor) = self.floor_height() else {
@@ -457,7 +464,7 @@ impl InboxStateV1 {
         // Key than a state may hold. Refusing more before anything is verified
         // keeps one Ghost Key from making every peer check a hundred of its
         // entries per delta. The key counted is the one each entry claims; an
-        // entry that claims another fails `verify_entry` below.
+        // entry that claims another fails `names_claimed_key` below.
         let mut per: BTreeMap<GhostkeyId, usize> = BTreeMap::new();
         for w in &delta.entries {
             let c = per.entry(w.entry.ghostkey).or_insert(0);
@@ -526,9 +533,8 @@ impl InboxStateV1 {
                     next.removals.insert(key, b.clone());
                 }
             }
-            // Before the removed set is built from them below, so an entry is
-            // skipped as removed only on the strength of a batch the result
-            // keeps.
+            // Keeps the state in normal form as batches arrive. No entry's fate
+            // depends on it: a covered batch names a subset of what covers it.
             next.drop_covered();
         }
 
@@ -552,13 +558,15 @@ impl InboxStateV1 {
                     // the rest of the delta is not refused on its account.
                     continue;
                 }
-                // Before the certificate, for the reason given in `verify`.
-                verify_entry_signature(&w.entry, params)?;
                 let pem = canonical_certificate(&w.certificate_pem)?;
                 let ck = cert_key(&pem);
                 if ck != w.entry.cert {
                     return Err("entry names a different certificate than it carries".into());
                 }
+                // Before the certificate's chain, for the reason given in
+                // `verify`.
+                names_claimed_key(&pem, &w.entry)?;
+                verify_entry_signature(&w.entry, params)?;
                 let vk = match certified.get(&ck) {
                     Some(v) => *v,
                     None => {
@@ -627,17 +635,23 @@ impl InboxStateV1 {
             if e.key() != *k || removed.contains(&(e.mainnet_height, k.removal_prefix())) {
                 continue;
             }
+            // Cheapest first, as in `verify`: no certificate's RSA check is
+            // spent on an entry that does not claim the key it names, or is
+            // not signed under it.
+            let Some(pem) = self.certificates.get(&e.cert) else {
+                continue;
+            };
+            if names_claimed_key(pem, e).is_err() || verify_entry_signature(e, params).is_err() {
+                continue;
+            }
             let vk = *certified.entry(e.cert).or_insert_with(|| {
-                let pem = self.certificates.get(&e.cert)?;
                 if cert_key(pem) != e.cert {
                     return None;
                 }
                 verify_certificate(pem, &params.ghostkey_master).ok()
             });
-            if let Some(vk) = vk {
-                if verify_entry(e, &vk, params).is_ok() {
-                    out.push((*k, e));
-                }
+            if vk.is_some_and(|vk| certifies(&vk, e).is_ok()) {
+                out.push((*k, e));
             }
         }
         out

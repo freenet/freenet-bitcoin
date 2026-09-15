@@ -1225,6 +1225,48 @@ fn a_forged_entry_fails_before_its_certificate_is_checked() {
     assert!(err.contains("did not sign"), "{err}");
 }
 
+/// An entry signed by a key nobody certified, carrying someone else's real
+/// certificate. Its signature checks out under the key it claims, so only
+/// reading the certificate shows the mismatch, and every path that reads
+/// entries must do that before spending the certificate's RSA check.
+#[test]
+fn an_uncertified_signer_carrying_a_real_certificate_costs_no_rsa_check() {
+    let rsa = || RSA_CHECKS.with(|c| c.get());
+    let impostor = SigningKey::from_bytes(&[11u8; 32]);
+    let mut w = entry(&ghostkeys()[0], 104, 1);
+    w.entry.ghostkey = GhostkeyId(impostor.verifying_key().to_bytes());
+    w.entry.signature = ByteBuf(impostor.sign(&w.entry.scoped_payload).to_bytes().to_vec());
+    assert!(
+        verify_entry_signature(&w.entry, &params()).is_ok(),
+        "the entry is validly signed under the key it claims"
+    );
+
+    let mut s = open_at(100);
+    let before = rsa();
+    let err = s
+        .apply_delta(
+            &params(),
+            &InboxDelta {
+                entries: vec![w.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(err.contains("different Ghost Key"), "{err}");
+    assert_eq!(rsa(), before, "apply_delta spent an RSA check");
+
+    // The same entry in a whole state, as a peer or the bridge receives it.
+    let mut bad = with_entries(100, &[entry(&ghostkeys()[0], 104, 1)]);
+    bad.entries.clear();
+    bad.entries.insert(w.entry.key(), w.entry.clone());
+    let before = rsa();
+    let err = bad.verify(&params()).unwrap_err();
+    assert!(err.contains("different Ghost Key"), "{err}");
+    assert_eq!(rsa(), before, "verify spent an RSA check");
+    assert!(bad.verified_entries(&params()).is_empty());
+    assert_eq!(rsa(), before, "verified_entries spent an RSA check");
+}
+
 /// A delta refused part-way must leave nothing of itself behind.
 #[test]
 fn a_refused_delta_changes_nothing() {

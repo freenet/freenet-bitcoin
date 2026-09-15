@@ -80,6 +80,20 @@ impl ChainClient {
         })
     }
 
+    /// The tip, and whether the node has finished syncing: out of initial
+    /// block download, and holding every block it has a header for. From one
+    /// call, so the two agree.
+    pub fn sync_status(&self) -> Result<(BlockAnchor, bool)> {
+        let info = self.rpc.get_blockchain_info()?;
+        Ok((
+            BlockAnchor {
+                height: info.blocks as u32,
+                hash: BlockHash(info.best_block_hash.to_byte_array()),
+            },
+            !info.initial_block_download && info.blocks == info.headers,
+        ))
+    }
+
     pub fn in_initial_block_download(&self) -> Result<bool> {
         Ok(self.rpc.get_blockchain_info()?.initial_block_download)
     }

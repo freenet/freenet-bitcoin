@@ -112,6 +112,13 @@ pub const WATCH_LIFETIME_MS: i64 = 24 * 60 * 60 * 1000;
 /// below it, unread. A node catches up with one small contract in seconds.
 pub const FLOOR_HOLD_MS: i64 = 2 * 60 * 1000;
 
+/// Whether the floor is still held at `now_ms`. A hold never lasts more than
+/// [`FLOOR_HOLD_MS`] from when it is checked, so a clock stepped back cannot
+/// stretch it, and stop reading and expiry with it.
+fn floor_held(now_ms: i64, until_ms: i64) -> bool {
+    now_ms < until_ms && until_ms - now_ms <= FLOOR_HOLD_MS
+}
+
 /// How far behind the tip the observer may be, in blocks, before watches kept
 /// for it are worth a warning. A block or two is an observer between rounds;
 /// more than this is one that is stuck or catching up after downtime.
@@ -126,6 +133,10 @@ const OBSERVER_LAG_WARN_BLOCKS: u32 = 6;
 pub struct Tips {
     /// The tip of each network this bridge observes, where it could be read.
     pub by_network: HashMap<BitcoinNetwork, u32>,
+    /// Networks whose node is still syncing: in initial block download, or
+    /// holding headers it has not fetched the blocks for. Its tip is then
+    /// only how far it has got, so no watch ends on it.
+    pub syncing: BTreeSet<BitcoinNetwork>,
 }
 
 impl Tips {
@@ -269,7 +280,7 @@ impl Processor<'_> {
                 .push(RemovalBatch::sign(self.key, h, &removed));
         }
 
-        let held = now_ms < self.floor_hold_until_ms;
+        let held = floor_held(now_ms, self.floor_hold_until_ms);
         let target = match tips.mainnet() {
             Some(tip) if !held => known.max(Some(tip.saturating_sub(FLOOR_LAG_BLOCKS))),
             _ => known,
@@ -329,7 +340,7 @@ impl Processor<'_> {
     ) -> Result<bool> {
         let cutoff = now_ms.saturating_sub(WATCH_LIFETIME_MS);
         let (mut ended, mut stopped, mut lagging) = (0usize, 0usize, false);
-        for &net in self.observed {
+        'networks: for &net in self.observed {
             let Some(&tip) = tips.by_network.get(&net) else {
                 continue;
             };
@@ -343,18 +354,32 @@ impl Processor<'_> {
                 .unwrap_or(u32::MAX);
             let candidates = self.store.watches_recorded_before(net, cutoff)?;
             if candidates.is_empty() {
+                self.lag_warned.borrow_mut().remove(&net);
+                continue;
+            }
+            // A node still syncing reports as its tip the last block it has,
+            // which the observer may well have scanned. That says nothing of
+            // the blocks it has yet to fetch, from the day these watches ran.
+            if tips.syncing.contains(&net) {
+                lagging = true;
                 continue;
             }
             // Checked once here, to spare a transaction per watch while the
             // observer is behind, and again inside each, where it counts.
+            // Caught up means exactly at the tip: a checkpoint above it means
+            // the node went back (a reindex), and has not fetched those blocks
+            // again yet.
             let scanned_to = self.store.checkpoint(net)?.map(|c| c.height);
-            if scanned_to.is_none_or(|h| h < tip) {
+            if scanned_to != Some(tip) {
                 lagging = true;
-                let behind = scanned_to.map(|h| tip - h);
+                let behind = scanned_to.map(|h| tip.saturating_sub(h));
                 // Once per lag, not once per pass: a stuck observer is
-                // reported each time it falls further behind.
-                let new_lag = self.lag_warned.borrow_mut().insert(net, behind) != Some(behind);
-                if new_lag && behind.is_none_or(|b| b > OBSERVER_LAG_WARN_BLOCKS) {
+                // reported each time it falls further behind, and not again
+                // while it catches up.
+                let lag = behind.unwrap_or(u32::MAX);
+                let previous = self.lag_warned.borrow_mut().insert(net, behind);
+                let grew = previous.is_none_or(|p| lag > p.unwrap_or(u32::MAX));
+                if grew && behind.is_none_or(|b| b > OBSERVER_LAG_WARN_BLOCKS) {
                     tracing::warn!(
                         network = ?net,
                         ?behind,
@@ -372,7 +397,7 @@ impl Processor<'_> {
                 // Checked inside the transaction that ends the watch, so the
                 // observer's progress and outputs are read as they stand then.
                 let outcome = self.store.with_transaction(|| {
-                    let scanned = self.store.checkpoint(net)?.is_some_and(|c| c.height >= tip);
+                    let scanned = self.store.checkpoint(net)?.is_some_and(|c| c.height == tip);
                     if !scanned || self.store.has_shallow_output(net, &script, tip, deep)? {
                         return Ok(None);
                     }
@@ -399,7 +424,7 @@ impl Processor<'_> {
                         // turn, each after the busy timeout; stop until the
                         // next pass rather than wait out one per watch.
                         if is_busy(&e) {
-                            break;
+                            break 'networks;
                         }
                     }
                 }
@@ -820,7 +845,7 @@ impl InboxWorker {
         bytes: &[u8],
     ) -> Result<()> {
         let tips = session.tips(&self.networks);
-        let held = now_ms() < processor.floor_hold_until_ms;
+        let held = floor_held(now_ms(), processor.floor_hold_until_ms);
         let fingerprint = QuietCache::fingerprint(bytes, &tips, held);
         if session.quiet.is_quiet(&fingerprint) {
             return Ok(());
@@ -980,9 +1005,12 @@ impl Session {
                     }
                 },
             };
-            match client.tip() {
-                Ok(a) => {
+            match client.sync_status() {
+                Ok((a, synced)) => {
                     tips.by_network.insert(n.network, a.height);
+                    if !synced {
+                        tips.syncing.insert(n.network);
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(network = ?n.network, "cannot read the chain tip: {e}");
@@ -1071,6 +1099,7 @@ mod tests {
                 (BitcoinNetwork::Bitcoin, MAINNET_TIP),
                 (SIGNET, SIGNET_TIP),
             ]),
+            ..Default::default()
         }
     }
 
@@ -2051,6 +2080,127 @@ mod tests {
         let constraint = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(19), None);
         assert!(!is_busy(&anyhow::Error::from(constraint)));
         assert!(!is_busy(&anyhow!("anything else")));
+    }
+
+    /// A database too busy to write fails every watch in turn, so the first
+    /// busy failure ends expiry for the pass, on every network, rather than
+    /// costing the busy timeout once per watch. Watches are tried mainnet
+    /// first, then two on signet: one busy failure is right, two means the
+    /// stop reached only its own network, three that nothing stopped.
+    #[test]
+    fn a_busy_database_stops_expiry_on_every_network() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static BUSY: AtomicUsize = AtomicUsize::new(0);
+        fn refuse(attempt: i32) -> bool {
+            if attempt == 0 {
+                BUSY.fetch_add(1, Ordering::SeqCst);
+            }
+            false
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        let store = Store::open(&path).unwrap();
+        let (a, b) = (&ghostkeys()[0], &ghostkeys()[1]);
+        let mainnet = InboxRequest {
+            network: BitcoinNetwork::Bitcoin,
+            ..request(Action::Watch, b"spk", 1)
+        };
+        run_at(
+            &store,
+            &inbox(FLOOR, vec![entry(a, FLOOR + 1, &mainnet)]),
+            &tips(),
+            T0,
+        );
+        watch_at(&store, a, 1, T0);
+        watch_at(&store, b, 1, T0);
+        caught_up(&store);
+        store
+            .set_checkpoint(
+                BitcoinNetwork::Bitcoin,
+                &BlockAnchor {
+                    height: MAINNET_TIP,
+                    hash: BlockHash([0; 32]),
+                },
+            )
+            .unwrap();
+
+        // Another connection holds the write lock throughout.
+        let other = rusqlite::Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        store.busy_handler_for_test(Some(refuse)).unwrap();
+        let params = params();
+        let key = bridge_key();
+        let deep = HashMap::from([(BitcoinNetwork::Bitcoin, 6), (SIGNET, 6)]);
+        let processor = Processor {
+            params: &params,
+            key: &key,
+            store: &store,
+            observed: OBSERVED,
+            max_watches_per_ghostkey: MAX_WATCHES_PER_GHOSTKEY,
+            deep_confirmations: &deep,
+            floor_hold_until_ms: i64::MIN,
+            lag_warned: Default::default(),
+        };
+        let lagging = processor
+            .expire_watches(&tips(), T0 + 25 * HOUR, &BTreeSet::new())
+            .unwrap();
+        assert!(lagging, "the watches are tried again next pass");
+        assert_eq!(
+            BUSY.load(Ordering::SeqCst),
+            1,
+            "one busy failure, then no more tries"
+        );
+        other.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(watched(&store), vec![b"spk".to_vec()], "nothing ended");
+    }
+
+    /// A node syncing after downtime reports as its tip the last block it
+    /// has, which the observer may already have scanned.
+    #[test]
+    fn a_watch_does_not_end_while_its_node_is_still_syncing() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        caught_up(&store);
+        let mut syncing = tips();
+        syncing.syncing.insert(SIGNET);
+        let pass = run_at(&store, &inbox(FLOOR, vec![]), &syncing, T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        assert!(pass.gated, "kept for the node, so not passed over as quiet");
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert!(watched(&store).is_empty());
+    }
+
+    /// A reindexing node reports a tip below what the observer scanned
+    /// before, and has not fetched the blocks above it again yet.
+    #[test]
+    fn a_checkpoint_above_the_tip_is_not_caught_up() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        store
+            .set_checkpoint(
+                SIGNET,
+                &BlockAnchor {
+                    height: SIGNET_TIP + 5,
+                    hash: BlockHash([0; 32]),
+                },
+            )
+            .unwrap();
+        let pass = run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        assert!(pass.gated);
+        tick(&store, &tips(), T0 + 26 * HOUR);
+        assert!(watched(&store).is_empty());
+    }
+
+    #[test]
+    fn a_clock_stepped_back_does_not_stretch_the_floor_hold() {
+        assert!(
+            floor_held(T0, T0 + FLOOR_HOLD_MS),
+            "held for its two minutes"
+        );
+        assert!(!floor_held(T0 + FLOOR_HOLD_MS, T0 + FLOOR_HOLD_MS));
+        // Set at T0 for two minutes, then the clock went back an hour.
+        assert!(!floor_held(T0 - HOUR, T0 + FLOOR_HOLD_MS));
     }
 
     // --- the driver ------------------------------------------------------------

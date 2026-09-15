@@ -909,8 +909,9 @@ impl Store {
                 params![net.as_str(), cutoff_ms, OPERATOR_INTEREST.to_vec()],
                 |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
             )?
-            .filter_map(|row| row.ok())
-            .collect();
+            // A row that fails to read fails the expiry, which is logged and
+            // tried again, rather than vanishing without a word.
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -1019,6 +1020,14 @@ impl Store {
         Ok(())
     }
 
+    /// Replace the busy timeout with `handler`, for tests that need to see
+    /// each time a write meets another connection's lock.
+    #[cfg(test)]
+    pub fn busy_handler_for_test(&self, handler: Option<fn(i32) -> bool>) -> anyhow::Result<()> {
+        self.conn.busy_handler(handler)?;
+        Ok(())
+    }
+
     // --- inbox entries already acted on ------------------------------------
 
     pub fn is_handled(&self, entry_key: &[u8; 32]) -> anyhow::Result<bool> {
@@ -1089,9 +1098,27 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare("SELECT entry_key FROM inbox_handled WHERE entry_height = ?1")?;
+        // A row that fails to read is logged and left out, not made to fail
+        // the pass: failing would stop the bridge reading anything until the
+        // floor passed the row, while leaving it out costs only that entry's
+        // removal, and the entry is not acted on twice.
         let keys = stmt
             .query_map(params![entry_height as i64], |r| r.get::<_, Vec<u8>>(0))?
-            .filter_map(|row| row.ok().and_then(|k| <[u8; 32]>::try_from(k).ok()))
+            .filter_map(|row| match row.map(<[u8; 32]>::try_from) {
+                Ok(Ok(k)) => Some(k),
+                Ok(Err(k)) => {
+                    tracing::warn!(
+                        len = k.len(),
+                        entry_height,
+                        "an entry key on record is not 32 bytes"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(entry_height, "an entry key on record cannot be read: {e}");
+                    None
+                }
+            })
             .collect();
         Ok(keys)
     }
