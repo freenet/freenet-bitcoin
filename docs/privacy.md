@@ -31,8 +31,10 @@ address. The inbox is built not to be one:
   which scripts) is encrypted to the bridge's key. Peers store and relay only
   ciphertext.
 - **Requests are transient.** The bridge removes each one once it has read it,
-  and every peer drops a request about three hours after it was made, when the
-  inbox's floor, which follows the Bitcoin mainnet tip, passes it.
+  and every peer drops a request about half an hour after it was made, when
+  the inbox's floor, which follows the Bitcoin mainnet tip, passes it. What a
+  removal leaves behind is 8 bytes of the request's digest, which names no
+  script, and it goes when the floor passes too.
 - **What is visible** is that a given Ghost Key sent this bridge a request,
   when (to the block), and how large the sealed request is. That was accepted
   explicitly in freenet/freenet-bitcoin#3: the Ghost Key has to be visible for

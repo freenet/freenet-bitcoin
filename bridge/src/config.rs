@@ -93,6 +93,46 @@ impl BridgeConfig {
         if cfg.networks.is_empty() {
             anyhow::bail!("configuration lists no networks; the bridge would do nothing");
         }
+        // The bridge keeps the blocks from `BLOCKS_KEPT` below where it has
+        // scanned upwards. Neither of these refuses the configuration: a
+        // bridge that will not start observes nothing, and every payment mined
+        // while it is down is missed, which is worse than either fault here.
+        // `Store::open` does refuse one thing, a host clock reading before
+        // 1970, because a bridge that runs on it dates every watch it inherits
+        // wrongly and quietly, and there is nothing else to date them by.
+        //
+        // The block that ends a watch is `deep_confirmations - 1` below the
+        // scan position, so a depth past `BLOCKS_KEPT + 1` names a block the
+        // bridge no longer holds and no watch ends. That costs updates, not
+        // payments, so it is reported and left alone rather than lowered: the
+        // depth is the operator's judgement about how buried a payment must be
+        // before this bridge will report it.
+        let kept = crate::store::Store::BLOCKS_KEPT;
+        for n in &cfg.networks {
+            if n.deep_confirmations > kept + 1 {
+                tracing::error!(
+                    network = ?n.network,
+                    deep_confirmations = n.deep_confirmations,
+                    "deep_confirmations reaches past the {kept} blocks kept below the scan \
+                     position, so no watch will end; lower it or watches last for ever"
+                );
+            }
+            // A backfill past them asks to rewind to a block the bridge no
+            // longer holds. `Store::rewind_checkpoint_to` stops at the oldest
+            // it does hold, so this says so and changes nothing: the value is
+            // also recorded as a watch's `scan_from_height`, which nothing
+            // else may narrow.
+            if n.demo_backfill_blocks > kept {
+                tracing::error!(
+                    network = ?n.network,
+                    demo_backfill_blocks = n.demo_backfill_blocks,
+                    "demo_backfill_blocks reaches past the {kept} blocks kept below the scan \
+                     position; the rewind will stop at the oldest block kept, and the height \
+                     it asks for is recorded with the demo watch for good, since nothing may \
+                     narrow one"
+                );
+            }
+        }
         Ok(cfg)
     }
 
@@ -120,6 +160,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.networks[0].deep_confirmations, 6);
+    }
+
+    /// A depth past the blocks the bridge keeps ends no watch, and a backfill
+    /// past them asks to rewind to a block it no longer holds, which reads as
+    /// a reorg. Neither refuses the configuration and neither is narrowed:
+    /// both are reported and left as they are, since the rewind stops at the
+    /// oldest block held on its own and the depth is the operator's call.
+    #[test]
+    fn a_depth_or_backfill_past_the_blocks_kept_is_reported_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.toml");
+        let cfg = |extra: &str| {
+            format!(
+                r#"
+                signing_key_path = "/k"
+                database_path = "/d"
+                contract_dir = "/c"
+
+                [[networks]]
+                network = "Signet"
+                rpc_url = "http://127.0.0.1:38332"
+                {extra}
+                "#
+            )
+        };
+        let kept = crate::store::Store::BLOCKS_KEPT;
+        // A depth past the blocks kept is reported, not refused: a bridge that
+        // will not start misses every payment mined while it is down.
+        std::fs::write(&path, cfg(&format!("deep_confirmations = {}", kept + 2))).unwrap();
+        let loaded = BridgeConfig::load(&path).expect("a deep config still starts the bridge");
+        assert_eq!(
+            loaded.networks[0].deep_confirmations,
+            kept + 2,
+            "left alone"
+        );
+        // A backfill past them is reported and kept as it is: the rewind stops
+        // at the oldest block held, and the value is also recorded as a
+        // watch's `scan_from_height`, which nothing else may narrow.
+        std::fs::write(&path, cfg(&format!("demo_backfill_blocks = {}", kept + 1))).unwrap();
+        let loaded = BridgeConfig::load(&path).expect("a wide demo window still starts it");
+        assert_eq!(
+            loaded.networks[0].demo_backfill_blocks,
+            kept + 1,
+            "left alone"
+        );
     }
 
     /// The bridge used to serve HTTP, configured by `listen` and `auth`. A

@@ -258,14 +258,46 @@ down, and it walks back to the fork point and retracts the orphaned outputs.
 The bridge has no network listener. A client asks it to watch a script by
 appending a Ghost Key signed request, sealed to the bridge, to its inbox
 contract. The bridge reads the inbox over its own connection to the local node,
-acts on each request, and removes it with a signed tombstone. On first start it
+acts on each request, and removes it with a signed removal batch. On first start it
 opens the inbox itself, by PUTting it with its first floor, and logs the
 contract id as `serving the request inbox`.
 
 - **Mainnet must be configured.** Requests are dated by Bitcoin mainnet block
   height whichever network they are for, and the inbox floor follows the
-  mainnet tip, 6 blocks behind. With no `Bitcoin` network in the config the
+  mainnet tip, 2 blocks behind. With no `Bitcoin` network in the config the
   inbox stays closed, and the bridge says so at startup.
+- **Confirm the mainnet node is on mainnet before pointing the bridge at it.**
+  The floor is taken from the tip that node reports, nothing bounds how far
+  one reading may raise it, and it only ever rises. A node on another chain,
+  or serving a corrupt one, therefore raises the floor past every real
+  request: the requests waiting at that moment are dropped, the floor never
+  rises again, and once the removal budget fills no further request is read.
+  Watches go on ending to their ordinary schedule throughout, so this is not
+  self-announcing. Recovering means correcting the recorded floor in
+  `inbox_meta` by hand. The bridge does not check the node's chain against
+  the configured network today; that is freenet-bitcoin#20.
+- **The bridge waits two minutes after connecting to its node**
+  (`FLOOR_HOLD_MS`), so a node that was down has time to catch up with the
+  inbox. The wait has two halves, because they cost differently when they
+  are wrong.
+  - *The floor* waits on every connection, but arms that wait no more often
+    than once in twenty minutes (`FLOOR_HOLD_REARM_MS`): a node dropping the
+    connection over and over would otherwise hold the floor down for as long
+    as it flapped, and a floor that never rises retires no removals and
+    fills the removal budget. So a connection inside that interval may raise
+    the floor past requests a node that has just come back has not finished
+    fetching; their senders resend, as the protocol already says.
+  - *Watch expiry* waits after **every** connection, with no such interval,
+    however often the node drops. A node that has lost the inbox answers
+    NotFound, and the bridge opens it again itself, empty, at the highest
+    floor it has signed rather than the tip's: reading that empty inbox as
+    every watch having run out would end them, and a watch that ends early
+    loses a payment for good, while one held back costs updates. A node
+    that flaps without pause therefore stops watches ending for as long as
+    it flaps, and so does one that answers NotFound over and over, since the
+    bridge opens the inbox again each time and the reopen interval is shorter
+    than the wait. That is the cheap failure of the two, and both are visible
+    in the log: each reopen writes "opening the request inbox".
 - **`bitcoin_inbox_contract.wasm` must be in the contract directory**, beside
   the other two. `scripts/deploy.sh` installs it.
 - **`listen` and `auth` are ignored.** They configured the HTTP service the
@@ -274,13 +306,125 @@ contract id as `serving the request inbox`.
   each script (`script_interests`), and a script stops being scanned only when
   the last requester withdraws. A watch registered before the inbox existed has
   no requester on record, so no unwatch ends it.
+- **A watch lasts about a day** after the Watch that last asked for it
+  (`WATCH_LIFETIME_MS`), and then ends as if its requester had withdrawn it.
+  Watching costs an update to the script's address contract every block, and
+  a client typically watches an address for one payment. A client that still
+  wants the script sends the Watch again, with a newer timestamp, well before
+  the day is out. The day is measured by the timestamps of blocks the
+  observer has scanned: a watch ends once the block `deep_confirmations - 1`
+  below the observer's position is dated a day after the Watch, counted from
+  the later of the sender's timestamp and the time the bridge read it (the
+  sender's counts for at most a week past that). The time read is the
+  bridge's clock, or the newest block the observer has recorded where that
+  is later, so a watch can be shortened only while the bridge's clock and
+  the observer are both more than a week behind: keep the host's clock
+  right. Bitcoin Core 27 and later refuse a block dated more than two hours
+  ahead of the host's clock, so with that clock right every block published
+  after the bridge read the Watch and within 22 hours of it has been scanned
+  for it by then, however long
+  the bridge or Bitcoin Core was down (#11 is the known exception, a reorg
+  round that fails part-way, and a reorg of `deep_confirmations` blocks or
+  more can still bring in a payment after a watch has ended). The bridge
+  keeps the 1000 blocks below its scan position, so a `deep_confirmations`
+  past 1001 names a block it no longer holds and ends no watch: it says so at
+  startup and leaves the setting alone, since how buried a payment must be is
+  the operator's call and a watch that never ends costs updates, not payments.
+  A `demo_backfill_blocks` past 1000 is reported the same way. Neither
+  refuses the configuration: a bridge that will not start misses every
+  payment mined while it is down. A rewind never goes below the oldest block
+  still held, whatever the setting says, since a checkpoint below those reads
+  as a reorg and retracts payments nothing moved; a database already carrying
+  such a checkpoint is repaired when the bridge opens it. A network's first scan starts at its tip,
+  so a Watch read before then is not scanned for the blocks before it (#7).
+  Only mined blocks are scanned: a client waiting on a payment keeps
+  renewing until it is buried. The day a watch inherited from an older
+  bridge gets is dated by the host's clock alone, since no block carries a
+  time yet at that moment, so a clock behind by more than a day at the
+  upgrade grants less than a day: check it before upgrading. Nor does a watch
+  end while a payment to it is less than `deep_confirmations` deep, within
+  two minutes of the bridge connecting to its node or opening an inbox the
+  node has lost (see the wait's expiry half above), while a request from its
+  own requester waits on the removal budget, since that may be its renewal
+  (only while that request is still in the inbox: one the caps push out or
+  the floor passes no longer counts), or while the inbox this node serves
+  carries a floor more than `WINDOW_BLOCKS` below the highest the bridge has
+  signed. That last one says the copy is not live: a node that stops
+  following the contract keeps answering reads from what it froze, without
+  dropping the connection or reporting anything missing, and a renewal would
+  be missing from such a copy too, as would a request the floor has already
+  passed, which is skipped unread and holds watches back on its own. An entry
+  this bridge cannot accept at all holds them back for the same reason, and
+  says something different: the contract validated what the bridge refuses, so
+  the bridge and the `bitcoin_inbox_contract.wasm` it loaded disagree, which a
+  deployment that replaces one without the other can cause. It is
+  logged when it starts, "this node serves an inbox this bridge cannot safely
+  act on; no watch ends until it serves one this bridge can. The fields name
+  which reason applies", again every hour while it lasts, and once when it
+  ends, "this node serves a current inbox again; watches may end". It is not
+  logged every pass, which would be thousands of lines a day, and not only
+  once either: one of its reasons lasts until someone acts, and a bridge holds
+  one connection for days, so a single line can sit outside every window an
+  operator looks at. The line carries `signed`, `copy`, `behind_the_floor` and
+  `unverified`, which is what tells the three reasons apart.
+  `signed` more than `WINDOW_BLOCKS` above `copy`, which is five blocks or
+  about fifty minutes and not a gap that looks dramatic, is a node that has
+  stopped following the contract while still answering reads from what it
+  holds. It can also be a floor this bridge signed from a bad tip reading and
+  can no longer lower, which is freenet-bitcoin#20, so check the recorded
+  floor against the chain before chasing the node. `copy` as `None` is a
+  third shape of the same reason: the copy carries no floor this bridge
+  signed, which is an empty inbox between a node losing it and the bridge
+  opening it again. `unverified` above zero is
+  this build and the contract disagreeing about what an entry must satisfy.
+  Install the binary and the three WASM together with `scripts/deploy.sh`,
+  never one without the others. Read a return to health here carefully,
+  because this reason ends on its own without being fixed: the floor goes on
+  rising while the count holds watches back, and within about half an hour it
+  passes the entry, which is then dropped unread. The count falls to zero and
+  "watches may end" is logged, with the disagreement still installed and the
+  next entry of that shape due to be skipped in its turn. So the pair of
+  lines says the copy became readable again, never that anything was
+  repaired. That also bounds what the gate protects: it holds watches back
+  only while the entry is still in the copy, and an entry dropped that way
+  was read by nobody, so a watch it would have renewed can end at its
+  ordinary time. That residual is in freenet-bitcoin#18. `behind_the_floor` above zero, with the floors close together, says
+  this copy predates the floor this bridge signed. Read it as that and no
+  more: it does not say the entries it counts went unread, since a pass may
+  have read them already against a fresher copy, and the record that would
+  show so is pruned by the floor before the count is taken. That is still
+  enough to hold watches back, because a copy predating the floor may be
+  missing a renewal, and there is no way from here to tell which. It holds
+  back every watch on the bridge, not only the one whose request was skipped,
+  since a copy that is not current is not current for anyone; so a run of
+  watches all staying put during one lagging-copy episode has this one cause,
+  not a cause per watch.
+  Two limits worth knowing, since neither is visible to the bridge: the
+  evidence is this bridge's own floor read back from its own node, so a node
+  that applies what the bridge writes while seeing no peers looks healthy;
+  and the floor rises with the mainnet tip, so while mainnet's node cannot
+  be reached the evidence stops moving although watches still end on the
+  other networks. Both are in freenet-bitcoin#18. Every scan also covers
+  the scripts of payments a reorg moved out of their block and that have not
+  been seen again, watched or not, so such a payment is found where it was
+  re-mined rather than left retracted. Watches registered before the inbox
+  existed never end this way, and a watch held by a bridge upgraded from one
+  that did not yet end watches by block time gets a day from the upgrade.
 - **Acted-on entries are recorded** (`inbox_handled`) until the floor passes
-  them, so an entry whose tombstone failed to land is removed again rather than
-  acted on again. Each requester's latest request per script is kept with its
-  sender's timestamp, so requests take effect in the order they were made
-  whatever order they arrive in. Deleting the database loses both records; the
-  cost is that requests still in the inbox, a few hours' worth at most, are
-  acted on a second time.
+  them, so an entry whose removal failed to land is removed again rather than
+  acted on again, and each removal batch is built from this record. Each
+  requester's latest request per script is kept with its sender's timestamp,
+  so requests take effect in the order they were made whatever order they
+  arrive in. Deleting the database loses both records; the cost is that
+  requests still in the inbox, about half an hour's worth, are acted on a
+  second time.
+- **Reading stops at the removal budget** (`REMOVAL_BUDGET`, 4096 entries).
+  Every entry read is removed, and removals last until the floor passes them,
+  about half an hour for a request dated as senders date them and at most
+  five blocks for any. Past the budget, new requests wait in the inbox for the
+  floor, and the bridge logs that they do. Each Ghost Key gets a 64th of the
+  budget (`REMOVAL_SHARE_PER_GHOSTKEY`), so one sender cannot spend it for
+  everyone; a sender past its share waits the same way while others are read.
 
 ### Backfilling history on a pruned node
 
@@ -333,19 +477,25 @@ enabling `txindex`.
   an absence of payments means nothing and the claim would be misleading.
 - **Requests come only through the inbox.** There is no service to expose and
   no reverse proxy to run. The inbox admits only Ghost Key signed entries,
-  verified by every peer, and holds at most 2 requests per Ghost Key and 128 in
-  all. The bridge adds its own limit: 1000 watched scripts per Ghost Key. A
-  request cannot move the scan cursor (see "Backfilling history" above).
-- **A tombstone means read, not done.** The bridge removes every entry it
+  verified by every peer, and holds at most 2 waiting requests per Ghost Key
+  and 128 in all; a request gives its place back as soon as the bridge has
+  read it. The bridge adds its own limit: 1000 watched scripts per Ghost Key.
+  A request cannot move the scan cursor (see "Backfilling history" above).
+- **A removal means read, not done.** The bridge removes every entry it
   reads, including ones it cannot open, ones for a network it does not
   observe, and a Watch beyond its sender's limit, whose extra scripts it
   drops with a warning in the log. A sender learns what a Watch did from the
   address contract, not from the inbox.
-- **What the inbox does not stop.** Whoever holds 64 Ghost Keys can fill it and
-  keep other requests out for as long as they keep posting. That is the price
-  of censoring a bridge's inbox, paid once in donations; see `MAX_RECORDS` in
-  `inbox/src/lib.rs` for why it cannot be raised without raising what every
-  peer spends validating the inbox.
+- **What the inbox does not stop.** 64 Ghost Keys can hold every place in it.
+  A request gives its place back once read, and each Ghost Key is read only up
+  to its share of the removal budget, so the cost is 64 Ghost Keys each
+  sending about 66 requests every five blocks, about 50 minutes (dated at the
+  top of the window, which also outranks honest requests by height). That is
+  the same act as spending
+  the removal budget, after which new requests wait for the floor. See
+  `MAX_ENTRIES` and `REMOVAL_BUDGET` in `inbox/src/lib.rs` for why neither is
+  raised freely: more entries mean more certificates for every peer to check,
+  and more removals mean a larger state.
 
 #### What it bought, measured
 

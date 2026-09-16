@@ -2,7 +2,8 @@
 //! A bridge's Ghost Key gated request inbox, as a Freenet contract.
 //!
 //! One instance per bridge. Anyone holding a Ghost Key appends a sealed
-//! request; the bridge reads it, acts, and removes it with a signed tombstone.
+//! request; the bridge reads it, acts, and removes it with a signed removal
+//! batch.
 //! All the rules live in `freenet_bitcoin_inbox`; this is the contract
 //! surface over them. Design of record: freenet/freenet-bitcoin#3.
 //!

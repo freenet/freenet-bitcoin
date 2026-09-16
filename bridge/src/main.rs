@@ -29,7 +29,7 @@ use bitcoin_freenet_bridge::{
     config::BridgeConfig,
     freenet::{ContractWasm, FreenetPublisher},
     inbox::InboxWorker,
-    observer::{Observer, RoundClaims},
+    observer::{scan_set, Observer, RoundClaims},
     signer::Signer,
     store::{Store, WatchedScript},
 };
@@ -152,11 +152,22 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
     // pruned node has not kept the early chain, so asking for it would fail,
     // and a demo only needs recent activity to be convincing.
     for net_cfg in &cfg.networks {
-        let backfill_from = ChainClient::connect(net_cfg)
+        if net_cfg.always_watch.is_empty() {
+            continue;
+        }
+        // A tip that cannot be read seeds nothing. `add_watch` keeps the
+        // lowest `scan_from_height` ever asked for, so seeding at 0 once, from
+        // a node still loading its block index, would ask for the whole chain
+        // ever after; and the rewind that follows would go as far back as the
+        // blocks kept allow. The next start seeds it.
+        let Some(tip) = ChainClient::connect(net_cfg)
             .ok()
             .and_then(|c| c.tip().ok())
-            .map(|t| t.height.saturating_sub(net_cfg.demo_backfill_blocks))
-            .unwrap_or(0);
+        else {
+            tracing::warn!(network = ?net_cfg.network, "cannot read the tip, so this network's demo addresses are not seeded this time");
+            continue;
+        };
+        let backfill_from = tip.height.saturating_sub(net_cfg.demo_backfill_blocks);
         for addr_str in &net_cfg.always_watch {
             match parse_address(addr_str, net_cfg.network) {
                 Ok(spk) => {
@@ -486,6 +497,11 @@ async fn observe_once(
         .map(|w| w.script_pubkey)
         .collect();
 
+    // Payments in doubt are read before `handle_reorg` changes anything, so
+    // failing to read them cannot strand this round's retractions (see #11);
+    // this round's own orphans are added once it has found them.
+    let mut in_doubt = store.scripts_with_unconfirmed_outputs(obs.network())?;
+
     let mut round = RoundClaims::default();
 
     // Reorg first: a reorg invalidates the range we were about to scan.
@@ -505,6 +521,11 @@ async fn observe_once(
         reorg.resume_from = tip.height;
     }
     let next = reorg.resume_from;
+    // Blocks are scanned for the scripts of payments in doubt too, watched or
+    // not, including this round's orphans; the watermarks below stay with
+    // `watched`. See `scan_set`.
+    in_doubt.extend(reorg.orphaned.iter().map(|(script, _)| script.clone()));
+    let scan = scan_set(&watched, &in_doubt);
 
     // A tip entry for EVERY block scanned, not only the last.
     //
@@ -526,8 +547,8 @@ async fn observe_once(
     let ceiling = reorg.scan_ceiling(tip.height, obs.cfg.max_reorg_depth);
     for height in next..=ceiling {
         let hash = obs.chain.block_hash_at(height)?;
-        let block = obs.chain.scan_block(&hash, &watched)?;
-        obs.claims_from_block(store, signer, &block, &tip, &mut round)?;
+        let block = obs.chain.scan_block(&hash, &scan)?;
+        obs.claims_from_block(store, signer, &block, &tip, &watched, &mut round)?;
         tip_entries.push(obs.tip_entry(signer, &block)?);
         store.set_checkpoint(obs.network(), &block.anchor)?;
     }
@@ -560,7 +581,7 @@ async fn observe_once(
         round.record(script, &freenet_bitcoin_common::Claim::ScannedTo, wm);
     }
 
-    store.prune_blocks(obs.network(), tip.height, 1000)?;
+    store.prune_blocks(obs.network(), Store::BLOCKS_KEPT)?;
 
     let Some(publisher) = publisher else {
         tracing::debug!("no Freenet connection; observations recorded but not published");
@@ -889,6 +910,46 @@ mod tests {
     /// a ceiling inline, left all 142 tests green. This is a source pin
     /// precisely because the wiring is the part that cannot be run here; it is
     /// weaker than a behavioural test and is not a substitute for one.
+    /// `observe_once` scans blocks for the scripts in doubt as well as the
+    /// watched ones, and lets the claims step publish only for the watched.
+    /// Both halves are unit-tested (`scan_set`, `claims_from_block`), but only
+    /// this pins the wiring, which round one of #10 got wrong while the unit
+    /// tests stayed green. The needles are split as the test below explains.
+    #[test]
+    fn observe_once_scans_the_scripts_in_doubt_and_claims_only_for_the_watched() {
+        let src = include_str!("main.rs");
+        for (needle, why) in [
+            (
+                concat!("scripts_with_unconfirmed", "_outputs(obs.network())"),
+                "the payments in doubt are no longer read",
+            ),
+            (
+                concat!("scan_set(&watched, ", "&in_doubt)"),
+                "the scan set no longer includes the scripts in doubt",
+            ),
+            (
+                concat!("scan_block(&hash, ", "&scan)"),
+                "blocks are no longer scanned with the scan set",
+            ),
+            (
+                concat!("&tip, &watch", "ed, &mut round)"),
+                "claims are no longer limited to the watched scripts",
+            ),
+            (
+                concat!("prune_blocks(obs.network(), ", "Store::BLOCKS_KEPT)"),
+                "blocks are no longer pruned, or no longer to the window watch \
+                 expiry reads the deciding block from",
+            ),
+            (
+                concat!("let Some(tip) = ChainClient::conn", "ect(net_cfg)"),
+                "a demo address is seeded again without a tip, so a node still \
+                 loading its block index makes it ask for the whole chain",
+            ),
+        ] {
+            assert!(src.contains(needle), "{why}");
+        }
+    }
+
     #[test]
     fn observe_once_takes_its_ceiling_from_the_reorg_outcome() {
         let src = include_str!("main.rs");

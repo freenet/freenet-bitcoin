@@ -3,9 +3,9 @@
 # entry with the rebuilt WASM.
 #
 # Unlike the address and tip contracts, nothing is migrated forward from an old
-# inbox generation. Its entries are requests dated within about an hour of the
-# Bitcoin mainnet tip, and a sender knows its request was read when the inbox
-# holds a tombstone for it. A request left unread in a superseded inbox is
+# inbox generation. Its entries are requests dated within about half an hour of
+# the Bitcoin mainnet tip, and a sender knows its request was read when the
+# inbox holds a removal naming it. A request left unread in a superseded inbox is
 # therefore not carried over: its sender resends to the generation the inbox
 # pointer names. Entries are recorded so scripts/deploy.sh can refuse to move
 # the bridge back onto a retired generation.

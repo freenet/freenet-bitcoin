@@ -367,6 +367,7 @@ pub fn merkle_root(txids: &[[u8; 32]]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use freenet_bitcoin_common::spv::merkle_root_from_branch;
 
     fn txid(n: u8) -> [u8; 32] {
