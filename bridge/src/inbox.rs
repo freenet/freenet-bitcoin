@@ -149,6 +149,16 @@ pub const FLOOR_HOLD_MS: i64 = 2 * 60 * 1000;
 /// back costs updates. See [`FloorHold`].
 pub const FLOOR_HOLD_REARM_MS: i64 = 10 * FLOOR_HOLD_MS;
 
+/// Whether a change in the stale-copy condition is worth reporting, and what
+/// it changed to.
+///
+/// `None` while it stays as it was: the condition lasts as long as the node
+/// serves that copy, and a line a pass would be thousands a day. The worker
+/// reports it, so this is where a test can reach the decision.
+pub fn stale_transition(was: bool, now: bool) -> Option<bool> {
+    (was != now).then_some(now)
+}
+
 /// Whether the floor is still held. The hold is kept on the monotonic clock,
 /// so no step of the wall clock stretches it or cuts it short.
 fn floor_held(until: Option<Instant>) -> bool {
@@ -195,6 +205,23 @@ pub struct Pass {
     /// condition lasts as long as the node serves that copy, and a line a
     /// pass would be thousands a day.
     pub stale: bool,
+    /// The three numbers behind `stale`, carried so the worker can report
+    /// them: the highest floor this bridge has signed, the floor the copy
+    /// carries, and how many of its entries that floor has passed. The
+    /// condition has two causes needing different remedies, a copy frozen
+    /// more than a window back and a request the floor overtook, and these
+    /// are what tell them apart.
+    pub signed_floor: Option<u32>,
+    pub copy_floor: Option<u32>,
+    pub behind_the_floor: usize,
+    /// Entries the node served that this bridge cannot accept. A state the
+    /// node validated holds none, since the contract refuses every reason
+    /// this bridge has for skipping one, so this counts a disagreement
+    /// between the bridge and the contract it loaded rather than anything a
+    /// sender can cause. It gates expiry for the same reason as the count
+    /// above: a skipped entry may be the renewal, and nothing else would
+    /// tell us it was skipped.
+    pub unverified: usize,
 }
 
 pub struct Processor<'a> {
@@ -245,7 +272,8 @@ impl Processor<'_> {
         if unverified > 0 {
             tracing::warn!(
                 unverified,
-                "inbox entries that do not verify, or are already removed, were skipped"
+                "inbox entries this bridge cannot accept were skipped; no watch ends while it \
+                 reads one, since a skipped entry may be a renewal"
             );
         }
         entries.sort_by_key(|(k, e)| (e.mainnet_height, *k));
@@ -253,8 +281,11 @@ impl Processor<'_> {
         let mut pass = Pass::default();
         let mut handled = self.store.handled_count()?;
         let mut read_heights: BTreeSet<u32> = BTreeSet::new();
-        // Entries this copy holds that the signed floor has passed: each one
-        // is a request read by nobody, and says the copy is behind.
+        // Entries this copy holds that the signed floor has passed. A copy
+        // that validates cannot hold one, so any of them says this copy
+        // predates the floor. It does not say the entry went unread
+        // everywhere: an earlier pass may have read it against a fresher
+        // copy, and only this copy has yet to hear that.
         let mut behind_the_floor = 0usize;
         for (k, e) in entries {
             // Below a floor this bridge signed: a stale copy of the inbox. It
@@ -374,9 +405,14 @@ impl Processor<'_> {
         // read from what it holds, so neither a connection nor an opening
         // arms the hold. A renewal would be missing from such a copy too.
         let stale_view = behind_the_floor > 0
+            || unverified > 0
             || known
                 .is_some_and(|k| state_floor.is_none_or(|f| k.saturating_sub(f) > WINDOW_BLOCKS));
         pass.stale = stale_view;
+        pass.signed_floor = known;
+        pass.copy_floor = state_floor;
+        pass.behind_the_floor = behind_the_floor;
+        pass.unverified = unverified;
         pass.gated = held || expiry_held || stale_view;
         if !expiry_held && !stale_view {
             match self.expire_watches(now_ms, &pass.waiting) {
@@ -1052,10 +1088,14 @@ impl InboxWorker {
         };
         let pass = match processor.pass(&state, &tips, now_ms()) {
             Ok(p) => {
-                if p.stale != session.was_stale {
-                    session.was_stale = p.stale;
-                    if p.stale {
+                if let Some(now_stale) = stale_transition(session.was_stale, p.stale) {
+                    session.was_stale = now_stale;
+                    if now_stale {
                         tracing::warn!(
+                            signed = ?p.signed_floor,
+                            copy = ?p.copy_floor,
+                            behind_the_floor = p.behind_the_floor,
+                            unverified = p.unverified,
                             "this node serves an inbox behind the floor this bridge signed, or \
                              holding a request that floor has passed; no watch ends until it \
                              serves a current one"
@@ -2668,6 +2708,30 @@ mod tests {
         assert!(watched(&store).is_empty());
     }
 
+    /// Reported when it starts and when it ends, and not while it lasts.
+    #[test]
+    fn the_stale_copy_condition_is_reported_only_when_it_changes() {
+        assert_eq!(stale_transition(false, false), None, "still fine");
+        assert_eq!(stale_transition(false, true), Some(true), "it starts");
+        assert_eq!(stale_transition(true, true), None, "still behind");
+        assert_eq!(stale_transition(true, false), Some(false), "it ends");
+    }
+
+    /// An entry dated at the floor itself is not behind it: it is read like
+    /// any other, and the copy is not called stale for holding it.
+    #[test]
+    fn an_entry_dated_at_the_floor_is_read_and_the_copy_is_not_stale() {
+        let store = Store::open_in_memory().unwrap();
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0);
+        let at_floor = entry(&ghostkeys()[0], FLOOR, &request(Action::Watch, b"spk", 1));
+        let pass = run_at(&store, &inbox(FLOOR, vec![at_floor]), &tips(), T0);
+        assert_eq!(pass.acted, 1, "read like any other");
+        assert!(
+            !pass.stale,
+            "and the copy is not called stale for holding it"
+        );
+    }
+
     /// A copy whose floor looks current can still hold an entry that floor
     /// has passed, since a sender dates against the floor it read: the entry
     /// is skipped unread, and it may be the renewal. No watch ends on a pass
@@ -2700,6 +2764,51 @@ mod tests {
         );
         assert!(pass.stale, "and the copy is reported as behind");
         assert!(pass.gated, "and the pass is not passed over as quiet");
+        // The numbers that tell this cause from the frozen-copy one: the
+        // floors are a window apart, and an entry sits below the signed one.
+        assert_eq!(pass.behind_the_floor, 1, "the entry the floor passed");
+        assert_eq!(
+            pass.signed_floor,
+            Some(FLOOR),
+            "the floor this bridge signed"
+        );
+        assert_eq!(
+            pass.copy_floor,
+            Some(FLOOR - 3),
+            "the floor the copy carries"
+        );
+    }
+
+    /// The contract refuses every reason this bridge has for skipping an
+    /// entry, so a copy the node validated holds none it cannot accept. One
+    /// that does says the bridge and the contract it loaded disagree, which
+    /// replacing the binary without the WASM can cause. The entry is skipped
+    /// unread and may be the renewal, so no watch ends against such a copy.
+    #[test]
+    fn a_watch_is_kept_while_the_copy_holds_an_entry_this_bridge_cannot_accept() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0);
+        caught_up(&store);
+        let renewal = entry(&ghostkeys()[1], FLOOR, &request(Action::Watch, b"spk2", 1));
+        let mut state = inbox(FLOOR, vec![renewal]);
+        // File it under a key that is not its digest, which `verify` refuses
+        // and this bridge skips. The contract cannot object here: it has
+        // already validated this copy, and what the node serves is what it
+        // holds.
+        let key = *state.entries.keys().next().expect("the copy holds it");
+        let broken = state.entries.remove(&key).expect("just read");
+        state.entries.insert(EntryKey([0u8; 32]), broken);
+        let pass = run_at(&store, &state, &tips(), T0 + 25 * HOUR);
+        assert_eq!(pass.unverified, 1, "the entry this bridge cannot accept");
+        assert_eq!(pass.acted, 0, "which is read by nobody");
+        assert!(pass.stale, "so the copy is not treated as current");
+        assert!(pass.gated, "and the pass is not passed over as quiet");
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "and the watch is kept, since the skipped entry may be its renewal"
+        );
     }
 
     /// A node that has stopped following the inbox answers every read from
@@ -2721,6 +2830,10 @@ mod tests {
         );
         assert!(frozen.stale, "and the copy is reported as behind");
         assert!(frozen.gated, "and the pass is not passed over as quiet");
+        // The other cause, and it reads differently: the copy is a hundred
+        // blocks back and holds nothing the floor passed.
+        assert_eq!(frozen.behind_the_floor, 0, "no entry, just a stale floor");
+        assert_eq!(frozen.copy_floor, Some(FLOOR - 100), "how far back it is");
         // One block past the window is already too far.
         run_at(
             &store,
