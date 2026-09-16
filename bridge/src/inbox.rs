@@ -128,17 +128,25 @@ pub const REQUEST_AHEAD_MAX_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// with the inbox the requests other peers hold are missing from the copy the
 /// bridge reads. Raising the floor at once would drop any of those dated
 /// below it, unread. A node catches up with one small contract in seconds.
-/// While it is held, no watch ends either: a renewal may be in the copy the
-/// bridge has not read yet (see [`Processor::pass`]).
+///
+/// The same wait stops watches ending, since a renewal may be in the copy the
+/// bridge has not read yet, but the two are armed differently: see
+/// [`FloorHold`]. The floor's half is rationed by [`FLOOR_HOLD_REARM_MS`];
+/// the expiry half is armed by every connection, and by every inbox the
+/// bridge opens for a node that has lost one. So a pass can run with the
+/// floor free while watches are still held back, which is the case
+/// `Processor::pass` is written for; the reverse cannot happen.
 pub const FLOOR_HOLD_MS: i64 = 2 * 60 * 1000;
 
-/// How long after arming the floor hold it may be armed again.
+/// How long after arming the floor's half of the hold it may be armed again.
 ///
-/// The hold stops the floor rising and stops watches ending, so a node that
-/// keeps dropping the connection must not arm it over and over. At ten times
-/// the hold, it is in force for at most a tenth of the time whatever shape
-/// the flapping takes, and a node restarted under a bridge that has been
-/// running for hours still gets it.
+/// This rations the floor's half alone. A floor held down for as long as a
+/// node flaps retires no removals and fills the removal budget, so at ten
+/// times the hold it is in force for at most a tenth of the time whatever
+/// shape the flapping takes, and a node restarted under a bridge that has
+/// been running for hours still gets it. The expiry half is not rationed at
+/// all: ending a watch early loses a payment for good, while holding one
+/// back costs updates. See [`FloorHold`].
 pub const FLOOR_HOLD_REARM_MS: i64 = 10 * FLOOR_HOLD_MS;
 
 /// Whether the floor is still held. The hold is kept on the monotonic clock,
@@ -294,6 +302,12 @@ impl Processor<'_> {
                 .into_iter()
                 .map(|k| EntryKey(k).removal_prefix())
                 .collect();
+            // A batch naming nothing is refused by every peer, and a delta is
+            // all or nothing, so it would cost this pass its floor too. Only
+            // a row this bridge cannot read could empty a height it read at.
+            if removed.is_empty() {
+                continue;
+            }
             pass.delta
                 .removals
                 .push(RemovalBatch::sign(self.key, h, &removed));
@@ -320,8 +334,24 @@ impl Processor<'_> {
         // since that request may be the renewal: only its own, so no one
         // sender can hold back every watch on the bridge.
         let expiry_held = floor_held(self.expiry_hold_until);
-        pass.gated = held || expiry_held;
-        if !expiry_held {
+        // Evidence that this copy is live, rather than that time has passed.
+        // The bridge signs the floor as the chain moves, so a copy it reads
+        // carries a floor within a block or two of the highest it has signed.
+        // A copy a node has stopped following freezes and falls further
+        // behind every pass, and no reply says so: the node answers every
+        // read from what it holds, so neither a connection nor an opening
+        // arms the hold. A renewal would be missing from such a copy too.
+        let stale_view =
+            known.is_some_and(|k| state_floor.is_none_or(|f| k.saturating_sub(f) > WINDOW_BLOCKS));
+        if stale_view {
+            tracing::warn!(
+                signed = ?known,
+                copy = ?state_floor,
+                "this node serves an inbox behind the floor this bridge signed; no watch ends while it does"
+            );
+        }
+        pass.gated = held || expiry_held || stale_view;
+        if !expiry_held && !stale_view {
             match self.expire_watches(now_ms, &pass.waiting) {
                 Ok(lagging) => pass.gated |= lagging,
                 Err(e) => {
@@ -1827,6 +1857,28 @@ mod tests {
             1,
             "opening an inbox no longer holds the floor"
         );
+        // The arming itself, not only what it is assigned to. `FloorHold` is
+        // `Copy` and the binding made on opening shadows the one made at the
+        // connection, so dropping just that call still compiles, reads the
+        // connection's hold, and hands the pass an instant hours past: the
+        // hold would be over before the inbox was opened, which is the fault
+        // this arming exists to prevent. Twice: at the connection, and on
+        // opening.
+        assert_eq!(
+            src.matches(concat!(
+                "let hold = arm_floor_",
+                "hold(*floor_armed_at, Instant::now());"
+            ))
+            .count(),
+            2,
+            "the hold is not armed afresh where it is used"
+        );
+        assert_eq!(
+            src.matches(concat!("*floor_armed_at = Some(hold", ".armed_at);"))
+                .count(),
+            2,
+            "one of the two armings does not record when it armed"
+        );
     }
 
     /// Catching up far behind the node's tip, the blocks the observer has
@@ -2568,6 +2620,31 @@ mod tests {
         assert_eq!(watched(&store), vec![b"spk".to_vec()], "b still wants it");
         tick(&store, &tips(), T0 + 45 * HOUR);
         assert!(watched(&store).is_empty());
+    }
+
+    /// A node that has stopped following the inbox answers every read from
+    /// the copy it froze, so nothing disconnects and nothing is missing:
+    /// neither half of the hold is armed. The floor the copy carries falls
+    /// further behind the one this bridge signs, which is what says the copy
+    /// is not live, and no watch ends while it says so.
+    #[test]
+    fn a_watch_is_kept_while_the_copy_this_node_serves_is_behind_the_signed_floor() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0);
+        caught_up(&store);
+        let frozen = run_at(&store, &inbox(FLOOR - 100, vec![]), &tips(), T0 + 25 * HOUR);
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "kept while the copy is behind"
+        );
+        assert!(frozen.gated, "and the pass is not passed over as quiet");
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0 + 25 * HOUR);
+        assert!(
+            watched(&store).is_empty(),
+            "and ends once the copy carries the floor again"
+        );
     }
 
     /// Every connection holds watches back, even one the rearm interval

@@ -284,7 +284,10 @@ contract id as `serving the request inbox`.
     every watch having run out would end them, and a watch that ends early
     loses a payment for good, while one held back costs updates. A node
     that flaps without pause therefore stops watches ending for as long as
-    it flaps, which is the cheap failure of the two.
+    it flaps, and so does one that answers NotFound over and over, since the
+    bridge opens the inbox again each time and the reopen interval is shorter
+    than the wait. That is the cheap failure of the two, and both are visible
+    in the log: each reopen writes "opening the request inbox".
 - **`bitcoin_inbox_contract.wasm` must be in the contract directory**, beside
   the other two. `scripts/deploy.sh` installs it.
 - **`listen` and `auth` are ignored.** They configured the HTTP service the
