@@ -23,6 +23,39 @@ use freenet_bitcoin_common::{BitcoinNetwork, BlockAnchor, BlockHash, Txid};
 
 use crate::config::NetworkConfig;
 
+/// The `bitcoin` crate's name for a network this bridge observes.
+pub fn bitcoin_network(network: BitcoinNetwork) -> bitcoin::Network {
+    match network {
+        BitcoinNetwork::Bitcoin => bitcoin::Network::Bitcoin,
+        BitcoinNetwork::Testnet4 => bitcoin::Network::Testnet4,
+        BitcoinNetwork::Signet => bitcoin::Network::Signet,
+        BitcoinNetwork::Regtest => bitcoin::Network::Regtest,
+    }
+}
+
+/// Refuse a node that is not on the network the config names for it.
+///
+/// Every tip the bridge reads comes through [`ChainClient::tip`], and a tip is
+/// trusted a long way. The observer scans and signs whatever that node calls
+/// the chain, under this network's name. The inbox floor is raised from the
+/// mainnet tip and is never lowered, so a single reading from a node on the
+/// wrong chain can lift it past every real request for good, which discards
+/// the requests waiting and then jams the inbox (freenet-bitcoin#20).
+///
+/// Refusing costs nothing that matters. The observer logs the round as failed
+/// and tries again, and the inbox worker treats the tip as unreadable, which
+/// leaves the floor where it was.
+pub fn check_chain(configured: BitcoinNetwork, reported: bitcoin::Network) -> Result<()> {
+    let expected = bitcoin_network(configured);
+    anyhow::ensure!(
+        reported == expected,
+        "the node configured for {configured:?} reports that it is on {reported:?}, not \
+         {expected:?}, so its tip is refused; point this network's rpc_url at a node on \
+         {expected:?}"
+    );
+    Ok(())
+}
+
 pub struct ChainClient {
     rpc: Client,
     pub network: BitcoinNetwork,
@@ -74,6 +107,8 @@ impl ChainClient {
 
     pub fn tip(&self) -> Result<BlockAnchor> {
         let info = self.rpc.get_blockchain_info()?;
+        // Before anything is taken from the reading: see `check_chain`.
+        check_chain(self.network, info.chain)?;
         Ok(BlockAnchor {
             height: info.blocks as u32,
             hash: BlockHash(info.best_block_hash.to_byte_array()),
@@ -475,5 +510,84 @@ mod tests {
             h -= 1;
         };
         assert_eq!(fork, 97);
+    }
+
+    const ALL: [BitcoinNetwork; 4] = [
+        BitcoinNetwork::Bitcoin,
+        BitcoinNetwork::Testnet4,
+        BitcoinNetwork::Signet,
+        BitcoinNetwork::Regtest,
+    ];
+
+    /// Each network accepts a node on its own chain and refuses a node on any
+    /// other. The pairs a real misconfiguration produces are the ones that
+    /// matter: mainnet's slot pointed at a test chain, and testnet4's pointed
+    /// at the older testnet, which is also "a testnet" and is not this one.
+    #[test]
+    fn a_node_on_another_chain_is_refused_and_one_on_its_own_is_accepted() {
+        for configured in ALL {
+            assert!(
+                check_chain(configured, bitcoin_network(configured)).is_ok(),
+                "{configured:?} accepts a node on its own chain"
+            );
+            for other in ALL.into_iter().filter(|o| *o != configured) {
+                assert!(
+                    check_chain(configured, bitcoin_network(other)).is_err(),
+                    "{configured:?} refuses a node on {other:?}"
+                );
+            }
+        }
+        assert!(
+            check_chain(BitcoinNetwork::Testnet4, bitcoin::Network::Testnet).is_err(),
+            "the older testnet is not testnet4"
+        );
+        assert!(
+            check_chain(BitcoinNetwork::Bitcoin, bitcoin::Network::Testnet).is_err(),
+            "nor is it mainnet"
+        );
+    }
+
+    /// `getblockchaininfo` reports Bitcoin Core's own name for the chain, so
+    /// the mapping is pinned to those names. A mapping that drifted from them
+    /// would refuse every node, and one that drifted to the wrong network
+    /// would accept the very node this check exists to refuse.
+    #[test]
+    fn each_network_maps_to_the_chain_bitcoin_core_reports_for_it() {
+        for (network, core_name) in [
+            (BitcoinNetwork::Bitcoin, "main"),
+            (BitcoinNetwork::Testnet4, "testnet4"),
+            (BitcoinNetwork::Signet, "signet"),
+            (BitcoinNetwork::Regtest, "regtest"),
+        ] {
+            assert_eq!(
+                bitcoin_network(network),
+                bitcoin::Network::from_core_arg(core_name).expect("a name Core uses"),
+                "{network:?} is what Core calls {core_name}"
+            );
+        }
+    }
+
+    /// `check_chain` protects nothing unless the tip passes through it before
+    /// the reading is used, and deleting that one call would leave every test
+    /// above green. So the call is pinned, and pinned ahead of the anchor
+    /// built from the reading.
+    #[test]
+    fn the_tip_is_checked_against_the_configured_network_before_it_is_used() {
+        let src = include_str!("chain.rs");
+        let start = src
+            .find(concat!("pub fn ", "tip(&self)"))
+            .expect("ChainClient::tip is declared in chain.rs");
+        let body = &src[start..];
+        let body = &body[..body.find("\n    }\n").expect("its body ends")];
+        let check = body
+            .find(concat!("check_chain(", "self.network, info.chain)?"))
+            .expect("ChainClient::tip must refuse a node on the wrong chain");
+        let used = body
+            .find(concat!("Block", "Anchor {"))
+            .expect("the tip is built from the reading");
+        assert!(
+            check < used,
+            "the chain is checked before the reading is used"
+        );
     }
 }
