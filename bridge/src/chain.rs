@@ -17,9 +17,11 @@
 use anyhow::{Context, Result};
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
+use bitcoincore_rpc::json::GetBlockchainInfoResult;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use freenet_bitcoin_common::spv::{BlockHeader, SpvProof};
 use freenet_bitcoin_common::{BitcoinNetwork, BlockAnchor, BlockHash, Txid};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::NetworkConfig;
 
@@ -33,32 +35,77 @@ pub fn bitcoin_network(network: BitcoinNetwork) -> bitcoin::Network {
     }
 }
 
-/// Refuse a node that is not on the network the config names for it.
-///
-/// Every tip the bridge reads comes through [`ChainClient::tip`], and a tip is
-/// trusted a long way. The observer scans and signs whatever that node calls
-/// the chain, under this network's name. The inbox floor is raised from the
-/// mainnet tip and is never lowered, so a single reading from a node on the
-/// wrong chain can lift it past every real request for good, which discards
-/// the requests waiting and then jams the inbox (freenet-bitcoin#20).
-///
-/// Refusing costs nothing that matters. The observer logs the round as failed
-/// and tries again, and the inbox worker treats the tip as unreadable, which
-/// leaves the floor where it was.
+// Why a node is checked at all.
+//
+// Every tip the bridge reads comes through `ChainClient::tip`, and a tip is
+// trusted a long way. The observer scans and signs whatever that node calls
+// the chain, under this network's name. The inbox floor is raised from the
+// mainnet tip and is never lowered, so a single reading from a node on the
+// wrong chain can lift it past every real request for good, which discards the
+// requests waiting and then jams the inbox (freenet-bitcoin#20).
+//
+// Two checks, because each misses what the other catches. The chain name is
+// cheap and read with every tip, but a fork of Bitcoin Core for another coin
+// reports "main" too. The genesis block tells coins apart, and is read once per
+// client since it cannot change.
+//
+// What neither catches: a custom signet shares both the name and the genesis
+// block of the default one, so it passes on a Signet slot. That cannot move the
+// inbox floor, which only mainnet feeds. And a node on the right chain serving a
+// corrupt one can still report a wrong height, which is why #20 stays open.
+//
+// Refusing costs nothing that matters. The observer logs the round as failed
+// and tries again, and the inbox worker treats the tip as unreadable, which
+// leaves the floor where it was.
+
+/// Refuse a node whose reported chain is not the network the config names for
+/// it. Names are Bitcoin Core's own, which is how the operator sees them.
 pub fn check_chain(configured: BitcoinNetwork, reported: bitcoin::Network) -> Result<()> {
     let expected = bitcoin_network(configured);
     anyhow::ensure!(
         reported == expected,
-        "the node configured for {configured:?} reports that it is on {reported:?}, not \
-         {expected:?}, so its tip is refused; point this network's rpc_url at a node on \
-         {expected:?}"
+        "the node configured for {configured:?} reports chain \"{}\", but {configured:?} is \
+         chain \"{}\", so its tip is refused",
+        reported.to_core_arg(),
+        expected.to_core_arg()
     );
     Ok(())
+}
+
+/// Refuse a node whose genesis block is not the configured network's. This is
+/// what tells Bitcoin from a fork of it for another coin, whose node reports the
+/// same chain name.
+pub fn check_genesis(configured: BitcoinNetwork, reported: bitcoin::BlockHash) -> Result<()> {
+    let expected = bitcoin::constants::genesis_block(bitcoin_network(configured)).block_hash();
+    anyhow::ensure!(
+        reported == expected,
+        "the node configured for {configured:?} has genesis block {reported}, not \
+         {configured:?}'s {expected}, so it is not on that chain and its tip is refused"
+    );
+    Ok(())
+}
+
+/// The tip a `getblockchaininfo` reply gives, refused unless the reply names
+/// the configured chain. Kept apart from [`ChainClient::tip`] so the refusal is
+/// tested against the real reply type rather than against source text.
+fn anchor_from_info(
+    configured: BitcoinNetwork,
+    info: &GetBlockchainInfoResult,
+) -> Result<BlockAnchor> {
+    check_chain(configured, info.chain)?;
+    Ok(BlockAnchor {
+        height: info.blocks as u32,
+        hash: BlockHash(info.best_block_hash.to_byte_array()),
+    })
 }
 
 pub struct ChainClient {
     rpc: Client,
     pub network: BitcoinNetwork,
+    /// Set once this node's genesis block has been seen to be the configured
+    /// network's. Never cleared: a node's genesis cannot change, and a client
+    /// that fails is dropped and rebuilt, which checks again.
+    genesis_checked: AtomicBool,
 }
 
 /// A payment to a watched script, found in a block.
@@ -102,17 +149,20 @@ impl ChainClient {
         Ok(ChainClient {
             rpc,
             network: cfg.network,
+            genesis_checked: AtomicBool::new(false),
         })
     }
 
+    /// The node's tip, refused unless the node is on the configured network.
+    /// See the note above `check_chain` for why, and for what it cannot catch.
     pub fn tip(&self) -> Result<BlockAnchor> {
+        if !self.genesis_checked.load(Ordering::Relaxed) {
+            let genesis = self.rpc.get_block_hash(0)?;
+            check_genesis(self.network, genesis)?;
+            self.genesis_checked.store(true, Ordering::Relaxed);
+        }
         let info = self.rpc.get_blockchain_info()?;
-        // Before anything is taken from the reading: see `check_chain`.
-        check_chain(self.network, info.chain)?;
-        Ok(BlockAnchor {
-            height: info.blocks as u32,
-            hash: BlockHash(info.best_block_hash.to_byte_array()),
-        })
+        anchor_from_info(self.network, &info)
     }
 
     pub fn in_initial_block_download(&self) -> Result<bool> {
@@ -130,6 +180,12 @@ impl ChainClient {
     /// Cheaper and lower-latency than polling `getbestblockhash`, and it means
     /// the bridge does not need a ZMQ dependency to be responsive. Returns
     /// `None` on timeout, which is a normal quiet period, not an error.
+    ///
+    /// The anchor this returns is NOT checked against the configured network.
+    /// Nothing calls this today. Before anything does, route what it returns
+    /// through [`ChainClient::tip`] or the same checks, or a node on the wrong
+    /// chain can reach the observer or the inbox floor around them
+    /// (freenet-bitcoin#20).
     pub fn wait_for_new_block(&self, timeout_ms: u64) -> Result<Option<BlockAnchor>> {
         let v: serde_json::Value = self
             .rpc
@@ -567,27 +623,138 @@ mod tests {
         }
     }
 
-    /// `check_chain` protects nothing unless the tip passes through it before
-    /// the reading is used, and deleting that one call would leave every test
-    /// above green. So the call is pinned, and pinned ahead of the anchor
-    /// built from the reading.
+    /// Each network accepts its own genesis block and refuses every other
+    /// network's.
     #[test]
-    fn the_tip_is_checked_against_the_configured_network_before_it_is_used() {
+    fn a_node_whose_genesis_is_another_networks_is_refused() {
+        let genesis = |n| bitcoin::constants::genesis_block(bitcoin_network(n)).block_hash();
+        for configured in ALL {
+            assert!(
+                check_genesis(configured, genesis(configured)).is_ok(),
+                "{configured:?} accepts its own genesis"
+            );
+            for other in ALL.into_iter().filter(|o| *o != configured) {
+                assert!(
+                    check_genesis(configured, genesis(other)).is_err(),
+                    "{configured:?} refuses {other:?}'s genesis"
+                );
+            }
+        }
+    }
+
+    /// The case a chain name alone lets through: a node for another coin that
+    /// reports "main" too, on the mainnet slot. Litecoin's is the example. The
+    /// mainnet genesis is pinned to its well-known value as well, so a change
+    /// in the bitcoin crate cannot silently move what mainnet accepts.
+    #[test]
+    fn another_coins_node_on_the_mainnet_slot_is_refused() {
+        let bitcoin: bitcoin::BlockHash =
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+                .parse()
+                .unwrap();
+        let litecoin: bitcoin::BlockHash =
+            "12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2"
+                .parse()
+                .unwrap();
+        assert!(
+            check_genesis(BitcoinNetwork::Bitcoin, bitcoin).is_ok(),
+            "mainnet's own genesis"
+        );
+        assert!(
+            check_genesis(BitcoinNetwork::Bitcoin, litecoin).is_err(),
+            "a Litecoin node reports chain \"main\" and is still refused"
+        );
+    }
+
+    /// A real `getblockchaininfo` reply, taken from the signet node this bridge
+    /// runs against, so the refusal is tested through the real reply type and
+    /// its real deserializer rather than a hand-built value.
+    const SIGNET_INFO: &str = r#"{
+      "chain": "signet",
+      "blocks": 322399,
+      "headers": 322399,
+      "bestblockhash": "0000000a5cdb5edbec1472d7e6380244f4640f71e178abab69664fcb0c433dbe",
+      "bits": "1d1419ac",
+      "target": "0000001419ac0000000000000000000000000000000000000000000000000000",
+      "difficulty": 0.0497497897201228,
+      "time": 1789594564,
+      "mediantime": 1789591264,
+      "verificationprogress": 1,
+      "initialblockdownload": false,
+      "chainwork": "000000000000000000000000000000000000000000000000000010c7d68f0d60",
+      "size_on_disk": 2074724100,
+      "pruned": true,
+      "pruneheight": 316295,
+      "automatic_pruning": true,
+      "prune_target_size": 2097152000,
+      "signet_challenge": "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae",
+      "warnings": []
+    }"#;
+
+    /// That reply, as it would read if the node named `chain` instead.
+    fn reply_naming(chain: &str) -> GetBlockchainInfoResult {
+        let mut v: serde_json::Value = serde_json::from_str(SIGNET_INFO).unwrap();
+        v["chain"] = serde_json::json!(chain);
+        serde_json::from_value(v).expect("the shape of a reply the node really sends")
+    }
+
+    #[test]
+    fn a_real_reply_gives_its_tip_only_on_the_network_it_names() {
+        let tip = anchor_from_info(BitcoinNetwork::Signet, &reply_naming("signet"))
+            .expect("a signet reply on the signet slot");
+        let best: bitcoin::BlockHash =
+            "0000000a5cdb5edbec1472d7e6380244f4640f71e178abab69664fcb0c433dbe"
+                .parse()
+                .unwrap();
+        assert_eq!(tip.height, 322399, "the reply's height");
+        assert!(
+            tip.hash == BlockHash(best.to_byte_array()),
+            "and its best block"
+        );
+        assert!(
+            anchor_from_info(BitcoinNetwork::Bitcoin, &reply_naming("signet")).is_err(),
+            "a signet node on the mainnet slot, which is #20"
+        );
+        assert!(
+            anchor_from_info(BitcoinNetwork::Bitcoin, &reply_naming("main")).is_ok(),
+            "the same reply naming mainnet"
+        );
+        assert!(
+            anchor_from_info(BitcoinNetwork::Testnet4, &reply_naming("test")).is_err(),
+            "the older testnet on the testnet4 slot"
+        );
+    }
+
+    /// The tests above exercise the checks, not whether `tip` goes through
+    /// them, so the wiring is pinned: `tip` calls the genesis check and builds
+    /// its anchor through `anchor_from_info`, and builds none of its own around
+    /// them. Comment lines are stripped before searching, because commenting a
+    /// check out is the likeliest way one gets disabled and a plain text search
+    /// would still find it there.
+    #[test]
+    fn tip_goes_through_both_checks() {
         let src = include_str!("chain.rs");
         let start = src
             .find(concat!("pub fn ", "tip(&self)"))
             .expect("ChainClient::tip is declared in chain.rs");
         let body = &src[start..];
         let body = &body[..body.find("\n    }\n").expect("its body ends")];
-        let check = body
-            .find(concat!("check_chain(", "self.network, info.chain)?"))
-            .expect("ChainClient::tip must refuse a node on the wrong chain");
-        let used = body
-            .find(concat!("Block", "Anchor {"))
-            .expect("the tip is built from the reading");
+        let code: Vec<&str> = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let code = code.join("\n");
         assert!(
-            check < used,
-            "the chain is checked before the reading is used"
+            code.contains(concat!("check_", "genesis(self.network, genesis)?")),
+            "tip checks the genesis block"
+        );
+        assert!(
+            code.contains(concat!("anchor_", "from_info(self.network, &info)")),
+            "tip builds its anchor through the chain check"
+        );
+        assert!(
+            !code.contains(concat!("Block", "Anchor {")),
+            "tip builds no anchor of its own around the checks"
         );
     }
 }
