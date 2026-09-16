@@ -149,14 +149,29 @@ pub const FLOOR_HOLD_MS: i64 = 2 * 60 * 1000;
 /// back costs updates. See [`FloorHold`].
 pub const FLOOR_HOLD_REARM_MS: i64 = 10 * FLOOR_HOLD_MS;
 
-/// Whether a change in the stale-copy condition is worth reporting, and what
-/// it changed to.
+/// How often the stale-copy condition is reported again while it lasts.
+pub const STALE_RELOG_MS: i64 = 60 * 60 * 1000;
+
+/// Whether the stale-copy condition is worth reporting, and what to say:
+/// `Some(true)` that it is in force, `Some(false)` that it has ended, `None`
+/// to stay quiet.
 ///
-/// `None` while it stays as it was: the condition lasts as long as the node
-/// serves that copy, and a line a pass would be thousands a day. The worker
-/// reports it, so this is where a test can reach the decision.
-pub fn stale_transition(was: bool, now: bool) -> Option<bool> {
-    (was != now).then_some(now)
+/// It is always reported when it changes. While it lasts it is repeated, but
+/// no more often than [`STALE_RELOG_MS`], which is a compromise between two
+/// ways of being useless. A line every pass is thousands a day, the flood of
+/// freenet-bitcoin#17. A line only when it starts can be worse: one cause is
+/// a disagreement between this build and the contract it loaded, which
+/// nothing but a deployment clears, and a bridge holds one connection for
+/// days, so the only report of a condition that is still in force can sit
+/// outside every window an operator looks at.
+///
+/// The worker reports it, so this is where a test can reach the decision.
+pub fn stale_report(was: bool, now: bool, since_report: Option<Duration>) -> Option<bool> {
+    if was != now {
+        return Some(now);
+    }
+    let due = since_report.is_none_or(|d| d >= Duration::from_millis(STALE_RELOG_MS as u64));
+    (now && due).then_some(true)
 }
 
 /// Whether the floor is still held. The hold is kept on the monotonic clock,
@@ -205,14 +220,18 @@ pub struct Pass {
     /// condition lasts as long as the node serves that copy, and a line a
     /// pass would be thousands a day.
     pub stale: bool,
-    /// The three numbers behind `stale`, carried so the worker can report
-    /// them: the highest floor this bridge has signed, the floor the copy
-    /// carries, and how many of its entries that floor has passed. The
-    /// condition has two causes needing different remedies, a copy frozen
-    /// more than a window back and a request the floor overtook, and these
-    /// are what tell them apart.
+    /// The highest floor this bridge has signed. Carried, with the three
+    /// below, so the worker can report what lies behind `stale`: the
+    /// condition has three causes needing different remedies, and these
+    /// numbers are what tell them apart.
     pub signed_floor: Option<u32>,
+    /// The floor the copy just read carries. Far below `signed_floor` says
+    /// the node has stopped following the contract.
     pub copy_floor: Option<u32>,
+    /// Entries this copy holds that the signed floor has passed. Above zero
+    /// with the floors close together says this copy predates the floor,
+    /// which is all it says: see the counter's own comment in `pass`, since
+    /// an entry counted here may be one an earlier pass already read.
     pub behind_the_floor: usize,
     /// Entries the node served that this bridge cannot accept. A state the
     /// node validated holds none, since the contract refuses every reason
@@ -270,10 +289,18 @@ impl Processor<'_> {
         let mut entries: Vec<(EntryKey, &InboxEntry)> = state.verified_entries(self.params);
         let unverified = state.entries.len().saturating_sub(entries.len());
         if unverified > 0 {
-            tracing::warn!(
+            // Debug, not warn, and deliberately: this count now holds watches
+            // back, so it makes the pass gated, so the quiet cache never arms
+            // and the same state is read again every poll. At warn that is a
+            // line every thirty seconds for as long as the disagreement
+            // lasts, which is the flood of freenet-bitcoin#17. The condition
+            // is reported once when it starts, by the worker, which carries
+            // this count in that line.
+            tracing::debug!(
                 unverified,
-                "inbox entries this bridge cannot accept were skipped; no watch ends while it \
-                 reads one, since a skipped entry may be a renewal"
+                "inbox entries this bridge cannot accept were skipped and so were read by \
+                 nobody; no watch ends against a copy holding one, since a skipped entry may \
+                 be the renewal that keeps a watch alive"
             );
         }
         entries.sort_by_key(|(k, e)| (e.mainnet_height, *k));
@@ -1012,6 +1039,7 @@ impl InboxWorker {
             chains: HashMap::new(),
             quiet: QuietCache::default(),
             was_stale: false,
+            stale_reported_at: None,
         };
 
         let mut driver = Driver::default();
@@ -1088,17 +1116,24 @@ impl InboxWorker {
         };
         let pass = match processor.pass(&state, &tips, now_ms()) {
             Ok(p) => {
-                if let Some(now_stale) = stale_transition(session.was_stale, p.stale) {
+                let since_report = session.stale_reported_at.map(|at| at.elapsed());
+                if let Some(now_stale) = stale_report(session.was_stale, p.stale, since_report) {
                     session.was_stale = now_stale;
+                    session.stale_reported_at = Some(Instant::now());
                     if now_stale {
+                        // Deliberately does not name a cause: there are three,
+                        // they need different remedies, and the fields tell
+                        // them apart. A message that lists them goes stale the
+                        // next time one is added, which is how the previous
+                        // one came to name two of three.
                         tracing::warn!(
                             signed = ?p.signed_floor,
                             copy = ?p.copy_floor,
                             behind_the_floor = p.behind_the_floor,
                             unverified = p.unverified,
-                            "this node serves an inbox behind the floor this bridge signed, or \
-                             holding a request that floor has passed; no watch ends until it \
-                             serves a current one"
+                            "this node serves an inbox this bridge cannot act on in full; no \
+                             watch ends until it serves one this bridge can. The fields name \
+                             which reason applies"
                         );
                     } else {
                         tracing::info!("this node serves a current inbox again; watches may end");
@@ -1235,6 +1270,10 @@ struct Session {
     /// floor this bridge signed, so the condition is reported when it starts
     /// and when it ends rather than on every pass.
     was_stale: bool,
+    /// When the stale-copy condition was last reported, so a condition that
+    /// lasts is repeated at the rate [`stale_report`] allows rather than
+    /// once for the life of a connection. See [`STALE_RELOG_MS`].
+    stale_reported_at: Option<Instant>,
 }
 
 impl Session {
@@ -2650,6 +2689,12 @@ mod tests {
         let pass = run(&store, &state, &tips());
         assert_eq!(pass.acted, 3);
         assert_eq!(watched(&store).len(), 3);
+        // A rule the contract enforces and this bridge does not is the safe
+        // half of the difference between them, and must stay that way: if a
+        // cap the two came to count differently were read as an entry this
+        // bridge cannot accept, it would hold every watch back for ever.
+        assert_eq!(pass.unverified, 0, "a cap disagreement skips nothing");
+        assert!(!pass.stale, "so it holds no watch back");
     }
 
     #[test]
@@ -2708,13 +2753,23 @@ mod tests {
         assert!(watched(&store).is_empty());
     }
 
-    /// Reported when it starts and when it ends, and not while it lasts.
+    /// Reported when it starts and when it ends, repeated while it lasts but
+    /// no more often than the interval, and never while all is well.
     #[test]
-    fn the_stale_copy_condition_is_reported_only_when_it_changes() {
-        assert_eq!(stale_transition(false, false), None, "still fine");
-        assert_eq!(stale_transition(false, true), Some(true), "it starts");
-        assert_eq!(stale_transition(true, true), None, "still behind");
-        assert_eq!(stale_transition(true, false), Some(false), "it ends");
+    fn the_stale_copy_condition_is_reported_on_a_change_then_at_its_interval() {
+        let due = Some(Duration::from_millis(STALE_RELOG_MS as u64));
+        let fresh = Some(Duration::from_millis(0));
+        assert_eq!(stale_report(false, false, fresh), None, "still fine");
+        assert_eq!(stale_report(false, true, fresh), Some(true), "it starts");
+        assert_eq!(stale_report(true, false, fresh), Some(false), "it ends");
+        assert_eq!(stale_report(true, true, fresh), None, "not due again yet");
+        assert_eq!(stale_report(true, true, due), Some(true), "due again");
+        assert_eq!(stale_report(true, true, None), Some(true), "never reported");
+        assert_eq!(
+            stale_report(false, false, due),
+            None,
+            "the interval never reports a condition that is not in force"
+        );
     }
 
     /// An entry dated at the floor itself is not behind it: it is read like
@@ -2791,7 +2846,8 @@ mod tests {
         run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0);
         caught_up(&store);
         let renewal = entry(&ghostkeys()[1], FLOOR, &request(Action::Watch, b"spk2", 1));
-        let mut state = inbox(FLOOR, vec![renewal]);
+        let clean = inbox(FLOOR, vec![renewal]);
+        let mut state = clean.clone();
         // File it under a key that is not its digest, which `verify` refuses
         // and this bridge skips. The contract cannot object here: it has
         // already validated this copy, and what the node serves is what it
@@ -2804,11 +2860,22 @@ mod tests {
         assert_eq!(pass.acted, 0, "which is read by nobody");
         assert!(pass.stale, "so the copy is not treated as current");
         assert!(pass.gated, "and the pass is not passed over as quiet");
+        // The discriminators, so this test proves the new reason carried it
+        // and not one of the two older ones.
+        assert_eq!(pass.behind_the_floor, 0, "nothing sits below the floor");
+        assert_eq!(pass.signed_floor, pass.copy_floor, "and the floors agree");
         assert_eq!(
             watched(&store),
             vec![b"spk".to_vec()],
             "and the watch is kept, since the skipped entry may be its renewal"
         );
+
+        // It opens again as soon as the node serves a copy this bridge can
+        // read: nothing here latches for the life of the connection.
+        let ok = run_at(&store, &clean, &tips(), T0 + 25 * HOUR);
+        assert_eq!(ok.unverified, 0, "nothing is skipped now");
+        assert!(!ok.stale, "so the copy counts as current again");
+        assert_eq!(ok.acted, 1, "and the entry is read");
     }
 
     /// A node that has stopped following the inbox answers every read from

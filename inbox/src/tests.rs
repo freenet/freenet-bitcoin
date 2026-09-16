@@ -1388,6 +1388,68 @@ fn verified_entries_leaves_out_what_does_not_check() {
     assert_eq!(kept, vec![good.entry.key()]);
 }
 
+/// The bridge holds every watch back while it reads an entry it cannot
+/// accept, and that gate is safe to have only because of one property
+/// spanning two functions: every reason `verified_entries` skips an entry is
+/// a reason `verify` refuses the whole state. So a state a node validated
+/// holds nothing this bridge skips, and the gate cannot be held down by
+/// anything a sender sends.
+///
+/// If that ever stopped holding, no watch would end on any network for as
+/// long as the entry sat there, and nothing else in either crate would fail.
+/// A comment is not enough to carry that; this asserts it.
+#[test]
+fn every_entry_this_bridge_skips_is_one_the_contract_refuses() {
+    let g = ghostkeys();
+    let good = entry(&g[0], 104, 1);
+    let base = with_entries(100, std::slice::from_ref(&good));
+    assert!(
+        base.verify(&params()).is_ok(),
+        "the untampered state verifies"
+    );
+    assert_eq!(
+        base.verified_entries(&params()).len(),
+        base.entries.len(),
+        "and this bridge skips nothing in it"
+    );
+
+    // Each case tampers with the state in one of the ways `verified_entries`
+    // skips for. Heights stay inside the window so that the window rule
+    // cannot be what makes `verify` refuse.
+    let mut cases: Vec<(&str, InboxStateV1)> = Vec::new();
+
+    let misfiled = entry(&g[1], 101, 2);
+    let mut s = base.clone();
+    s.certificates
+        .insert(misfiled.entry.cert, misfiled.certificate_pem.clone());
+    s.entries
+        .insert(EntryKey([9u8; 32]), misfiled.entry.clone());
+    cases.push(("filed under a key that is not its digest", s));
+
+    let uncertified = entry(&g[2], 102, 3);
+    let mut s = base.clone();
+    s.entries
+        .insert(uncertified.entry.key(), uncertified.entry.clone());
+    cases.push(("no certificate for it in the state", s));
+
+    let mut forged = entry(&g[3], 103, 4);
+    forged.entry.signature.0[0] ^= 1;
+    let mut s = base.clone();
+    s.certificates
+        .insert(forged.entry.cert, forged.certificate_pem.clone());
+    s.entries.insert(forged.entry.key(), forged.entry.clone());
+    cases.push(("a signature that does not check", s));
+
+    for (what, s) in cases {
+        let skipped = s.entries.len() - s.verified_entries(&params()).len();
+        assert_eq!(skipped, 1, "{what}: this bridge skips it");
+        assert!(
+            s.verify(&params()).is_err(),
+            "{what}: so the contract must refuse the whole state"
+        );
+    }
+}
+
 /// A certificate for `key`, signed by the test notary the way the real one
 /// signs: it certifies whatever key it is given.
 fn certify(key: ed25519_dalek::VerifyingKey) -> String {

@@ -348,15 +348,27 @@ contract id as `serving the request inbox`.
   says something different: the contract validated what the bridge refuses, so
   the bridge and the `bitcoin_inbox_contract.wasm` it loaded disagree, which a
   deployment that replaces one without the other can cause. It is
-  logged once when it starts, "this node serves an inbox behind the floor
-  this bridge signed, or holding a request that floor has passed; no watch
-  ends until it serves a current one", and once when it ends, "this node
-  serves a current inbox again; watches may end". It is not logged every
-  pass: the condition lasts as long as the node serves that copy. The first
-  line carries `signed`, `copy` and `behind_the_floor`, which is what tells
-  the two causes apart: a copy frozen more than a window back shows the
-  floors far apart and nothing behind, while a request the floor overtook
-  shows the floors close and a count above zero. It holds back every watch
+  logged when it starts, "this node serves an inbox this bridge cannot act on
+  in full; no watch ends until it serves one this bridge can. The fields name
+  which reason applies", again every hour while it lasts, and once when it
+  ends, "this node serves a current inbox again; watches may end". It is not
+  logged every pass, which would be thousands of lines a day, and not only
+  once either: one of its reasons lasts until someone acts, and a bridge holds
+  one connection for days, so a single line can sit outside every window an
+  operator looks at. The line carries `signed`, `copy`, `behind_the_floor` and
+  `unverified`, which is what tells the three reasons apart.
+  `signed` far above `copy` is a node that has stopped following the contract
+  while still answering reads from what it holds. `unverified` above zero is
+  this build and the contract disagreeing about what an entry must satisfy,
+  and it is the one reason nothing here clears by itself: install the binary
+  and the three WASM together with `scripts/deploy.sh`, never one without the
+  others. `behind_the_floor` above zero, with the floors close together, says
+  this copy predates the floor this bridge signed. Read it as that and no
+  more: it does not say the entries it counts went unread, since a pass may
+  have read them already against a fresher copy, and the record that would
+  show so is pruned by the floor before the count is taken. That is still
+  enough to hold watches back, because a copy predating the floor may be
+  missing a renewal, and there is no way from here to tell which. It holds back every watch
   on the bridge, not only the one whose request was skipped, since a copy
   that is not current is not current for anyone; so a run of watches all
   staying put during one lagging-copy episode has this one cause, not a
@@ -366,13 +378,7 @@ contract id as `serving the request inbox`.
   that applies what the bridge writes while seeing no peers looks healthy;
   and the floor rises with the mainnet tip, so while mainnet's node cannot
   be reached the evidence stops moving although watches still end on the
-  other networks. Both are in freenet-bitcoin#18. A third is worth knowing
-  because it does not mend itself: the floor this bridge has signed only ever
-  rises, so a Bitcoin Core that once reported a tip far above the real chain,
-  having been pointed at the wrong network or served a corrupt one, leaves a
-  floor no later reading lowers. Every real entry then sits below it, and no
-  watch ends again on any network until the recorded floor is corrected.
-  Watches are kept, never dropped, so nothing is lost meanwhile. Every scan
+  other networks. Both are in freenet-bitcoin#18. Every scan
   also covers
   the scripts of payments a reorg moved out of their block and that have not
   been seen again, watched or not, so such a payment is found where it was
