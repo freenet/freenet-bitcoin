@@ -663,12 +663,9 @@ async fn observe_once(
 /// several address encodings can denote the same script, and only the script
 /// appears on chain.
 fn parse_address(s: &str, network: BitcoinNetwork) -> Result<Vec<u8>> {
-    let btc_net = match network {
-        BitcoinNetwork::Bitcoin => bitcoin::Network::Bitcoin,
-        BitcoinNetwork::Testnet4 => bitcoin::Network::Testnet4,
-        BitcoinNetwork::Signet => bitcoin::Network::Signet,
-        BitcoinNetwork::Regtest => bitcoin::Network::Regtest,
-    };
+    // The same mapping the chain check uses, so an address and the node it is
+    // watched on can never be read as two different networks.
+    let btc_net = bitcoin_freenet_bridge::chain::bitcoin_network(network);
     let addr = s
         .trim()
         .parse::<Address<bitcoin::address::NetworkUnchecked>>()
