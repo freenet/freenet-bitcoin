@@ -196,6 +196,9 @@ pub struct Processor<'a> {
     pub deep_confirmations: &'a HashMap<BitcoinNetwork, u32>,
     /// The floor is not raised before this instant; see [`FLOOR_HOLD_MS`].
     pub floor_hold_until: Option<Instant>,
+    /// No watch ends before this instant. Armed by every connection, unlike
+    /// the floor's half: see [`FloorHold`].
+    pub expiry_hold_until: Option<Instant>,
 }
 
 impl Processor<'_> {
@@ -309,13 +312,16 @@ impl Processor<'_> {
         }
 
         // Last, and never allowed to cost the pass its removals and floor.
-        // Not while the floor is held, because a node that has just connected
-        // may not yet hold the Watch that renews a watch. And a Ghost Key with
+        // Not while the hold's expiry half is in force, which every connection
+        // arms, because a node that has just connected may not yet hold the
+        // Watch that renews a watch, and may answer NotFound, which this
+        // bridge answers with an empty inbox of its own. And a Ghost Key with
         // a request waiting on the removal budget keeps its watches for now,
         // since that request may be the renewal: only its own, so no one
         // sender can hold back every watch on the bridge.
-        pass.gated = held;
-        if !held {
+        let expiry_held = floor_held(self.expiry_hold_until);
+        pass.gated = held || expiry_held;
+        if !expiry_held {
             match self.expire_watches(now_ms, &pass.waiting) {
                 Ok(lagging) => pass.gated |= lagging,
                 Err(e) => {
@@ -758,12 +764,37 @@ impl Driver {
 /// it flapped. How long the last session lasted says nothing useful here: a
 /// connection refused while the node restarts ends in an instant, and it is
 /// exactly then that the hold is wanted.
-pub fn arm_floor_hold(armed_at: Option<Instant>, now: Instant) -> Instant {
+pub fn arm_floor_hold(armed_at: Option<Instant>, now: Instant) -> FloorHold {
     let rearm = Duration::from_millis(FLOOR_HOLD_REARM_MS as u64);
-    match armed_at {
+    let armed_at = match armed_at {
         Some(at) if now < at + rearm => at,
         _ => now,
+    };
+    FloorHold {
+        armed_at,
+        floor_until: armed_at + Duration::from_millis(FLOOR_HOLD_MS as u64),
+        expiry_until: now + Duration::from_millis(FLOOR_HOLD_MS as u64),
     }
+}
+
+/// When the hold was armed, and when each half of it ends.
+///
+/// The two halves part because their failures cost differently. Holding the
+/// floor down for as long as a node flaps would stop removals retiring and
+/// fill the removal budget, so it is armed no more often than
+/// [`FLOOR_HOLD_REARM_MS`] and a connection inside that interval is not held.
+/// Holding watches back costs updates and nothing else, while ending one
+/// early loses a payment for good, so every connection holds that, however
+/// often the node drops: the bridge writes an empty inbox itself when a node
+/// answers NotFound, and must not read that as every watch having run out.
+///
+/// The lengths are worked out here, where a test reads them, rather than at
+/// the connection, where nothing without a node can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloorHold {
+    pub armed_at: Instant,
+    pub floor_until: Instant,
+    pub expiry_until: Instant,
 }
 
 /// The wait before the next connection attempt, given the last wait and how
@@ -867,6 +898,10 @@ impl InboxWorker {
             .iter()
             .map(|n| (n.network, n.deep_confirmations))
             .collect();
+        // Armed once, here, so both halves of the hold come from one reading
+        // of the clock and the worker keeps when it was armed.
+        let hold = arm_floor_hold(*floor_armed_at, Instant::now());
+        *floor_armed_at = Some(hold.armed_at);
         let processor = Processor {
             params: &self.params,
             key: &self.key,
@@ -874,11 +909,8 @@ impl InboxWorker {
             observed: &observed,
             max_watches_per_ghostkey: MAX_WATCHES_PER_GHOSTKEY,
             deep_confirmations: &deep,
-            floor_hold_until: {
-                let at = arm_floor_hold(*floor_armed_at, Instant::now());
-                *floor_armed_at = Some(at);
-                Some(at + Duration::from_millis(FLOOR_HOLD_MS as u64))
-            },
+            floor_hold_until: Some(hold.floor_until),
+            expiry_hold_until: Some(hold.expiry_until),
         };
         let key = self.contract_key()?;
         let mut session = Session {
@@ -1212,6 +1244,7 @@ mod tests {
         s
     }
 
+    /// A hold that stands for both halves, as a connection arms them.
     fn try_run_held(
         store: &Store,
         state: &InboxStateV1,
@@ -1219,6 +1252,29 @@ mod tests {
         cap: usize,
         now_ms: i64,
         floor_hold_until: Option<Instant>,
+    ) -> Result<Pass> {
+        try_run_holds(
+            store,
+            state,
+            tips,
+            cap,
+            now_ms,
+            floor_hold_until,
+            floor_hold_until,
+        )
+    }
+
+    /// The two halves apart, which a connection inside the rearm interval
+    /// leaves: the floor may rise again while watches are still held back.
+    #[allow(clippy::too_many_arguments)]
+    fn try_run_holds(
+        store: &Store,
+        state: &InboxStateV1,
+        tips: &Tips,
+        cap: usize,
+        now_ms: i64,
+        floor_hold_until: Option<Instant>,
+        expiry_hold_until: Option<Instant>,
     ) -> Result<Pass> {
         let params = params();
         let key = bridge_key();
@@ -1231,6 +1287,7 @@ mod tests {
             max_watches_per_ghostkey: cap,
             deep_confirmations: &deep,
             floor_hold_until,
+            expiry_hold_until,
         }
         .pass(state, tips, now_ms)
     }
@@ -1640,23 +1697,34 @@ mod tests {
     /// watch ending, for as long as it flapped.
     #[test]
     fn the_floor_hold_is_armed_again_but_no_more_often_than_its_interval() {
+        let hold = Duration::from_millis(FLOOR_HOLD_MS as u64);
         let rearm = Duration::from_millis(FLOOR_HOLD_REARM_MS as u64);
         let first = Instant::now();
-        assert_eq!(arm_floor_hold(None, first), first, "the first connection");
+        let armed = arm_floor_hold(None, first);
+        assert_eq!(armed.armed_at, first, "the first connection");
+        assert_eq!(armed.floor_until, first + hold, "and it lasts the hold");
+        assert_eq!(armed.expiry_until, first + hold, "as does its expiry half");
+        let soon = first + rearm / 4;
         assert_eq!(
-            arm_floor_hold(Some(first), first + rearm / 4),
+            arm_floor_hold(Some(first), soon).armed_at,
             first,
             "a node that keeps dropping the connection, however it drops it"
         );
         assert_eq!(
-            arm_floor_hold(Some(first), first + rearm),
+            arm_floor_hold(Some(first), soon).expiry_until,
+            soon + hold,
+            "but every connection holds watches back, whatever the floor does"
+        );
+        assert_eq!(
+            arm_floor_hold(Some(first), first + rearm).armed_at,
             first + rearm,
             "the interval is up"
         );
         let days = first + Duration::from_secs(3 * 24 * 3600);
+        let again = arm_floor_hold(Some(first), days);
         assert_eq!(
-            arm_floor_hold(Some(first), days),
-            days,
+            (again.armed_at, again.floor_until),
+            (days, days + hold),
             "a node restarted under a bridge that kept running"
         );
     }
@@ -1704,6 +1772,17 @@ mod tests {
         assert!(
             run.contains(concat!("self.session(&mut floor_arm", "ed_at)")),
             "the session no longer takes the worker's hold"
+        );
+        // In `session`, past the slice above: the pass must be given when each
+        // half of the hold ends, not when it was armed, or the hold is over as
+        // soon as it begins.
+        assert!(
+            src.contains(concat!("Some(hold", ".floor_until)")),
+            "the pass is given something other than when the floor's hold ends"
+        );
+        assert!(
+            src.contains(concat!("Some(hold", ".expiry_until)")),
+            "the pass is given something other than when watches may end again"
         );
     }
 
@@ -1820,6 +1899,7 @@ mod tests {
             max_watches_per_ghostkey: MAX_WATCHES_PER_GHOSTKEY,
             deep_confirmations: deep,
             floor_hold_until: None,
+            expiry_hold_until: None,
         }
         .expire_watches(now_ms, &BTreeSet::new())
         .unwrap();
@@ -2447,6 +2527,34 @@ mod tests {
         assert!(watched(&store).is_empty());
     }
 
+    /// Every connection holds watches back, even one the rearm interval
+    /// leaves the floor free on: the node it has just reached may answer
+    /// NotFound, which this bridge answers with an empty inbox of its own,
+    /// and reading that as every watch having run out loses payments for
+    /// good, while holding them back costs updates.
+    #[test]
+    fn a_watch_is_kept_while_only_the_expiry_half_of_the_hold_is_in_force() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        caught_up(&store);
+        let pass = try_run_holds(
+            &store,
+            &inbox(FLOOR, vec![]),
+            &tips(),
+            MAX_WATCHES_PER_GHOSTKEY,
+            T0 + 25 * HOUR,
+            None,
+            Some(Instant::now() + Duration::from_secs(3600)),
+        )
+        .unwrap();
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "kept while watches are held back"
+        );
+        assert!(pass.gated, "and the pass is not passed over as quiet");
+    }
+
     /// A node that has just connected may not yet hold the Watch that renews
     /// a watch, so nothing ends while the floor is held; and a request
     /// waiting on the budget may be that Watch, so its sender's watches wait
@@ -2651,6 +2759,7 @@ mod tests {
             max_watches_per_ghostkey: MAX_WATCHES_PER_GHOSTKEY,
             deep_confirmations: &deep,
             floor_hold_until: None,
+            expiry_hold_until: None,
         };
         let lagging = processor
             .expire_watches(T0 + 25 * HOUR, &BTreeSet::new())

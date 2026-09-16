@@ -466,15 +466,28 @@ impl Store {
     /// moved. A `demo_backfill_blocks` past the window kept asks for that at
     /// every start, and so does a node restored from an older snapshot or
     /// resynced from scratch.
+    ///
+    /// It stops at a height it has a record for, and takes that block's hash:
+    /// the highest record at or below where it was asked to stop, or the
+    /// oldest record it holds where that is higher, so a checkpoint never
+    /// names a block this bridge cannot compare against the node's. With
+    /// nothing recorded for the network it stays where it is, since there is
+    /// nothing to name; the observer never leaves it that way, recording a
+    /// block at the height it sets in the same step.
     pub fn rewind_checkpoint_to(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<()> {
         self.conn.execute(
             "UPDATE chain_checkpoint
-             SET height = MIN(height, MAX(?2, COALESCE(
-                     (SELECT MIN(height) FROM seen_blocks WHERE network = ?1), ?2))),
+             SET height = MIN(height, COALESCE(
+                     (SELECT MAX(height) FROM seen_blocks WHERE network = ?1 AND height <= ?2),
+                     (SELECT MIN(height) FROM seen_blocks WHERE network = ?1),
+                     height)),
                  block_hash = COALESCE(
                      (SELECT block_hash FROM seen_blocks WHERE network = ?1 AND height =
-                         MIN(chain_checkpoint.height, MAX(?2, COALESCE(
-                             (SELECT MIN(height) FROM seen_blocks WHERE network = ?1), ?2)))),
+                         MIN(chain_checkpoint.height, COALESCE(
+                             (SELECT MAX(height) FROM seen_blocks
+                                  WHERE network = ?1 AND height <= ?2),
+                             (SELECT MIN(height) FROM seen_blocks WHERE network = ?1),
+                             chain_checkpoint.height))),
                      block_hash)
              WHERE network = ?1 AND height > ?2",
             params![net.as_str(), height as i64],
@@ -1358,7 +1371,7 @@ mod tests {
         let s = store();
         let at = |h| BlockAnchor {
             height: h,
-            hash: BlockHash([0; 32]),
+            hash: BlockHash([7; 32]),
         };
         s.set_checkpoint(BitcoinNetwork::Signet, &at(500)).unwrap();
         s.rewind_checkpoint_to(BitcoinNetwork::Signet, 800).unwrap();
@@ -1369,13 +1382,24 @@ mod tests {
                 .height,
             500
         );
+        // Nothing is recorded for this network, so there is no block to stop
+        // at and name, and the checkpoint stays where it was rather than
+        // moving to a height this bridge could not compare against the node's.
         s.rewind_checkpoint_to(BitcoinNetwork::Signet, 300).unwrap();
         assert_eq!(
             s.checkpoint(BitcoinNetwork::Signet)
                 .unwrap()
                 .unwrap()
                 .height,
-            300
+            500
+        );
+        // Nothing is recorded for this network, so there is no block to name
+        // and the checkpoint keeps the hash it had. The observer never leaves
+        // it that way: it records a block at the height it sets.
+        assert_eq!(
+            s.checkpoint(BitcoinNetwork::Signet).unwrap().unwrap().hash,
+            BlockHash([7; 32]),
+            "the hash it had"
         );
         s.rewind_checkpoint_to(BitcoinNetwork::Bitcoin, 300)
             .unwrap();

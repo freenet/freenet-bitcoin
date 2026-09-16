@@ -127,7 +127,9 @@ impl BridgeConfig {
                     network = ?n.network,
                     demo_backfill_blocks = n.demo_backfill_blocks,
                     "demo_backfill_blocks reaches past the {kept} blocks kept below the scan \
-                     position; the rewind will stop at the oldest block kept"
+                     position; the rewind will stop at the oldest block kept, and the height \
+                     it asks for is recorded with the demo watch for good, since nothing may \
+                     narrow one"
                 );
             }
         }
@@ -161,11 +163,12 @@ mod tests {
     }
 
     /// A depth past the blocks the bridge keeps ends no watch, and a backfill
-    /// past them rewinds to a block it no longer holds, which reads as a
-    /// reorg. Neither refuses the configuration: the depth is reported and
-    /// left alone, the backfill narrowed.
+    /// past them asks to rewind to a block it no longer holds, which reads as
+    /// a reorg. Neither refuses the configuration and neither is narrowed:
+    /// both are reported and left as they are, since the rewind stops at the
+    /// oldest block held on its own and the depth is the operator's call.
     #[test]
-    fn a_depth_past_the_blocks_kept_is_reported_and_a_wide_backfill_narrowed() {
+    fn a_depth_or_backfill_past_the_blocks_kept_is_reported_and_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bridge.toml");
         let cfg = |extra: &str| {
