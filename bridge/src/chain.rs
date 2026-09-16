@@ -21,7 +21,6 @@ use bitcoincore_rpc::json::GetBlockchainInfoResult;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use freenet_bitcoin_common::spv::{BlockHeader, SpvProof};
 use freenet_bitcoin_common::{BitcoinNetwork, BlockAnchor, BlockHash, Txid};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::NetworkConfig;
 
@@ -46,13 +45,22 @@ pub fn bitcoin_network(network: BitcoinNetwork) -> bitcoin::Network {
 //
 // Two checks, because each misses what the other catches. The chain name is
 // cheap and read with every tip, but a fork of Bitcoin Core for another coin
-// reports "main" too. The genesis block tells coins apart, and is read once per
-// client since it cannot change.
+// reports "main" too. The genesis block tells coins apart. It is read with every
+// tip rather than cached: it is one cheap read from the node's block index, and a
+// cache would trust a client's address to keep reaching the same daemon, which
+// a different daemon restarted onto that address breaks. The observer's client
+// is never rebuilt, so a cached check would never run again for it.
 //
 // What neither catches: a custom signet shares both the name and the genesis
-// block of the default one, so it passes on a Signet slot. That cannot move the
-// inbox floor, which only mainnet feeds. And a node on the right chain serving a
-// corrupt one can still report a wrong height, which is why #20 stays open.
+// block of the default one, so it passes on a Signet slot, and the observer then
+// scans that chain and signs what it finds there as Signet. It cannot move the
+// inbox floor, which only mainnet feeds, but it is signed evidence about the
+// wrong chain, and Signet is a network this bridge really runs. The same holds
+// for regtest, whose instances also share one genesis. The two reads are also
+// separate calls, so an address balanced across several daemons could answer
+// them from different ones; nothing is deployed that way. And a node on the
+// right chain serving a corrupt one can still report a wrong height, which is
+// why #20 stays open.
 //
 // Refusing costs nothing that matters. The observer logs the round as failed
 // and tries again, and the inbox worker treats the tip as unreadable, which
@@ -102,10 +110,6 @@ fn anchor_from_info(
 pub struct ChainClient {
     rpc: Client,
     pub network: BitcoinNetwork,
-    /// Set once this node's genesis block has been seen to be the configured
-    /// network's. Never cleared: a node's genesis cannot change, and a client
-    /// that fails is dropped and rebuilt, which checks again.
-    genesis_checked: AtomicBool,
 }
 
 /// A payment to a watched script, found in a block.
@@ -149,18 +153,17 @@ impl ChainClient {
         Ok(ChainClient {
             rpc,
             network: cfg.network,
-            genesis_checked: AtomicBool::new(false),
         })
     }
 
     /// The node's tip, refused unless the node is on the configured network.
     /// See the note above `check_chain` for why, and for what it cannot catch.
     pub fn tip(&self) -> Result<BlockAnchor> {
-        if !self.genesis_checked.load(Ordering::Relaxed) {
-            let genesis = self.rpc.get_block_hash(0)?;
-            check_genesis(self.network, genesis)?;
-            self.genesis_checked.store(true, Ordering::Relaxed);
-        }
+        let genesis = self
+            .rpc
+            .get_block_hash(0)
+            .context("reading the node's genesis block hash")?;
+        check_genesis(self.network, genesis)?;
         let info = self.rpc.get_blockchain_info()?;
         anchor_from_info(self.network, &info)
     }
@@ -666,6 +669,30 @@ mod tests {
         );
     }
 
+    /// The genesis blocks nova's own nodes report, read with `getblockhash 0`
+    /// on 2026-09-16, so the claim that this bridge's live nodes are accepted
+    /// is a test rather than a remark. A check that refused these would stop
+    /// observation on the networks the bridge actually runs.
+    #[test]
+    fn the_genesis_blocks_the_live_nodes_report_are_accepted() {
+        let mainnet: bitcoin::BlockHash =
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+                .parse()
+                .unwrap();
+        let signet: bitcoin::BlockHash =
+            "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"
+                .parse()
+                .unwrap();
+        assert!(
+            check_genesis(BitcoinNetwork::Bitcoin, mainnet).is_ok(),
+            "nova's mainnet node"
+        );
+        assert!(
+            check_genesis(BitcoinNetwork::Signet, signet).is_ok(),
+            "nova's signet node"
+        );
+    }
+
     /// A real `getblockchaininfo` reply, taken from the signet node this bridge
     /// runs against, so the refusal is tested through the real reply type and
     /// its real deserializer rather than a hand-built value.
@@ -728,9 +755,11 @@ mod tests {
     /// The tests above exercise the checks, not whether `tip` goes through
     /// them, so the wiring is pinned: `tip` calls the genesis check and builds
     /// its anchor through `anchor_from_info`, and builds none of its own around
-    /// them. Comment lines are stripped before searching, because commenting a
-    /// check out is the likeliest way one gets disabled and a plain text search
-    /// would still find it there.
+    /// them. Comments are stripped before searching, line and block alike,
+    /// because commenting a check out is the likeliest way one gets disabled
+    /// and a plain text search would still find it there. It is still a text
+    /// match: an `if false` around a check would pass it, which is why the
+    /// refusal itself is tested through `anchor_from_info` and `check_genesis`.
     #[test]
     fn tip_goes_through_both_checks() {
         let src = include_str!("chain.rs");
@@ -739,7 +768,17 @@ mod tests {
             .expect("ChainClient::tip is declared in chain.rs");
         let body = &src[start..];
         let body = &body[..body.find("\n    }\n").expect("its body ends")];
-        let code: Vec<&str> = body
+        // Strip block comments, then line comments.
+        let mut unblocked = String::new();
+        let mut rest = body;
+        while let Some(open) = rest.find("/*") {
+            unblocked.push_str(&rest[..open]);
+            rest = rest[open..]
+                .find("*/")
+                .map_or("", |close| &rest[open + close + 2..]);
+        }
+        unblocked.push_str(rest);
+        let code: Vec<&str> = unblocked
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect();
