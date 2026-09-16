@@ -266,6 +266,16 @@ contract id as `serving the request inbox`.
   height whichever network they are for, and the inbox floor follows the
   mainnet tip, 2 blocks behind. With no `Bitcoin` network in the config the
   inbox stays closed, and the bridge says so at startup.
+- **Confirm the mainnet node is on mainnet before pointing the bridge at it.**
+  The floor is taken from the tip that node reports, nothing bounds how far
+  one reading may raise it, and it only ever rises. A node on another chain,
+  or serving a corrupt one, therefore raises the floor past every real
+  request: the requests waiting at that moment are dropped, the floor never
+  rises again, and once the removal budget fills no further request is read.
+  Watches go on ending to their ordinary schedule throughout, so this is not
+  self-announcing. Recovering means correcting the recorded floor in
+  `inbox_meta` by hand. The bridge does not check the node's chain against
+  the configured network today; that is freenet-bitcoin#20.
 - **The bridge waits two minutes after connecting to its node**
   (`FLOOR_HOLD_MS`), so a node that was down has time to catch up with the
   inbox. The wait has two halves, because they cost differently when they
@@ -348,8 +358,8 @@ contract id as `serving the request inbox`.
   says something different: the contract validated what the bridge refuses, so
   the bridge and the `bitcoin_inbox_contract.wasm` it loaded disagree, which a
   deployment that replaces one without the other can cause. It is
-  logged when it starts, "this node serves an inbox this bridge cannot act on
-  in full; no watch ends until it serves one this bridge can. The fields name
+  logged when it starts, "this node serves an inbox this bridge cannot safely
+  act on; no watch ends until it serves one this bridge can. The fields name
   which reason applies", again every hour while it lasts, and once when it
   ends, "this node serves a current inbox again; watches may end". It is not
   logged every pass, which would be thousands of lines a day, and not only
@@ -357,29 +367,44 @@ contract id as `serving the request inbox`.
   one connection for days, so a single line can sit outside every window an
   operator looks at. The line carries `signed`, `copy`, `behind_the_floor` and
   `unverified`, which is what tells the three reasons apart.
-  `signed` far above `copy` is a node that has stopped following the contract
-  while still answering reads from what it holds. `unverified` above zero is
-  this build and the contract disagreeing about what an entry must satisfy,
-  and it is the one reason nothing here clears by itself: install the binary
-  and the three WASM together with `scripts/deploy.sh`, never one without the
-  others. `behind_the_floor` above zero, with the floors close together, says
+  `signed` more than `WINDOW_BLOCKS` above `copy`, which is five blocks or
+  about fifty minutes and not a gap that looks dramatic, is a node that has
+  stopped following the contract while still answering reads from what it
+  holds. It can also be a floor this bridge signed from a bad tip reading and
+  can no longer lower, which is freenet-bitcoin#20, so check the recorded
+  floor against the chain before chasing the node. `copy` as `None` is a
+  third shape of the same reason: the copy carries no floor this bridge
+  signed, which is an empty inbox between a node losing it and the bridge
+  opening it again. `unverified` above zero is
+  this build and the contract disagreeing about what an entry must satisfy.
+  Install the binary and the three WASM together with `scripts/deploy.sh`,
+  never one without the others. Read a return to health here carefully,
+  because this reason ends on its own without being fixed: the floor goes on
+  rising while the count holds watches back, and within about half an hour it
+  passes the entry, which is then dropped unread. The count falls to zero and
+  "watches may end" is logged, with the disagreement still installed and the
+  next entry of that shape due to be skipped in its turn. So the pair of
+  lines says the copy became readable again, never that anything was
+  repaired. That also bounds what the gate protects: it holds watches back
+  only while the entry is still in the copy, and an entry dropped that way
+  was read by nobody, so a watch it would have renewed can end at its
+  ordinary time. That residual is in freenet-bitcoin#18. `behind_the_floor` above zero, with the floors close together, says
   this copy predates the floor this bridge signed. Read it as that and no
   more: it does not say the entries it counts went unread, since a pass may
   have read them already against a fresher copy, and the record that would
   show so is pruned by the floor before the count is taken. That is still
   enough to hold watches back, because a copy predating the floor may be
-  missing a renewal, and there is no way from here to tell which. It holds back every watch
-  on the bridge, not only the one whose request was skipped, since a copy
-  that is not current is not current for anyone; so a run of watches all
-  staying put during one lagging-copy episode has this one cause, not a
-  cause per watch.
+  missing a renewal, and there is no way from here to tell which. It holds
+  back every watch on the bridge, not only the one whose request was skipped,
+  since a copy that is not current is not current for anyone; so a run of
+  watches all staying put during one lagging-copy episode has this one cause,
+  not a cause per watch.
   Two limits worth knowing, since neither is visible to the bridge: the
   evidence is this bridge's own floor read back from its own node, so a node
   that applies what the bridge writes while seeing no peers looks healthy;
   and the floor rises with the mainnet tip, so while mainnet's node cannot
   be reached the evidence stops moving although watches still end on the
-  other networks. Both are in freenet-bitcoin#18. Every scan
-  also covers
+  other networks. Both are in freenet-bitcoin#18. Every scan also covers
   the scripts of payments a reorg moved out of their block and that have not
   been seen again, watched or not, so such a payment is found where it was
   re-mined rather than left retracted. Watches registered before the inbox

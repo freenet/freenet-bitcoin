@@ -1398,6 +1398,19 @@ fn verified_entries_leaves_out_what_does_not_check() {
 /// If that ever stopped holding, no watch would end on any network for as
 /// long as the entry sat there, and nothing else in either crate would fail.
 /// A comment is not enough to carry that; this asserts it.
+///
+/// Each case is the base state plus one tampering, and the base is asserted
+/// to verify, so a refusal here is caused by the tampering and not by
+/// something else in the state. Heights stay inside the window for the same
+/// reason.
+///
+/// What this does not reach, and what a future round should add: the classes
+/// where an entry's certificate is real but wrong for it
+/// (`names_claimed_key`), where the certificate's own chain does not check
+/// (`verify_certificate`, `certifies`), and where a removal batch already
+/// covers the entry. Those need a forged chain or a signed batch to build,
+/// and they are the classes the certificate ordering has been moved through
+/// most, so they are the ones worth the trouble next.
 #[test]
 fn every_entry_this_bridge_skips_is_one_the_contract_refuses() {
     let g = ghostkeys();
@@ -1440,6 +1453,15 @@ fn every_entry_this_bridge_skips_is_one_the_contract_refuses() {
     s.entries.insert(forged.entry.key(), forged.entry.clone());
     cases.push(("a signature that does not check", s));
 
+    let odd = entry(&g[0], 103, 5);
+    let mut s = base.clone();
+    let wrong = CertKey([7u8; 32]);
+    let mut moved = odd.entry.clone();
+    moved.cert = wrong;
+    s.certificates.insert(wrong, odd.certificate_pem.clone());
+    s.entries.insert(moved.key(), moved);
+    cases.push(("a certificate filed under a key that is not its digest", s));
+
     for (what, s) in cases {
         let skipped = s.entries.len() - s.verified_entries(&params()).len();
         assert_eq!(skipped, 1, "{what}: this bridge skips it");
@@ -1448,6 +1470,35 @@ fn every_entry_this_bridge_skips_is_one_the_contract_refuses() {
             "{what}: so the contract must refuse the whole state"
         );
     }
+}
+
+/// The test above asserts the containment for the classes it can build, but
+/// it is three examples of a claim about every skip, so a fourth skip added
+/// to `verified_entries` with no matching refusal in `verify` ships with
+/// every test green. That was measured, not supposed: adding one leaves the
+/// whole suite passing.
+///
+/// This counts the skips instead. It cannot tell whether a new one is
+/// matched, which is the point: it fails, and whoever added it has to say.
+#[test]
+fn every_skip_in_verified_entries_is_accounted_for() {
+    let src = include_str!("state.rs");
+    let start = src
+        .find("pub fn verified_entries")
+        .expect("verified_entries is declared in state.rs");
+    let body = &src[start..];
+    let end = body.find("\n    }\n").expect("its body ends");
+    let skips = body[..end].matches("continue;").count();
+    assert_eq!(
+        skips, 3,
+        "`verified_entries` now has {skips} ways of skipping an entry, not \
+         the 3 this pin was written for. Every one of them must be a reason \
+         `verify` refuses the whole state, or the bridge holds every watch \
+         back for ever against a copy the node was right to serve. Add the \
+         matching refusal and a case in \
+         `every_entry_this_bridge_skips_is_one_the_contract_refuses`, then \
+         correct this count."
+    );
 }
 
 /// A certificate for `key`, signed by the test notary the way the real one

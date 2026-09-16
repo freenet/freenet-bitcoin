@@ -158,12 +158,20 @@ pub const STALE_RELOG_MS: i64 = 60 * 60 * 1000;
 ///
 /// It is always reported when it changes. While it lasts it is repeated, but
 /// no more often than [`STALE_RELOG_MS`], which is a compromise between two
-/// ways of being useless. A line every pass is thousands a day, the flood of
-/// freenet-bitcoin#17. A line only when it starts can be worse: one cause is
-/// a disagreement between this build and the contract it loaded, which
-/// nothing but a deployment clears, and a bridge holds one connection for
-/// days, so the only report of a condition that is still in force can sit
-/// outside every window an operator looks at.
+/// ways of being useless. A line every pass is thousands a day, which is
+/// what freenet-bitcoin#18 asks to be rationed and what freenet-bitcoin#17
+/// looks like in the journal. A line only when it starts can be worse, because the
+/// causes outlast any one report: a copy a node has stopped following stays
+/// stale until that node is seen to, and a bridge holds one connection for
+/// days, so the only report of a condition still in force can sit outside
+/// every window an operator looks at.
+///
+/// Note what the repeat does NOT do. A build that disagrees with the
+/// contract it loaded raises the condition, but the entry it cannot accept
+/// falls below the floor within a window or so and the condition then ends
+/// on its own, with the disagreement still installed and every entry of that
+/// shape still going unread. So a start and an end here are not evidence
+/// that anything was fixed; only the `unverified` field says what happened.
 ///
 /// The worker reports it, so this is where a test can reach the decision.
 pub fn stale_report(was: bool, now: bool, since_report: Option<Duration>) -> Option<bool> {
@@ -214,11 +222,13 @@ pub struct Pass {
     /// the floor was held, or ending watches failed or found the observer
     /// gone back. Such a pass must run again, not be passed over as quiet.
     pub gated: bool,
-    /// The copy this pass read is behind the floor this bridge signed, or
-    /// holds a request that floor has passed, so no watch ended. Reported by
-    /// the worker when it starts and when it stops, rather than here: the
-    /// condition lasts as long as the node serves that copy, and a line a
-    /// pass would be thousands a day.
+    /// This copy is not one to end a watch against, for any of three
+    /// reasons: it carries a floor far below the one this bridge signed, or
+    /// it holds a request that floor has passed, or it holds an entry this
+    /// bridge cannot accept. The worker reports it rather than this function,
+    /// when it starts, when it ends, and at intervals while it lasts: see
+    /// [`stale_report`]. Keep this list at three, or at whatever the number
+    /// becomes; naming two of three is how the log line went wrong before.
     pub stale: bool,
     /// The highest floor this bridge has signed. Carried, with the three
     /// below, so the worker can report what lies behind `stale`: the
@@ -289,14 +299,22 @@ impl Processor<'_> {
         let mut entries: Vec<(EntryKey, &InboxEntry)> = state.verified_entries(self.params);
         let unverified = state.entries.len().saturating_sub(entries.len());
         if unverified > 0 {
-            // Debug, not warn, and deliberately: this count now holds watches
+            // Trace, not warn, and not debug either: this count holds watches
             // back, so it makes the pass gated, so the quiet cache never arms
-            // and the same state is read again every poll. At warn that is a
-            // line every thirty seconds for as long as the disagreement
-            // lasts, which is the flood of freenet-bitcoin#17. The condition
-            // is reported once when it starts, by the worker, which carries
-            // this count in that line.
-            tracing::debug!(
+            // and the same state is read again every poll. That is a line
+            // every thirty seconds for as long as the disagreement lasts,
+            // which is the flood of freenet-bitcoin#17. Debug would not avoid
+            // it, because this binary turns debug on for its own crate when
+            // RUST_LOG is unset (see main), which is how it runs in the unit
+            // file. The worker reports the condition and carries this count
+            // in that line.
+            //
+            // What this holds back is bounded, and the message below must not
+            // be read as more: the floor goes on rising while it holds, so
+            // within about half an hour it passes the entry and the entry is
+            // dropped unread. A watch that entry would have renewed can then
+            // end at its ordinary time. That residual is freenet-bitcoin#18.
+            tracing::trace!(
                 unverified,
                 "inbox entries this bridge cannot accept were skipped and so were read by \
                  nobody; no watch ends against a copy holding one, since a skipped entry may \
@@ -331,6 +349,16 @@ impl Processor<'_> {
                     continue;
                 }
                 if e.mainnet_height > f.saturating_add(WINDOW_BLOCKS) {
+                    // Skipped, and deliberately not counted as either reason
+                    // above. Those two hold watches back because what they
+                    // skip never becomes readable; this one is skipped only
+                    // for now, since the floor rises toward it and a later
+                    // pass reads it. A validated copy cannot hold one at all,
+                    // because the contract refuses an entry above its own
+                    // window and this bridge's floor is never below the
+                    // copy's. It is reachable only where this build and the
+                    // contract disagree about the window, which is
+                    // freenet-bitcoin#21.
                     continue;
                 }
             }
@@ -1131,7 +1159,7 @@ impl InboxWorker {
                             copy = ?p.copy_floor,
                             behind_the_floor = p.behind_the_floor,
                             unverified = p.unverified,
-                            "this node serves an inbox this bridge cannot act on in full; no \
+                            "this node serves an inbox this bridge cannot treat as current; no \
                              watch ends until it serves one this bridge can. The fields name \
                              which reason applies"
                         );
@@ -1266,9 +1294,10 @@ struct Session {
     /// failure.
     chains: HashMap<BitcoinNetwork, ChainClient>,
     quiet: QuietCache,
-    /// Whether the last pass found the copy this node serves behind the
-    /// floor this bridge signed, so the condition is reported when it starts
-    /// and when it ends rather than on every pass.
+    /// Whether the last pass found the copy this node serves unfit to end a
+    /// watch against, for any of the reasons [`Pass::stale`] lists, so the
+    /// condition is reported when it starts, when it ends and at intervals
+    /// while it lasts rather than on every pass.
     was_stale: bool,
     /// When the stale-copy condition was last reported, so a condition that
     /// lasts is repeated at the rate [`stale_report`] allows rather than
@@ -2876,6 +2905,14 @@ mod tests {
         assert_eq!(ok.unverified, 0, "nothing is skipped now");
         assert!(!ok.stale, "so the copy counts as current again");
         assert_eq!(ok.acted, 1, "and the entry is read");
+        // Not just the flag: the gate really opened, so the watch that ran
+        // out ends and the renewal this copy carries is installed. `stale`
+        // alone would not show that, since `gated` has other sources.
+        assert_eq!(
+            watched(&store),
+            vec![b"spk2".to_vec()],
+            "the watch that ran out ends once the gate reopens"
+        );
     }
 
     /// A node that has stopped following the inbox answers every read from
