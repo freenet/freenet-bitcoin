@@ -266,17 +266,25 @@ contract id as `serving the request inbox`.
   height whichever network they are for, and the inbox floor follows the
   mainnet tip, 2 blocks behind. With no `Bitcoin` network in the config the
   inbox stays closed, and the bridge says so at startup.
-- **The floor waits two minutes after the bridge connects to its node**
-  (`FLOOR_HOLD_MS`), on every connection, but no more often than once in
-  twenty minutes (`FLOOR_HOLD_REARM_MS`), so a node dropping the connection
-  over and over cannot hold the floor, and stop every watch ending, for as
-  long as it flaps. A connection inside that interval is not held, so the
-  bridge may raise the floor past requests a node that has just come back has
-  not finished fetching; their senders resend, as the protocol already says.
-  The wait means a node that was down has time to catch up with the
-  inbox before the floor moves past requests other peers were holding. An
-  inbox the node has lost is opened again at the highest floor the bridge
-  has signed, not the tip's.
+- **The bridge waits two minutes after connecting to its node**
+  (`FLOOR_HOLD_MS`), so a node that was down has time to catch up with the
+  inbox. The wait has two halves, because they cost differently when they
+  are wrong.
+  - *The floor* waits on every connection, but arms that wait no more often
+    than once in twenty minutes (`FLOOR_HOLD_REARM_MS`): a node dropping the
+    connection over and over would otherwise hold the floor down for as long
+    as it flapped, and a floor that never rises retires no removals and
+    fills the removal budget. So a connection inside that interval may raise
+    the floor past requests a node that has just come back has not finished
+    fetching; their senders resend, as the protocol already says.
+  - *Watch expiry* waits after **every** connection, with no such interval,
+    however often the node drops. A node that has lost the inbox answers
+    NotFound, and the bridge opens it again itself, empty, at the highest
+    floor it has signed rather than the tip's: reading that empty inbox as
+    every watch having run out would end them, and a watch that ends early
+    loses a payment for good, while one held back costs updates. A node
+    that flaps without pause therefore stops watches ending for as long as
+    it flaps, which is the cheap failure of the two.
 - **`bitcoin_inbox_contract.wasm` must be in the contract directory**, beside
   the other two. `scripts/deploy.sh` installs it.
 - **`listen` and `auth` are ignored.** They configured the HTTP service the
@@ -321,7 +329,8 @@ contract id as `serving the request inbox`.
   bridge gets is dated by the host's clock alone, since no block carries a
   time yet at that moment, so a clock behind by more than a day at the
   upgrade grants less than a day: check it before upgrading. Nor does a watch end while a payment to it is
-  less than `deep_confirmations` deep, while the floor is held, or while a
+  less than `deep_confirmations` deep, within two minutes of the bridge
+  connecting to its node (see the wait's expiry half above), or while a
   request from its own requester waits on the removal budget, since that may
   be its renewal (only while that request is still in the inbox: one the
   caps push out or the floor passes no longer counts). Every scan also covers

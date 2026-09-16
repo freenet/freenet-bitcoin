@@ -751,17 +751,19 @@ impl Driver {
     }
 }
 
-/// When the floor hold ends, given the hold in force and how long the session
-/// before this one lasted.
+/// Both halves of the hold, given the arming in force.
 ///
 /// The hold gives the node time to catch up with the inbox before the bridge
 /// raises the floor past requests other peers hold, or ends a watch whose
-/// renewal it has not read yet. So a connection following a session that was
-/// working arms it again: that is a node restarted under a bridge that kept
-/// running, which is what the hold is for. It is armed no more often than
-/// [`FLOOR_HOLD_REARM_MS`], or a node dropping the connection every few
-/// minutes would hold the floor, and stop every watch ending, for as long as
-/// it flapped. How long the last session lasted says nothing useful here: a
+/// renewal it has not read yet. It is armed by connecting, and again whenever
+/// the bridge opens an inbox a node has lost, which is when it has just
+/// written an empty one itself.
+///
+/// The floor's half is armed no more often than [`FLOOR_HOLD_REARM_MS`], or a
+/// node dropping the connection every few minutes would hold the floor down
+/// for as long as it flapped, and a floor that never rises retires no
+/// removals. The expiry half has no such interval: see [`FloorHold`] for why
+/// the two part. How long the last session lasted says nothing useful here: a
 /// connection refused while the node restarts ends in an instant, and it is
 /// exactly then that the hold is wanted.
 pub fn arm_floor_hold(armed_at: Option<Instant>, now: Instant) -> FloorHold {
@@ -902,7 +904,7 @@ impl InboxWorker {
         // of the clock and the worker keeps when it was armed.
         let hold = arm_floor_hold(*floor_armed_at, Instant::now());
         *floor_armed_at = Some(hold.armed_at);
-        let processor = Processor {
+        let mut processor = Processor {
             params: &self.params,
             key: &self.key,
             store: &store,
@@ -939,7 +941,22 @@ impl InboxWorker {
                         )
                         .await?
                     }
-                    Step::Open => self.open(&mut api, &mut session, &store).await?,
+                    Step::Open => {
+                        // The bridge writes an empty inbox here, for a node
+                        // that answered NotFound, and reads it back next.
+                        // Both halves are armed again, however long the
+                        // session has run: reading that empty inbox as every
+                        // watch having run out would end them for good, and
+                        // raising the floor over it would drop requests other
+                        // peers still hold. The floor's half keeps its
+                        // interval, so a node that answers NotFound over and
+                        // over cannot pin the floor down.
+                        let hold = arm_floor_hold(*floor_armed_at, Instant::now());
+                        *floor_armed_at = Some(hold.armed_at);
+                        processor.floor_hold_until = Some(hold.floor_until);
+                        processor.expiry_hold_until = Some(hold.expiry_until);
+                        self.open(&mut api, &mut session, &store).await?
+                    }
                     Step::Process(bytes) => {
                         self.on_state(&mut api, key, &processor, &mut session, &bytes)
                             .await?
@@ -1690,11 +1707,12 @@ mod tests {
         assert!(watched(&store).is_empty());
     }
 
-    /// The hold is armed by the first connection, and again by one that
-    /// follows a session that was working, since that is a node restarted
-    /// under a bridge that kept running. A node dropping the connection every
-    /// few minutes arms nothing, or it would hold the floor, and stop every
-    /// watch ending, for as long as it flapped.
+    /// The floor's half is armed by the first connection and no more often
+    /// than its interval after that, or a node dropping the connection every
+    /// few minutes would hold the floor down for as long as it flapped. The
+    /// expiry half is armed every time, whatever the interval says, since
+    /// ending a watch early loses a payment while holding one back costs
+    /// updates.
     #[test]
     fn the_floor_hold_is_armed_again_but_no_more_often_than_its_interval() {
         let hold = Duration::from_millis(FLOOR_HOLD_MS as u64);
@@ -1776,13 +1794,38 @@ mod tests {
         // In `session`, past the slice above: the pass must be given when each
         // half of the hold ends, not when it was armed, or the hold is over as
         // soon as it begins.
+        // Each half tied to its own field, not merely present somewhere: the
+        // two transposed would arm the floor on every connection and cap
+        // watches to the interval, which is both faults at once.
         assert!(
-            src.contains(concat!("Some(hold", ".floor_until)")),
-            "the pass is given something other than when the floor's hold ends"
+            src.contains(concat!("floor_hold_until: Some(hold", ".floor_until)")),
+            "the floor is given something other than when its own half ends"
         );
         assert!(
-            src.contains(concat!("Some(hold", ".expiry_until)")),
-            "the pass is given something other than when watches may end again"
+            src.contains(concat!("expiry_hold_until: Some(hold", ".expiry_until)")),
+            "watches are held by something other than their own half"
+        );
+        // Opening an inbox the node has lost writes an empty one, which the
+        // bridge reads back: both halves are armed again there, or that empty
+        // inbox reads as every watch having run out. `session` needs a live
+        // node, so this too is pinned by source.
+        assert_eq!(
+            src.matches(concat!(
+                "processor.expiry_hold",
+                "_until = Some(hold.expiry_until);"
+            ))
+            .count(),
+            1,
+            "opening an inbox no longer holds watches back"
+        );
+        assert_eq!(
+            src.matches(concat!(
+                "processor.floor_hold",
+                "_until = Some(hold.floor_until);"
+            ))
+            .count(),
+            1,
+            "opening an inbox no longer holds the floor"
         );
     }
 

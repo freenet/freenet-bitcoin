@@ -475,6 +475,10 @@ impl Store {
     /// nothing to name; the observer never leaves it that way, recording a
     /// block at the height it sets in the same step.
     pub fn rewind_checkpoint_to(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<()> {
+        // The height it stops at is worked out twice below, once for the
+        // height and once to look up that block's hash. They must stay the
+        // same expression: a height beside another block's hash is the fault
+        // this stopping rule exists to end.
         self.conn.execute(
             "UPDATE chain_checkpoint
              SET height = MIN(height, COALESCE(
@@ -1677,6 +1681,35 @@ mod tests {
             .unwrap();
         assert_eq!(s.block_time_ms(net, 101).unwrap(), Some(1_000));
         assert_eq!(s.latest_block_time_ms(net).unwrap(), Some(1_000));
+    }
+
+    /// Asked to stop where it holds no record, it stops at the highest record
+    /// below that, not the oldest it holds: the rescan is as short as the
+    /// records allow, and the checkpoint still names a block it can compare
+    /// against the node's.
+    #[test]
+    fn a_rewind_stops_at_the_highest_record_at_or_below_where_it_was_asked() {
+        let s = store();
+        let net = BitcoinNetwork::Signet;
+        for h in [100u32, 200, 500] {
+            s.record_block(net, h, &BlockHash([h as u8; 32]), Some(i64::from(h)))
+                .unwrap();
+        }
+        s.set_checkpoint(
+            net,
+            &BlockAnchor {
+                height: 900,
+                hash: BlockHash([9; 32]),
+            },
+        )
+        .unwrap();
+        s.rewind_checkpoint_to(net, 300).unwrap();
+        let at = s.checkpoint(net).unwrap().unwrap();
+        assert_eq!(
+            (at.height, at.hash),
+            (200, BlockHash([200u8; 32])),
+            "the highest record at or below 300, naming it"
+        );
     }
 
     /// A rewind stops at the oldest block record kept: below that, a round
