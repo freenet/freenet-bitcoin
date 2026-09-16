@@ -128,7 +128,18 @@ pub const REQUEST_AHEAD_MAX_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// with the inbox the requests other peers hold are missing from the copy the
 /// bridge reads. Raising the floor at once would drop any of those dated
 /// below it, unread. A node catches up with one small contract in seconds.
+/// While it is held, no watch ends either: a renewal may be in the copy the
+/// bridge has not read yet (see [`Processor::pass`]).
 pub const FLOOR_HOLD_MS: i64 = 2 * 60 * 1000;
+
+/// How long after arming the floor hold it may be armed again.
+///
+/// The hold stops the floor rising and stops watches ending, so a node that
+/// keeps dropping the connection must not arm it over and over. At ten times
+/// the hold, it is in force for at most a tenth of the time whatever shape
+/// the flapping takes, and a node restarted under a bridge that has been
+/// running for hours still gets it.
+pub const FLOOR_HOLD_REARM_MS: i64 = 10 * FLOOR_HOLD_MS;
 
 /// Whether the floor is still held. The hold is kept on the monotonic clock,
 /// so no step of the wall clock stretches it or cuts it short.
@@ -741,19 +752,17 @@ impl Driver {
 /// raises the floor past requests other peers hold, or ends a watch whose
 /// renewal it has not read yet. So a connection following a session that was
 /// working arms it again: that is a node restarted under a bridge that kept
-/// running, which is what the hold is for. A session that ended sooner than
-/// the hold itself was not working, and arms nothing, or a node dropping the
-/// connection every few minutes would hold the floor, and stop every watch
-/// ending, for as long as it flapped.
-pub fn arm_floor_hold(
-    armed: Option<Instant>,
-    last_session: Option<Duration>,
-    now: Instant,
-) -> Option<Instant> {
-    let hold = Duration::from_millis(FLOOR_HOLD_MS as u64);
-    match (armed, last_session) {
-        (Some(armed), Some(lasted)) if lasted < hold => Some(armed),
-        _ => Some(now + hold),
+/// running, which is what the hold is for. It is armed no more often than
+/// [`FLOOR_HOLD_REARM_MS`], or a node dropping the connection every few
+/// minutes would hold the floor, and stop every watch ending, for as long as
+/// it flapped. How long the last session lasted says nothing useful here: a
+/// connection refused while the node restarts ends in an instant, and it is
+/// exactly then that the hold is wanted.
+pub fn arm_floor_hold(armed_at: Option<Instant>, now: Instant) -> Instant {
+    let rearm = Duration::from_millis(FLOOR_HOLD_REARM_MS as u64);
+    match armed_at {
+        Some(at) if now < at + rearm => at,
+        _ => now,
     }
 }
 
@@ -830,26 +839,23 @@ impl InboxWorker {
         }
 
         let mut backoff = Duration::from_secs(1);
-        let mut floor_hold_until = None;
-        let mut last_session = None;
+        // Annotated so that a second declaration inside the loop, which would
+        // shadow this one and arm the hold again every reconnection, still
+        // compiles and is caught by the test rather than by the type checker
+        // only while this one happens to be unused.
+        let mut floor_armed_at: Option<Instant> = None;
         loop {
             let started = Instant::now();
-            if let Err(e) = self.session(&mut floor_hold_until, last_session).await {
+            if let Err(e) = self.session(&mut floor_armed_at).await {
                 tracing::warn!("request inbox connection ended: {e:#}");
             }
-            let lasted = started.elapsed();
-            last_session = Some(lasted);
-            backoff = next_backoff(backoff, lasted);
+            backoff = next_backoff(backoff, started.elapsed());
             tokio::time::sleep(backoff).await;
         }
     }
 
     /// One connection's worth of serving. Returns only with an error.
-    async fn session(
-        &self,
-        floor_hold_until: &mut Option<Instant>,
-        last_session: Option<Duration>,
-    ) -> Result<()> {
+    async fn session(&self, floor_armed_at: &mut Option<Instant>) -> Result<()> {
         let (stream, _) = tokio_tungstenite::connect_async(&self.ws_url)
             .await
             .with_context(|| format!("connecting to the Freenet node at {}", self.ws_url))?;
@@ -869,8 +875,9 @@ impl InboxWorker {
             max_watches_per_ghostkey: MAX_WATCHES_PER_GHOSTKEY,
             deep_confirmations: &deep,
             floor_hold_until: {
-                *floor_hold_until = arm_floor_hold(*floor_hold_until, last_session, Instant::now());
-                *floor_hold_until
+                let at = arm_floor_hold(*floor_armed_at, Instant::now());
+                *floor_armed_at = Some(at);
+                Some(at + Duration::from_millis(FLOOR_HOLD_MS as u64))
             },
         };
         let key = self.contract_key()?;
@@ -1632,20 +1639,24 @@ mod tests {
     /// few minutes arms nothing, or it would hold the floor, and stop every
     /// watch ending, for as long as it flapped.
     #[test]
-    fn the_floor_hold_is_armed_again_only_after_a_session_that_worked() {
-        let hold = Duration::from_millis(FLOOR_HOLD_MS as u64);
+    fn the_floor_hold_is_armed_again_but_no_more_often_than_its_interval() {
+        let rearm = Duration::from_millis(FLOOR_HOLD_REARM_MS as u64);
         let first = Instant::now();
-        let armed = arm_floor_hold(None, None, first);
-        assert_eq!(armed, Some(first + hold), "the first connection");
-        let later = first + Duration::from_secs(600);
+        assert_eq!(arm_floor_hold(None, first), first, "the first connection");
         assert_eq!(
-            arm_floor_hold(armed, Some(hold / 4), later),
-            armed,
-            "a node that keeps dropping the connection"
+            arm_floor_hold(Some(first), first + rearm / 4),
+            first,
+            "a node that keeps dropping the connection, however it drops it"
         );
         assert_eq!(
-            arm_floor_hold(armed, Some(hold * 10), later),
-            Some(later + hold),
+            arm_floor_hold(Some(first), first + rearm),
+            first + rearm,
+            "the interval is up"
+        );
+        let days = first + Duration::from_secs(3 * 24 * 3600);
+        assert_eq!(
+            arm_floor_hold(Some(first), days),
+            days,
             "a node restarted under a bridge that kept running"
         );
     }
@@ -1656,26 +1667,43 @@ mod tests {
     /// node, so nothing here can run that wiring, and `arm_floor_hold`'s own
     /// test passes either way: this pins the placement by source, as `main.rs`
     /// does, and the needles are split so they cannot match this test itself.
+    ///
+    /// One declaration only: a second one inside the loop would shadow the
+    /// worker's, which reads as a tidy-up and arms the hold every reconnection
+    /// again, with the first still in place for a test that only looked at
+    /// where it sits. The slice runs to the end of the file, so the first
+    /// `loop {` after `run` is the reconnect loop only while no function
+    /// between them holds one.
     #[test]
     fn the_floor_hold_is_declared_outside_the_reconnect_loop() {
         let src = include_str!("inbox.rs");
-        let run = &src[src
+        let from = src
             .find(concat!("pub async fn ", "run(self)"))
-            .expect("run() was renamed")..];
+            .expect("run() was renamed");
+        // Bounded to `run` itself, so a rename of its loop cannot leave the
+        // check reading a loop in some later function and passing for nothing.
+        let to = from
+            + src[from..]
+                .find(concat!("async fn ", "session("))
+                .expect("session() was renamed");
+        let run = &src[from..to];
+        let needle = concat!("let mut floor_arm", "ed_at");
         let declared = run
-            .find(concat!("let mut floor_hold", "_until = None;"))
+            .find(needle)
             .expect("the worker no longer holds the floor hold across sessions");
+        assert_eq!(
+            run.matches(needle).count(),
+            1,
+            "a second declaration shadows the worker's hold, so every reconnection arms it again"
+        );
         let reconnects = run.find(concat!("loop ", "{")).expect("the loop moved");
         assert!(
             declared < reconnects,
             "the hold is declared inside the reconnect loop, so every reconnection arms it again"
         );
         assert!(
-            run.contains(concat!(
-                "self.session(&mut floor_hold",
-                "_until, last_session)"
-            )),
-            "the session no longer takes the worker's hold and its last session"
+            run.contains(concat!("self.session(&mut floor_arm", "ed_at)")),
+            "the session no longer takes the worker's hold"
         );
     }
 

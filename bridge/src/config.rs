@@ -89,7 +89,7 @@ impl BridgeConfig {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-        let mut cfg: BridgeConfig = toml::from_str(&text)?;
+        let cfg: BridgeConfig = toml::from_str(&text)?;
         if cfg.networks.is_empty() {
             anyhow::bail!("configuration lists no networks; the bridge would do nothing");
         }
@@ -97,6 +97,9 @@ impl BridgeConfig {
         // scanned upwards. Neither of these refuses the configuration: a
         // bridge that will not start observes nothing, and every payment mined
         // while it is down is missed, which is worse than either fault here.
+        // `Store::open` does refuse one thing, a host clock reading before
+        // 1970, because a bridge that runs on it dates every watch it inherits
+        // wrongly and quietly, and there is nothing else to date them by.
         //
         // The block that ends a watch is `deep_confirmations - 1` below the
         // scan position, so a depth past `BLOCKS_KEPT + 1` names a block the
@@ -105,7 +108,7 @@ impl BridgeConfig {
         // depth is the operator's judgement about how buried a payment must be
         // before this bridge will report it.
         let kept = crate::store::Store::BLOCKS_KEPT;
-        for n in &mut cfg.networks {
+        for n in &cfg.networks {
             if n.deep_confirmations > kept + 1 {
                 tracing::error!(
                     network = ?n.network,
@@ -114,18 +117,18 @@ impl BridgeConfig {
                      position, so no watch will end; lower it or watches last for ever"
                 );
             }
-            // A backfill past them rewinds at every start to a block the
-            // bridge no longer holds. `Store::rewind_checkpoint_to` stops at
-            // the oldest it does hold, so this only says so plainly; a demo
-            // window is a display choice, and narrowing it costs nothing.
+            // A backfill past them asks to rewind to a block the bridge no
+            // longer holds. `Store::rewind_checkpoint_to` stops at the oldest
+            // it does hold, so this says so and changes nothing: the value is
+            // also recorded as a watch's `scan_from_height`, which nothing
+            // else may narrow.
             if n.demo_backfill_blocks > kept {
                 tracing::error!(
                     network = ?n.network,
                     demo_backfill_blocks = n.demo_backfill_blocks,
                     "demo_backfill_blocks reaches past the {kept} blocks kept below the scan \
-                     position; using {kept}"
+                     position; the rewind will stop at the oldest block kept"
                 );
-                n.demo_backfill_blocks = kept;
             }
         }
         Ok(cfg)
@@ -189,16 +192,15 @@ mod tests {
             kept + 2,
             "left alone"
         );
-        // A backfill past them is narrowed, since it only chooses how much
-        // history the demo window shows.
+        // A backfill past them is reported and kept as it is: the rewind stops
+        // at the oldest block held, and the value is also recorded as a
+        // watch's `scan_from_height`, which nothing else may narrow.
         std::fs::write(&path, cfg(&format!("demo_backfill_blocks = {}", kept + 1))).unwrap();
         let loaded = BridgeConfig::load(&path).expect("a wide demo window still starts it");
-        assert_eq!(loaded.networks[0].demo_backfill_blocks, kept);
-        std::fs::write(&path, cfg(&format!("demo_backfill_blocks = {kept}"))).unwrap();
-        let loaded = BridgeConfig::load(&path).unwrap();
         assert_eq!(
-            loaded.networks[0].demo_backfill_blocks, kept,
-            "the widest kept"
+            loaded.networks[0].demo_backfill_blocks,
+            kept + 1,
+            "left alone"
         );
     }
 

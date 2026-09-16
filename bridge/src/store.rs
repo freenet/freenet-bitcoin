@@ -87,12 +87,6 @@ pub struct WatchedScript {
     pub is_public_demo: bool,
 }
 
-/// The time a bridge upgrading from one that ended no watch by block time
-/// reads the watches it already holds at.
-///
-/// The host clock alone dates it, since no block carries a time at that
-/// moment. A clock reading before 1970 fails the upgrade rather than granting
-/// those watches nothing in silence.
 /// Whether the day from the upgrade is worth anything.
 ///
 /// A host clock reading no later than watches this bridge already recorded
@@ -103,6 +97,12 @@ fn upgrade_grace_lands(now_ms: i64, newest_recorded_ms: Option<i64>) -> bool {
     newest_recorded_ms.is_none_or(|newest| now_ms > newest)
 }
 
+/// The time a bridge upgrading from one that ended no watch by block time
+/// reads the watches it already holds at.
+///
+/// The host clock alone dates it, since no block carries a time at that
+/// moment. A clock reading before 1970 fails the upgrade rather than granting
+/// those watches nothing in silence.
 fn upgrade_read_time(now: std::time::SystemTime) -> anyhow::Result<i64> {
     match now.duration_since(std::time::UNIX_EPOCH) {
         Ok(since) => Ok(since.as_millis() as i64),
@@ -413,6 +413,23 @@ impl Store {
             DROP TABLE IF EXISTS challenges;
             "#,
         )?;
+        // A checkpoint below every block record kept reads as a reorg at a
+        // height nothing was recorded for, and the round retracts every
+        // payment above it. `rewind_checkpoint_to` stops at the oldest record
+        // now, but a database rewound by a build from before it did carries
+        // the damage until it is repaired, which is here. The blocks below
+        // were scanned: pruning only ever drops what is behind the
+        // checkpoint, so they are only missing because they are old.
+        self.conn.execute(
+            "UPDATE chain_checkpoint AS c
+             SET height = (SELECT MIN(height) FROM seen_blocks WHERE network = c.network),
+                 block_hash = COALESCE((SELECT block_hash FROM seen_blocks
+                     WHERE network = c.network AND height =
+                         (SELECT MIN(height) FROM seen_blocks WHERE network = c.network)),
+                     c.block_hash)
+             WHERE c.height < (SELECT MIN(height) FROM seen_blocks WHERE network = c.network)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -453,7 +470,12 @@ impl Store {
         self.conn.execute(
             "UPDATE chain_checkpoint
              SET height = MIN(height, MAX(?2, COALESCE(
-                 (SELECT MIN(height) FROM seen_blocks WHERE network = ?1), ?2)))
+                     (SELECT MIN(height) FROM seen_blocks WHERE network = ?1), ?2))),
+                 block_hash = COALESCE(
+                     (SELECT block_hash FROM seen_blocks WHERE network = ?1 AND height =
+                         MIN(chain_checkpoint.height, MAX(?2, COALESCE(
+                             (SELECT MIN(height) FROM seen_blocks WHERE network = ?1), ?2)))),
+                     block_hash)
              WHERE network = ?1 AND height > ?2",
             params![net.as_str(), height as i64],
         )?;
@@ -1665,6 +1687,70 @@ mod tests {
             s.checkpoint(net).unwrap().unwrap().height,
             900,
             "a rewind never moves the checkpoint forward"
+        );
+    }
+
+    /// A rewind names the block it stops at, not the one it started from: a
+    /// checkpoint carrying another block's hash names no block on any chain,
+    /// and the bridge signs a watermark from it.
+    #[test]
+    fn a_rewind_names_the_block_it_stops_at() {
+        let s = store();
+        let net = BitcoinNetwork::Signet;
+        for h in 900..=1000u32 {
+            s.record_block(net, h, &BlockHash([h as u8; 32]), Some(i64::from(h)))
+                .unwrap();
+        }
+        s.set_checkpoint(
+            net,
+            &BlockAnchor {
+                height: 1000,
+                hash: BlockHash([1000u32 as u8; 32]),
+            },
+        )
+        .unwrap();
+        s.rewind_checkpoint_to(net, 950).unwrap();
+        let at = s.checkpoint(net).unwrap().unwrap();
+        assert_eq!((at.height, at.hash), (950, BlockHash([950u32 as u8; 32])));
+        s.rewind_checkpoint_to(net, 100).unwrap();
+        let at = s.checkpoint(net).unwrap().unwrap();
+        assert_eq!(
+            (at.height, at.hash),
+            (900, BlockHash([900u32 as u8; 32])),
+            "the block it stopped at"
+        );
+    }
+
+    /// A database rewound below every block it kept, by a build from before
+    /// the rewind stopped there, is repaired when it is opened.
+    #[test]
+    fn a_checkpoint_below_every_block_kept_is_repaired_on_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        {
+            let s = Store::open(&path).unwrap();
+            let net = BitcoinNetwork::Signet;
+            for h in 900..=1000u32 {
+                s.record_block(net, h, &BlockHash([h as u8; 32]), Some(i64::from(h)))
+                    .unwrap();
+            }
+            s.set_checkpoint(
+                net,
+                &BlockAnchor {
+                    height: 1000,
+                    hash: BlockHash([1000u32 as u8; 32]),
+                },
+            )
+            .unwrap();
+            s.execute_for_test("UPDATE chain_checkpoint SET height = 100")
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let at = s.checkpoint(BitcoinNetwork::Signet).unwrap().unwrap();
+        assert_eq!(
+            (at.height, at.hash),
+            (900, BlockHash([900u32 as u8; 32])),
+            "raised to the oldest block kept, naming it"
         );
     }
 

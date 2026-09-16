@@ -152,11 +152,22 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
     // pruned node has not kept the early chain, so asking for it would fail,
     // and a demo only needs recent activity to be convincing.
     for net_cfg in &cfg.networks {
-        let backfill_from = ChainClient::connect(net_cfg)
+        if net_cfg.always_watch.is_empty() {
+            continue;
+        }
+        // A tip that cannot be read seeds nothing. `add_watch` keeps the
+        // lowest `scan_from_height` ever asked for, so seeding at 0 once, from
+        // a node still loading its block index, would ask for the whole chain
+        // ever after; and the rewind that follows would go as far back as the
+        // blocks kept allow. The next start seeds it.
+        let Some(tip) = ChainClient::connect(net_cfg)
             .ok()
             .and_then(|c| c.tip().ok())
-            .map(|t| t.height.saturating_sub(net_cfg.demo_backfill_blocks))
-            .unwrap_or(0);
+        else {
+            tracing::warn!(network = ?net_cfg.network, "cannot read the tip, so this network's demo addresses are not seeded this time");
+            continue;
+        };
+        let backfill_from = tip.height.saturating_sub(net_cfg.demo_backfill_blocks);
         for addr_str in &net_cfg.always_watch {
             match parse_address(addr_str, net_cfg.network) {
                 Ok(spk) => {
@@ -928,6 +939,11 @@ mod tests {
                 concat!("prune_blocks(obs.network(), ", "Store::BLOCKS_KEPT)"),
                 "blocks are no longer pruned, or no longer to the window watch \
                  expiry reads the deciding block from",
+            ),
+            (
+                concat!("let Some(tip) = ChainClient::conn", "ect(net_cfg)"),
+                "a demo address is seeded again without a tip, so a node still \
+                 loading its block index makes it ask for the whole chain",
             ),
         ] {
             assert!(src.contains(needle), "{why}");

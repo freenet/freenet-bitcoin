@@ -267,11 +267,13 @@ contract id as `serving the request inbox`.
   mainnet tip, 2 blocks behind. With no `Bitcoin` network in the config the
   inbox stays closed, and the bridge says so at startup.
 - **The floor waits two minutes after the bridge connects to its node**
-  (`FLOOR_HOLD_MS`), on the first connection and on any that follows a
-  session that lasted longer than the hold, such as a node restarted under a
-  bridge that kept running. A node dropping the connection every few minutes
-  arms nothing, or it would hold the floor, and stop every watch ending, for
-  as long as it flapped. The wait means a node that was down has time to catch up with the
+  (`FLOOR_HOLD_MS`), on every connection, but no more often than once in
+  twenty minutes (`FLOOR_HOLD_REARM_MS`), so a node dropping the connection
+  over and over cannot hold the floor, and stop every watch ending, for as
+  long as it flaps. A connection inside that interval is not held, so the
+  bridge may raise the floor past requests a node that has just come back has
+  not finished fetching; their senders resend, as the protocol already says.
+  The wait means a node that was down has time to catch up with the
   inbox before the floor moves past requests other peers were holding. An
   inbox the node has lost is opened again at the highest floor the bridge
   has signed, not the tip's.
@@ -307,11 +309,12 @@ contract id as `serving the request inbox`.
   past 1001 names a block it no longer holds and ends no watch: it says so at
   startup and leaves the setting alone, since how buried a payment must be is
   the operator's call and a watch that never ends costs updates, not payments.
-  A `demo_backfill_blocks` past 1000 is narrowed to it, and a rewind never
-  goes below the oldest block still held, since a checkpoint below those
-  reads as a reorg and retracts payments nothing moved. Neither refuses the
-  configuration: a bridge that will not start misses every payment mined
-  while it is down. A network's first scan starts at its tip,
+  A `demo_backfill_blocks` past 1000 is reported the same way. Neither
+  refuses the configuration: a bridge that will not start misses every
+  payment mined while it is down. A rewind never goes below the oldest block
+  still held, whatever the setting says, since a checkpoint below those reads
+  as a reorg and retracts payments nothing moved; a database already carrying
+  such a checkpoint is repaired when the bridge opens it. A network's first scan starts at its tip,
   so a Watch read before then is not scanned for the blocks before it (#7).
   Only mined blocks are scanned: a client waiting on a payment keeps
   renewing until it is buried. The day a watch inherited from an older
