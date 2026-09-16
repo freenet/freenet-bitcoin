@@ -189,6 +189,12 @@ pub struct Pass {
     /// the floor was held, or ending watches failed or found the observer
     /// gone back. Such a pass must run again, not be passed over as quiet.
     pub gated: bool,
+    /// The copy this pass read is behind the floor this bridge signed, or
+    /// holds a request that floor has passed, so no watch ended. Reported by
+    /// the worker when it starts and when it stops, rather than here: the
+    /// condition lasts as long as the node serves that copy, and a line a
+    /// pass would be thousands a day.
+    pub stale: bool,
 }
 
 pub struct Processor<'a> {
@@ -247,16 +253,28 @@ impl Processor<'_> {
         let mut pass = Pass::default();
         let mut handled = self.store.handled_count()?;
         let mut read_heights: BTreeSet<u32> = BTreeSet::new();
+        // Entries this copy holds that the signed floor has passed: each one
+        // is a request read by nobody, and says the copy is behind.
+        let mut behind_the_floor = 0usize;
         for (k, e) in entries {
             // Below a floor this bridge signed: a stale copy of the inbox. It
             // was either acted on already or dropped unread when that floor
             // was set, and the floor sent below removes it. Above that floor's
             // window: no inbox this bridge serves admits it, and the checks on
             // each entry do not cover the window, so it is left alone here.
-            if known.is_some_and(|f| {
-                e.mainnet_height < f || e.mainnet_height > f.saturating_add(WINDOW_BLOCKS)
-            }) {
-                continue;
+            if let Some(f) = known {
+                if e.mainnet_height < f {
+                    // This copy still holds an entry the floor this bridge
+                    // signed has passed, so the copy predates that floor. A
+                    // sender dates at the floor it read plus the slack, so a
+                    // renewal sent against an older floor lands here too, and
+                    // is skipped unread: no watch ends against such a copy.
+                    behind_the_floor += 1;
+                    continue;
+                }
+                if e.mainnet_height > f.saturating_add(WINDOW_BLOCKS) {
+                    continue;
+                }
             }
             if !self.store.is_handled(&k.0)? {
                 // Every entry read is removed, and a removal lasts until the
@@ -304,8 +322,22 @@ impl Processor<'_> {
                 .collect();
             // A batch naming nothing is refused by every peer, and a delta is
             // all or nothing, so it would cost this pass its floor too. Only
-            // a row this bridge cannot read could empty a height it read at.
+            // a row this bridge cannot read could empty a height it read at,
+            // which is a database to look at rather than a state to send.
+            //
+            // No test reaches this, and none can as the code stands: a height
+            // enters `read_heights` only by an entry that was read, and an
+            // entry is read only when `is_handled` says it was not, or after
+            // `mark_handled` records it. Both read the same column as
+            // `handled_at`, so a row it cannot decode is a row `is_handled`
+            // does not match either, and the entry is simply read again. It
+            // is guarded rather than argued about, since the argument stops
+            // holding the moment either query changes.
             if removed.is_empty() {
+                tracing::warn!(
+                    height = h,
+                    "a height this pass read has no readable record of what was read there"
+                );
                 continue;
             }
             pass.delta
@@ -341,15 +373,10 @@ impl Processor<'_> {
         // behind every pass, and no reply says so: the node answers every
         // read from what it holds, so neither a connection nor an opening
         // arms the hold. A renewal would be missing from such a copy too.
-        let stale_view =
-            known.is_some_and(|k| state_floor.is_none_or(|f| k.saturating_sub(f) > WINDOW_BLOCKS));
-        if stale_view {
-            tracing::warn!(
-                signed = ?known,
-                copy = ?state_floor,
-                "this node serves an inbox behind the floor this bridge signed; no watch ends while it does"
-            );
-        }
+        let stale_view = behind_the_floor > 0
+            || known
+                .is_some_and(|k| state_floor.is_none_or(|f| k.saturating_sub(f) > WINDOW_BLOCKS));
+        pass.stale = stale_view;
         pass.gated = held || expiry_held || stale_view;
         if !expiry_held && !stale_view {
             match self.expire_watches(now_ms, &pass.waiting) {
@@ -948,6 +975,7 @@ impl InboxWorker {
         let mut session = Session {
             chains: HashMap::new(),
             quiet: QuietCache::default(),
+            was_stale: false,
         };
 
         let mut driver = Driver::default();
@@ -1023,7 +1051,21 @@ impl InboxWorker {
             }
         };
         let pass = match processor.pass(&state, &tips, now_ms()) {
-            Ok(p) => p,
+            Ok(p) => {
+                if p.stale != session.was_stale {
+                    session.was_stale = p.stale;
+                    if p.stale {
+                        tracing::warn!(
+                            "this node serves an inbox behind the floor this bridge signed, or \
+                             holding a request that floor has passed; no watch ends until it \
+                             serves a current one"
+                        );
+                    } else {
+                        tracing::info!("this node serves a current inbox again; watches may end");
+                    }
+                }
+                p
+            }
             Err(e) => {
                 tracing::error!("request inbox pass failed: {e:#}");
                 return Ok(());
@@ -1149,6 +1191,10 @@ struct Session {
     /// failure.
     chains: HashMap<BitcoinNetwork, ChainClient>,
     quiet: QuietCache,
+    /// Whether the last pass found the copy this node serves behind the
+    /// floor this bridge signed, so the condition is reported when it starts
+    /// and when it ends rather than on every pass.
+    was_stale: bool,
 }
 
 impl Session {
@@ -2622,6 +2668,40 @@ mod tests {
         assert!(watched(&store).is_empty());
     }
 
+    /// A copy whose floor looks current can still hold an entry that floor
+    /// has passed, since a sender dates against the floor it read: the entry
+    /// is skipped unread, and it may be the renewal. No watch ends on a pass
+    /// that skips one, whatever the floors say.
+    #[test]
+    fn a_watch_is_kept_while_the_copy_holds_a_request_the_floor_has_passed() {
+        let store = Store::open_in_memory().unwrap();
+        watch_at(&store, &ghostkeys()[0], 1, T0);
+        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0);
+        caught_up(&store);
+        // The copy's own floor is three blocks back, so it holds an entry
+        // dated against that floor which this bridge's floor has passed. Three
+        // is inside the window, so only the unread entry says the copy is
+        // behind.
+        let unread = entry(
+            &ghostkeys()[1],
+            FLOOR - 1,
+            &request(Action::Watch, b"spk2", 1),
+        );
+        let pass = run_at(
+            &store,
+            &inbox(FLOOR - 3, vec![unread]),
+            &tips(),
+            T0 + 25 * HOUR,
+        );
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "kept while a request below the floor sits unread"
+        );
+        assert!(pass.stale, "and the copy is reported as behind");
+        assert!(pass.gated, "and the pass is not passed over as quiet");
+    }
+
     /// A node that has stopped following the inbox answers every read from
     /// the copy it froze, so nothing disconnects and nothing is missing:
     /// neither half of the hold is armed. The floor the copy carries falls
@@ -2639,11 +2719,31 @@ mod tests {
             vec![b"spk".to_vec()],
             "kept while the copy is behind"
         );
+        assert!(frozen.stale, "and the copy is reported as behind");
         assert!(frozen.gated, "and the pass is not passed over as quiet");
-        run_at(&store, &inbox(FLOOR, vec![]), &tips(), T0 + 25 * HOUR);
+        // One block past the window is already too far.
+        run_at(
+            &store,
+            &inbox(FLOOR - WINDOW_BLOCKS - 1, vec![]),
+            &tips(),
+            T0 + 25 * HOUR,
+        );
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "kept a block past the window"
+        );
+        // Exactly a window behind is as far as a live copy lags: the bridge
+        // signs a floor and reads it back within a pass or two.
+        run_at(
+            &store,
+            &inbox(FLOOR - WINDOW_BLOCKS, vec![]),
+            &tips(),
+            T0 + 25 * HOUR,
+        );
         assert!(
             watched(&store).is_empty(),
-            "and ends once the copy carries the floor again"
+            "and ends once the copy is within a window of the floor again"
         );
     }
 

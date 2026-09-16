@@ -331,12 +331,26 @@ contract id as `serving the request inbox`.
   renewing until it is buried. The day a watch inherited from an older
   bridge gets is dated by the host's clock alone, since no block carries a
   time yet at that moment, so a clock behind by more than a day at the
-  upgrade grants less than a day: check it before upgrading. Nor does a watch end while a payment to it is
-  less than `deep_confirmations` deep, within two minutes of the bridge
-  connecting to its node (see the wait's expiry half above), or while a
-  request from its own requester waits on the removal budget, since that may
-  be its renewal (only while that request is still in the inbox: one the
-  caps push out or the floor passes no longer counts). Every scan also covers
+  upgrade grants less than a day: check it before upgrading. Nor does a watch
+  end while a payment to it is less than `deep_confirmations` deep, within
+  two minutes of the bridge connecting to its node or opening an inbox the
+  node has lost (see the wait's expiry half above), while a request from its
+  own requester waits on the removal budget, since that may be its renewal
+  (only while that request is still in the inbox: one the caps push out or
+  the floor passes no longer counts), or while the inbox this node serves
+  carries a floor more than `WINDOW_BLOCKS` below the highest the bridge has
+  signed. That last one says the copy is not live: a node that stops
+  following the contract keeps answering reads from what it froze, without
+  dropping the connection or reporting anything missing, and a renewal would
+  be missing from such a copy too, as would a request the floor has already
+  passed, which is skipped unread and holds watches back on its own. It is
+  logged: "this node serves an inbox behind the floor this bridge signed".
+  Two limits worth knowing, since neither is visible to the bridge: the
+  evidence is this bridge's own floor read back from its own node, so a node
+  that applies what the bridge writes while seeing no peers looks healthy;
+  and the floor rises with the mainnet tip, so while mainnet's node cannot
+  be reached the evidence stops moving although watches still end on the
+  other networks. Both are in freenet-bitcoin#18. Every scan also covers
   the scripts of payments a reorg moved out of their block and that have not
   been seen again, watched or not, so such a payment is found where it was
   re-mined rather than left retracted. Watches registered before the inbox
