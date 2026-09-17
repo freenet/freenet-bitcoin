@@ -1346,11 +1346,22 @@ fn read(key: ContractKey) -> ContractRequest<'static> {
     }
 }
 
+/// Hand one request to the connection, or give up on the connection.
+///
+/// A step can send several requests without reading in between, and the
+/// client's channels hold one message each, so a node that answers quickly
+/// can leave the client's task waiting to deliver a reply while this waits to
+/// hand it a request. Neither would ever move. Timing out ends the session,
+/// and `run` reconnects. See `freenet::Link` for the observer's side of this.
 async fn send(api: &mut WebApi, req: ContractRequest<'static>) -> Result<()> {
-    api.send(ClientRequest::ContractOp(req))
+    tokio::time::timeout(SEND_TIMEOUT, api.send(ClientRequest::ContractOp(req)))
         .await
+        .map_err(|_| anyhow!("timed out handing a request to the node connection"))?
         .map_err(|e| anyhow!("sending to the node: {e}"))
 }
+
+/// How long `send` waits to hand a request over before abandoning the session.
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn connection_lost(kind: &ErrorKind) -> bool {
     matches!(

@@ -48,6 +48,8 @@ toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
+bincode = "1"
+tokio = { version = "1", features = ["net"] }
 freenet-bitcoin-inbox = { workspace = true, features = ["seal", "test-support"] }
 
 [build-dependencies]

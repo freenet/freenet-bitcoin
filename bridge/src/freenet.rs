@@ -20,7 +20,7 @@ use freenet_bitcoin_common::{
     to_cbor, BitcoinAddressParameters, BitcoinTipParameters, SignedClaim, SignedTipEntry,
 };
 use freenet_stdlib::client_api::{
-    ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
+    ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse, WebApi,
 };
 use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,
@@ -29,6 +29,91 @@ use freenet_stdlib::prelude::{
 use tokio::sync::Mutex;
 
 const REQUEST_TIMEOUT_S: u64 = 60;
+
+/// How long a request may wait to be handed to the connection's task.
+///
+/// Normally immediate. It waits only when that task is itself stuck delivering
+/// a reply nobody collected, and then it would wait forever.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long opening a connection to the node may take.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One websocket to the node, replaced after any request goes unanswered.
+///
+/// A reply is matched to its request by order and nothing else. So a reply
+/// that arrives after its request timed out is read as the answer to the NEXT
+/// request, and so on down the line. Worse, the client's request and response
+/// channels hold one message each, and its task stops reading the socket while
+/// it waits to hand over a reply. Two uncollected replies fill the response
+/// channel, the next request fills the request channel, and the one after that
+/// waits in `send` forever while holding the publisher's lock. That froze the
+/// observer on 2026-09-17 with a confirmed payment unpublished.
+///
+/// A late reply cannot be told apart from a current one, and the only way to
+/// discard it is to discard the connection it would arrive on. So an
+/// unanswered request, a send that cannot be handed over, or a reply naming a
+/// different contract all drop the connection, and the next request opens a
+/// fresh one.
+struct Link {
+    ws_url: String,
+    api: Option<WebApi>,
+}
+
+impl Link {
+    async fn open(ws_url: &str) -> Result<WebApi> {
+        let (stream, _) =
+            tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(ws_url))
+                .await
+                .map_err(|_| anyhow!("timed out connecting to the Freenet node at {ws_url}"))?
+                .with_context(|| format!("connecting to the Freenet node at {ws_url}"))?;
+        Ok(WebApi::start(stream))
+    }
+
+    /// Send `req` and wait up to `timeout` for the reply.
+    ///
+    /// `Err` means no reply was received, and the connection has already been
+    /// dropped, so nothing that arrives late can be read as a later answer.
+    /// `Ok` carries whatever the node said, error replies included.
+    async fn request(
+        &mut self,
+        req: ContractRequest<'static>,
+        timeout: std::time::Duration,
+    ) -> Result<std::result::Result<HostResponse, ClientError>> {
+        let mut api = match self.api.take() {
+            Some(api) => api,
+            None => Self::open(&self.ws_url).await?,
+        };
+        match tokio::time::timeout(SEND_TIMEOUT, api.send(ClientRequest::ContractOp(req))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(anyhow!("sending to the node: {e}")),
+            Err(_) => {
+                return Err(anyhow!(
+                    "timed out handing a request to the node connection"
+                ))
+            }
+        }
+        let reply = tokio::time::timeout(timeout, api.recv())
+            .await
+            .map_err(|_| anyhow!("timed out waiting for the node's reply"))?;
+        if !matches!(&reply, Err(e) if connection_lost(e.kind())) {
+            self.api = Some(api);
+        }
+        Ok(reply)
+    }
+
+    /// Drop the connection, after a reply that answers some other request.
+    fn discard(&mut self) {
+        self.api = None;
+    }
+}
+
+fn connection_lost(kind: &ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::ChannelClosed | ErrorKind::Disconnect | ErrorKind::TransportProtocolDisconnect
+    )
+}
 
 /// The contract WASM a bridge runs, read from its `contract_dir`.
 pub struct ContractWasm {
@@ -54,7 +139,7 @@ impl ContractWasm {
 /// A connection to a local Freenet node, plus the contract WASM needed to
 /// derive keys and to PUT a contract that does not exist yet.
 pub struct FreenetPublisher {
-    api: Arc<Mutex<WebApi>>,
+    link: Arc<Mutex<Link>>,
     address_code: Arc<ContractCode<'static>>,
     tip_code: Arc<ContractCode<'static>>,
     /// Held for its code hash, which the inbox generation pointer names. The
@@ -68,11 +153,14 @@ pub struct FreenetPublisher {
 
 impl FreenetPublisher {
     pub async fn connect(ws_url: &str, wasm: &ContractWasm) -> Result<Self> {
-        let (stream, _) = tokio_tungstenite::connect_async(ws_url)
-            .await
-            .with_context(|| format!("connecting to the Freenet node at {ws_url}"))?;
+        // Connected up front, so a bridge pointed at no node fails at startup
+        // rather than on its first observation.
+        let api = Link::open(ws_url).await?;
         Ok(FreenetPublisher {
-            api: Arc::new(Mutex::new(WebApi::start(stream))),
+            link: Arc::new(Mutex::new(Link {
+                ws_url: ws_url.to_string(),
+                api: Some(api),
+            })),
             address_code: Arc::new(ContractCode::from(wasm.address.clone())),
             tip_code: Arc::new(ContractCode::from(wasm.tip.clone())),
             inbox_code: Arc::new(ContractCode::from(wasm.inbox.clone())),
@@ -303,33 +391,44 @@ impl FreenetPublisher {
         container: ContractContainer,
         state_bytes: Vec<u8>,
     ) -> Result<()> {
-        let mut api = self.api.lock().await;
+        let mut link = self.link.lock().await;
+        let timeout = std::time::Duration::from_secs(REQUEST_TIMEOUT_S);
 
         let update = ContractRequest::Update {
             key,
             data: UpdateData::State(state_bytes.clone().into()),
         };
-        api.send(ClientRequest::ContractOp(update))
-            .await
-            .map_err(|e| anyhow!("sending UPDATE: {e}"))?;
-
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(REQUEST_TIMEOUT_S),
-            api.recv(),
-        )
-        .await
-        {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse { .. }))) => {
-                return Ok(())
+        match link.request(update, timeout).await.context("UPDATE")? {
+            Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                key: answered,
+                ..
+            })) => {
+                if answered.id() == key.id() {
+                    return Ok(());
+                }
+                link.discard();
+                return Err(anyhow!(
+                    "the node answered an UPDATE of {} for {}",
+                    key.id(),
+                    answered.id()
+                ));
             }
-            Ok(Ok(_other)) => {
-                // Anything else -- most often "contract not found" -- means the
-                // instance does not exist yet, so fall through to PUT.
+            Ok(HostResponse::ContractResponse(ContractResponse::NotFound { instance_id }))
+                if instance_id != *key.id() =>
+            {
+                link.discard();
+                return Err(anyhow!(
+                    "the node answered an UPDATE of {} with NotFound for {instance_id}",
+                    key.id()
+                ));
             }
-            Ok(Err(e)) => {
+            Ok(_other) => {
+                // Anything else -- most often NotFound -- means the instance
+                // does not exist yet, so fall through to PUT.
+            }
+            Err(e) => {
                 tracing::debug!("UPDATE rejected ({e}); falling back to PUT");
             }
-            Err(_) => return Err(anyhow!("timed out waiting for UPDATE response")),
         }
 
         let put = ContractRequest::Put {
@@ -341,20 +440,21 @@ impl FreenetPublisher {
             subscribe: false,
             blocking_subscribe: false,
         };
-        api.send(ClientRequest::ContractOp(put))
-            .await
-            .map_err(|e| anyhow!("sending PUT: {e}"))?;
-
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(REQUEST_TIMEOUT_S),
-            api.recv(),
-        )
-        .await
-        {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { .. }))) => Ok(()),
-            Ok(Ok(other)) => Err(anyhow!("unexpected response to PUT: {other:?}")),
-            Ok(Err(e)) => Err(anyhow!("PUT failed: {e}")),
-            Err(_) => Err(anyhow!("timed out waiting for PUT response")),
+        match link.request(put, timeout).await.context("PUT")? {
+            Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key: answered })) => {
+                if answered.id() == key.id() {
+                    Ok(())
+                } else {
+                    link.discard();
+                    Err(anyhow!(
+                        "the node answered a PUT of {} for {}",
+                        key.id(),
+                        answered.id()
+                    ))
+                }
+            }
+            Ok(other) => Err(anyhow!("unexpected response to PUT: {other:?}")),
+            Err(e) => Err(anyhow!("PUT failed: {e}")),
         }
     }
 
@@ -366,28 +466,36 @@ impl FreenetPublisher {
     /// "the data is readable" are different claims, and only the second one
     /// means the integration works.
     pub async fn get_state(&self, key: ContractKey) -> Result<Vec<u8>> {
-        let mut api = self.api.lock().await;
-        api.send(ClientRequest::ContractOp(ContractRequest::Get {
+        let mut link = self.link.lock().await;
+        let req = ContractRequest::Get {
             key: key.into(),
             return_contract_code: false,
             subscribe: false,
             blocking_subscribe: false,
-        }))
-        .await
-        .map_err(|e| anyhow!("sending GET: {e}"))?;
-
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(REQUEST_TIMEOUT_S),
-            api.recv(),
-        )
-        .await
+        };
+        match link
+            .request(req, std::time::Duration::from_secs(REQUEST_TIMEOUT_S))
+            .await
+            .context("GET")?
         {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                state, ..
-            }))) => Ok(state.as_ref().to_vec()),
-            Ok(Ok(other)) => Err(anyhow!("unexpected response to GET: {other:?}")),
-            Ok(Err(e)) => Err(anyhow!("GET failed: {e}")),
-            Err(_) => Err(anyhow!("timed out waiting for GET response")),
+            Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key: answered,
+                state,
+                ..
+            })) => {
+                if answered.id() == key.id() {
+                    Ok(state.as_ref().to_vec())
+                } else {
+                    link.discard();
+                    Err(anyhow!(
+                        "the node answered a GET of {} for {}",
+                        key.id(),
+                        answered.id()
+                    ))
+                }
+            }
+            Ok(other) => Err(anyhow!("unexpected response to GET: {other:?}")),
+            Err(e) => Err(anyhow!("GET failed: {e}")),
         }
     }
 }
@@ -453,34 +561,75 @@ impl FreenetPublisher {
     pub async fn probe_get(&self, id: ContractInstanceId) -> freenet_migrate::ProbeAnswer {
         use freenet_migrate::ProbeAnswer;
 
-        let mut api = self.api.lock().await;
         let req = ContractRequest::Get {
             key: id,
             return_contract_code: false,
             subscribe: false,
             blocking_subscribe: false,
         };
-        if api.send(ClientRequest::ContractOp(req)).await.is_err() {
-            return ProbeAnswer::Unknown;
-        }
-
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(freenet_migrate::RECOMMENDED_PROBE_TIMEOUT_MS),
-            api.recv(),
-        )
-        .await
+        let mut link = self.link.lock().await;
+        let reply = match link
+            .request(
+                req,
+                std::time::Duration::from_millis(freenet_migrate::RECOMMENDED_PROBE_TIMEOUT_MS),
+            )
+            .await
         {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                state, ..
-            }))) => ProbeAnswer::State(state.as_ref().to_vec()),
-            // The one case that is genuinely an answer.
-            Ok(Err(e)) if is_not_found(&e.to_string()) => ProbeAnswer::Absent,
-            // A reply we did not expect tells us nothing about the contract.
-            Ok(Ok(_)) => ProbeAnswer::Unknown,
-            Ok(Err(_)) => ProbeAnswer::Unknown,
+            Ok(reply) => reply,
             // Silence. Never absence.
-            Err(_) => ProbeAnswer::Unknown,
+            Err(_) => return ProbeAnswer::Unknown,
+        };
+        match classify_probe_reply(&id, reply) {
+            ProbeReply::Answer(answer) => answer,
+            ProbeReply::OtherContract => {
+                link.discard();
+                ProbeAnswer::Unknown
+            }
         }
+    }
+}
+
+/// What one reply to a probe GET says.
+pub(crate) enum ProbeReply {
+    Answer(freenet_migrate::ProbeAnswer),
+    /// The reply names a contract other than the one asked about, so it
+    /// belongs to some other request and says nothing about this one.
+    OtherContract,
+}
+
+/// Classify the node's reply to a GET of `asked`.
+///
+/// A current node reports a missing contract as a successful
+/// `ContractResponse::NotFound`, not as an error. Reading that as "no answer"
+/// made every predecessor of every watched address look unreachable, so the
+/// migration never finished and re-sent all of its GETs on every round.
+pub(crate) fn classify_probe_reply(
+    asked: &ContractInstanceId,
+    reply: std::result::Result<HostResponse, ClientError>,
+) -> ProbeReply {
+    use freenet_migrate::ProbeAnswer;
+
+    match reply {
+        Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key, state, ..
+        })) => {
+            if key.id() == asked {
+                ProbeReply::Answer(ProbeAnswer::State(state.as_ref().to_vec()))
+            } else {
+                ProbeReply::OtherContract
+            }
+        }
+        Ok(HostResponse::ContractResponse(ContractResponse::NotFound { instance_id })) => {
+            if &instance_id == asked {
+                ProbeReply::Answer(ProbeAnswer::Absent)
+            } else {
+                ProbeReply::OtherContract
+            }
+        }
+        // An older node reported a miss as an error, which names no contract.
+        Err(e) if is_not_found(&e.to_string()) => ProbeReply::Answer(ProbeAnswer::Absent),
+        // A reply we did not expect tells us nothing about the contract.
+        Ok(_) | Err(_) => ProbeReply::Answer(ProbeAnswer::Unknown),
     }
 }
 
@@ -518,6 +667,136 @@ mod probe_tests {
             assert!(
                 !is_not_found(msg),
                 "{msg:?} must classify as Unknown, never Absent"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use freenet_migrate::ProbeAnswer;
+    use futures::{SinkExt, StreamExt};
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    fn id(byte: u8) -> ContractInstanceId {
+        ContractInstanceId::new([byte; 32])
+    }
+
+    fn not_found(
+        instance_id: ContractInstanceId,
+    ) -> std::result::Result<HostResponse, ClientError> {
+        Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
+            instance_id,
+        }))
+    }
+
+    #[test]
+    fn a_not_found_reply_for_the_contract_asked_about_is_absence() {
+        assert!(matches!(
+            classify_probe_reply(&id(1), not_found(id(1))),
+            ProbeReply::Answer(ProbeAnswer::Absent)
+        ));
+    }
+
+    #[test]
+    fn a_reply_about_another_contract_answers_nothing() {
+        assert!(matches!(
+            classify_probe_reply(&id(1), not_found(id(2))),
+            ProbeReply::OtherContract
+        ));
+    }
+
+    #[test]
+    fn an_older_nodes_not_found_error_is_still_absence() {
+        let reply = Err(ClientError::from("contract not found".to_string()));
+        assert!(matches!(
+            classify_probe_reply(&id(1), reply),
+            ProbeReply::Answer(ProbeAnswer::Absent)
+        ));
+    }
+
+    #[test]
+    fn any_other_reply_is_unknown() {
+        let reply = Err(ClientError::from("operation aborted".to_string()));
+        assert!(matches!(
+            classify_probe_reply(&id(1), reply),
+            ProbeReply::Answer(ProbeAnswer::Unknown)
+        ));
+    }
+
+    /// A node that answers every GET with NotFound for the contract asked
+    /// about, holding back its reply on the FIRST connection's first request
+    /// for `delay`.
+    async fn node(delay: Duration) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut first = true;
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let hold = if first { delay } else { Duration::ZERO };
+                first = false;
+                tokio::spawn(async move {
+                    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                    let mut hold = hold;
+                    while let Some(Ok(msg)) = ws.next().await {
+                        let Message::Binary(bytes) = msg else {
+                            continue;
+                        };
+                        let key = match bincode::deserialize::<ClientRequest<'_>>(&bytes) {
+                            Ok(ClientRequest::ContractOp(ContractRequest::Get { key, .. })) => key,
+                            _ => continue,
+                        };
+                        tokio::time::sleep(std::mem::take(&mut hold)).await;
+                        let reply = bincode::serialize(&not_found(key)).unwrap();
+                        if ws.send(Message::Binary(reply.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        url
+    }
+
+    fn get(instance: ContractInstanceId) -> ContractRequest<'static> {
+        ContractRequest::Get {
+            key: instance,
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        }
+    }
+
+    /// The 2026-09-17 freeze. The first reply comes after its request gave
+    /// up; the next request must get ITS OWN answer, not that late one.
+    #[tokio::test]
+    async fn a_late_reply_is_never_read_as_the_next_requests_answer() {
+        let url = node(Duration::from_millis(600)).await;
+        let mut link = Link {
+            api: Some(Link::open(&url).await.unwrap()),
+            ws_url: url,
+        };
+
+        let first = link.request(get(id(1)), Duration::from_millis(150)).await;
+        assert!(first.is_err(), "the held reply must time out");
+
+        // Let the late reply reach wherever it is going to go.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        for asked in [id(2), id(3)] {
+            let reply = link
+                .request(get(asked), Duration::from_secs(5))
+                .await
+                .expect("a prompt node answers");
+            assert!(
+                matches!(
+                    classify_probe_reply(&asked, reply),
+                    ProbeReply::Answer(ProbeAnswer::Absent)
+                ),
+                "the reply to {asked} must be about {asked}"
             );
         }
     }
