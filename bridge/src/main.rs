@@ -450,10 +450,13 @@ async fn observation_loop(
     // inbox, or reads an old generation of the other contracts. Republishing
     // an unchanged record is harmless.
     let mut pointers_due = std::time::Instant::now() + pointer_wait(pointers_ok);
+    let mut migrations = bitcoin_freenet_bridge::migrate::MigrationPacer::default();
 
     loop {
         for obs in &observers {
-            if let Err(e) = observe_once(obs, &signer, &store, publisher.as_deref()).await {
+            if let Err(e) =
+                observe_once(obs, &signer, &store, publisher.as_deref(), &mut migrations).await
+            {
                 tracing::error!(network = ?obs.network(), "observation round failed: {e}");
             }
         }
@@ -475,6 +478,7 @@ async fn observe_once(
     signer: &Signer,
     store: &Store,
     publisher: Option<&FreenetPublisher>,
+    migrations: &mut bitcoin_freenet_bridge::migrate::MigrationPacer,
 ) -> Result<()> {
     // While the node is still doing initial block download, an absence of
     // payments means nothing, so publishing "scanned to height N" would be an
@@ -600,10 +604,9 @@ async fn observe_once(
         let already = store
             .migration_done(&instance_key, &code_hash)
             .unwrap_or(false);
-        if !already {
+        if !already && migrations.due(&instance_key, std::time::Instant::now()) {
             let local = freenet_bitcoin_common::address_state::BitcoinAddressStateV1::default();
-            let (merged, note) = publisher.migrate_address_forward(&params, local).await;
-            let definitive = note.starts_with("recovered") || note.starts_with("every predecessor");
+            let (merged, note, walk) = publisher.migrate_address_forward(&params, local).await;
             if !merged.claims.claims.is_empty() {
                 match publisher.publish_state(&params, &merged).await {
                     Ok(_) => tracing::info!(script = %hex::encode(&script), "{note}"),
@@ -612,9 +615,9 @@ async fn observe_once(
             } else {
                 tracing::debug!(script = %hex::encode(&script), "{note}");
             }
-            // Only a definitive answer may be recorded. An indeterminate walk
-            // leaves no marker so the next run probes again.
-            if definitive {
+            // Recorded only once several separate walks agree. See
+            // `MigrationPacer` for why one is not enough.
+            if migrations.record(&instance_key, walk, std::time::Instant::now()) {
                 let _ = store.set_migration_done(&instance_key, &code_hash, &note);
             }
         }
@@ -625,21 +628,31 @@ async fn observe_once(
         let fresh: Vec<_> = script_claims
             .into_iter()
             .filter(|c| {
-                store
-                    .mark_published(obs.network(), &script, &c.digest())
-                    .unwrap_or(true)
+                !store
+                    .is_published(obs.network(), &script, &c.digest())
+                    .unwrap_or(false)
             })
             .collect();
         if fresh.is_empty() {
             continue;
         }
         match publisher.publish_claims(&params, &fresh).await {
-            Ok(key) => tracing::info!(
-                contract = %key.id(),
-                claims = fresh.len(),
-                "published Bitcoin observations"
-            ),
-            Err(e) => tracing::error!("publishing observations failed: {e}"),
+            Ok(key) => {
+                // Marked only now. Marked before the publish, a claim whose
+                // publish failed was never sent again: a confirmed payment
+                // that no retry, and no restart, would ever publish.
+                for claim in &fresh {
+                    if let Err(e) = store.mark_published(obs.network(), &script, &claim.digest()) {
+                        tracing::warn!("recording a published claim failed: {e}");
+                    }
+                }
+                tracing::info!(
+                    contract = %key.id(),
+                    claims = fresh.len(),
+                    "published Bitcoin observations"
+                )
+            }
+            Err(e) => tracing::error!("publishing observations failed, will retry: {e}"),
         }
     }
 

@@ -1354,14 +1354,14 @@ fn read(key: ContractKey) -> ContractRequest<'static> {
 /// hand it a request. Neither would ever move. Timing out ends the session,
 /// and `run` reconnects. See `freenet::Link` for the observer's side of this.
 async fn send(api: &mut WebApi, req: ContractRequest<'static>) -> Result<()> {
-    tokio::time::timeout(SEND_TIMEOUT, api.send(ClientRequest::ContractOp(req)))
-        .await
-        .map_err(|_| anyhow!("timed out handing a request to the node connection"))?
-        .map_err(|e| anyhow!("sending to the node: {e}"))
+    tokio::time::timeout(
+        crate::freenet::SEND_TIMEOUT,
+        api.send(ClientRequest::ContractOp(req)),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out handing a request to the node connection"))?
+    .map_err(|e| anyhow!("sending to the node: {e}"))
 }
-
-/// How long `send` waits to hand a request over before abandoning the session.
-const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn connection_lost(kind: &ErrorKind) -> bool {
     matches!(

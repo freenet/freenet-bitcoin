@@ -953,7 +953,29 @@ impl Store {
 
     // --- published claims --------------------------------------------------
 
+    /// Whether a claim has been published.
+    pub fn is_published(
+        &self,
+        net: BitcoinNetwork,
+        script: &[u8],
+        digest: &[u8; 32],
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM published_claims
+                 WHERE network = ?1 AND script_pubkey = ?2 AND claim_digest = ?3",
+                params![net.as_str(), script, digest.to_vec()],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
     /// Record a claim as published. Returns false if it already was.
+    ///
+    /// Call only after the publish succeeded: a claim marked here is never
+    /// sent again.
     pub fn mark_published(
         &self,
         net: BitcoinNetwork,
@@ -2223,7 +2245,9 @@ mod tests {
     fn published_claims_are_reported_new_exactly_once() {
         let s = store();
         let net = BitcoinNetwork::Signet;
+        assert!(!s.is_published(net, b"spk", &[3; 32]).unwrap());
         assert!(s.mark_published(net, b"spk", &[3; 32]).unwrap());
+        assert!(s.is_published(net, b"spk", &[3; 32]).unwrap());
         assert!(!s.mark_published(net, b"spk", &[3; 32]).unwrap());
     }
 
