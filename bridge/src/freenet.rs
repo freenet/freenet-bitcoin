@@ -713,7 +713,7 @@ pub(crate) enum ProbeReply {
     State(Vec<u8>),
     /// The node answered that it found nothing. That is `Absent` to the
     /// driver, and it is weak evidence: a node gives the same answer when its
-    /// GET merely ran out of retries. `migrate::MigrationPacer` is where that
+    /// GET merely ran out of retries. `migrate::count_walk` is where that
     /// weakness is accounted for.
     Absent,
     /// Not an answer about the contract asked about.
