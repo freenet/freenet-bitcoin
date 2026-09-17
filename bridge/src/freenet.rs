@@ -20,7 +20,7 @@ use freenet_bitcoin_common::{
     to_cbor, BitcoinAddressParameters, BitcoinTipParameters, SignedClaim, SignedTipEntry,
 };
 use freenet_stdlib::client_api::{
-    ClientError, ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
+    ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse, WebApi,
 };
 use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,
@@ -163,8 +163,16 @@ impl Link {
         let reply = tokio::time::timeout(timeout, api.recv())
             .await
             .map_err(|_| LinkUnusable("timed out waiting for the node's reply".to_string()))?;
-        if reply.is_ok() {
-            self.api = Some(api);
+        match &reply {
+            Ok(_) => self.api = Some(api),
+            // An error reply names no contract, so it cannot be checked
+            // against what was asked; the connection goes either way. What
+            // the error says about the NODE is worth passing on, so a caller
+            // about to make the same request for another contract can stop.
+            Err(e) if reply_is_about_the_node(e.kind()) => {
+                return Err(LinkUnusable(format!("the node answered: {e}")).into())
+            }
+            Err(_) => {}
         }
         Ok(reply)
     }
@@ -184,7 +192,7 @@ impl Link {
 /// same way, and can stop. A claim the node rejected, or one this bridge
 /// refuses to publish, says nothing about the next one.
 #[derive(Debug)]
-pub struct LinkUnusable(pub String);
+pub struct LinkUnusable(String);
 
 impl std::fmt::Display for LinkUnusable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -197,6 +205,27 @@ impl std::error::Error for LinkUnusable {}
 /// Whether `e` is [`LinkUnusable`], however deeply it is wrapped.
 pub fn link_unusable(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| cause.is::<LinkUnusable>())
+}
+
+/// Whether an error REPLY is about the node rather than about the request.
+///
+/// A node that has not joined, has no ring connections, or is shutting down
+/// answers an error rather than failing the socket, and it will answer the
+/// next request the same way. Every other kind, including a contract's own
+/// error, says something about the request and nothing about the next one.
+/// `ErrorKind` is `#[non_exhaustive]`, so an unrecognised kind is treated as
+/// per-request: the cost of being wrong that way is one retry.
+fn reply_is_about_the_node(kind: &ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::EmptyRing
+            | ErrorKind::PeerNotJoined
+            | ErrorKind::NodeUnavailable
+            | ErrorKind::Disconnect
+            | ErrorKind::ChannelClosed
+            | ErrorKind::TransportProtocolDisconnect
+            | ErrorKind::Shutdown
+    )
 }
 
 /// `base` scaled by a factor between 0.8 and 1.2, so a restart of the node
@@ -1181,6 +1210,10 @@ mod link_tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("PutResponse for"), "{err}");
+        assert!(
+            !link_unusable(&err),
+            "a reply about another contract is not the node refusing"
+        );
         assert_eq!(publisher.get_state(asked).await.unwrap(), vec![5]);
         assert_eq!(
             node.connections.load(Ordering::SeqCst),
@@ -1205,6 +1238,38 @@ mod link_tests {
         assert!(publisher.get_state(asked).await.is_err());
         assert_eq!(publisher.get_state(asked).await.unwrap(), vec![5]);
         assert_eq!(node.connections.load(Ordering::SeqCst), 2);
+    }
+
+    /// **A failure that is about the node stops the caller; one about the
+    /// request does not.**
+    ///
+    /// The round abandons the remaining scripts on the first kind and carries
+    /// on for the second, so getting this wrong either starves every later
+    /// script (a claim this bridge refuses to publish is permanent and
+    /// particular to one address) or hammers a node that has not joined yet,
+    /// once per script, every two seconds.
+    #[tokio::test]
+    async fn only_a_failure_about_the_node_is_link_unusable() {
+        let asked = key(1);
+        let node = node(Arc::new(move |connection, _| match connection {
+            0 => Action::Reply(Err(ClientError::from(ErrorKind::PeerNotJoined))),
+            1 => Action::Reply(get_response(key(2), vec![9])),
+            _ => Action::Reply(Err(ClientError::from(ErrorKind::Shutdown))),
+        }))
+        .await;
+        let publisher = publisher(&node.url).await;
+
+        let not_joined = publisher.get_state(asked).await.unwrap_err();
+        assert!(link_unusable(&not_joined), "{not_joined:#}");
+
+        let wrong_contract = publisher.get_state(asked).await.unwrap_err();
+        assert!(
+            !link_unusable(&wrong_contract),
+            "an answer about another contract says nothing about the node: {wrong_contract:#}"
+        );
+
+        let shutting_down = publisher.get_state(asked).await.unwrap_err();
+        assert!(link_unusable(&shutting_down), "{shutting_down:#}");
     }
 
     #[tokio::test]

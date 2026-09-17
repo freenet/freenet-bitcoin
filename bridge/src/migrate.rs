@@ -6,15 +6,16 @@
 //! every instance. Freenet has no core mechanism to carry state across that —
 //! deliberately, and permanently — so it is app-level work.
 //!
-//! The bridge is the right driver for one reason above all: **the probe's
-//! trigger is that the new key has no real state yet, so any write to the new
-//! key that lands first permanently suppresses it** (freenet/river#621). The
-//! bridge is the only writer here. If it published before probing, it would
-//! destroy the trigger with its own first write, and the migration would
-//! silently never run while everything looked healthy.
+//! The bridge is the right driver because it is the only writer here, so
+//! nothing else can be carrying this data forward.
 //!
-//! So the probe runs once per contract instance, *before* that instance is
-//! first published to in this process.
+//! A note on ordering, because an earlier version of this doc had it wrong and
+//! a later reader acted on it: the probe does NOT have to run before the
+//! current instance is first published to. `migrate_contract` GETs only the
+//! ids the lineage yields, never the current key, so a claim published to the
+//! current instance cannot be mistaken for a predecessor's state. That is what
+//! lets [`WalkClock`] hold the first walk back while publishing carries on.
+//! (freenet/river#621 is about an app whose probe DID read the current key.)
 //!
 //! # Why this is worth doing even though observations are reconstructible
 //!
@@ -274,14 +275,23 @@ pub fn count_walk(prev: Agreement, walk: Walk, now_ms: u64) -> (Agreement, bool)
     if walk == Walk::ProvesNothing {
         return (prev, false);
     }
-    let separate = prev.last_counted_ms.is_none_or(|last| {
+    match prev.last_counted_ms {
         // A stamp in the future is a clock that ran fast and was corrected.
-        // Without this the address waits for real time to catch up, which can
-        // be years: treat it as counted now and carry on.
-        last > now_ms || now_ms - last >= SEAL_SPACING_MS
-    });
-    if !separate {
-        return (prev, false);
+        // The stamp is brought back to now so the address is not left waiting
+        // for real time to catch up, which can be years, but THIS walk does
+        // not count: otherwise every backward correction would buy a walk's
+        // worth of evidence, and four of them would seal.
+        Some(last) if last > now_ms => {
+            return (
+                Agreement {
+                    walks: prev.walks,
+                    last_counted_ms: Some(now_ms),
+                },
+                false,
+            )
+        }
+        Some(last) if now_ms - last < SEAL_SPACING_MS => return (prev, false),
+        _ => {}
     }
     let next = Agreement {
         walks: prev.walks + 1,
@@ -744,13 +754,28 @@ mod walk_tests {
         assert!(!clock.publish_is_new(b"a", [1; 32]));
     }
 
+    /// **A clock corrected backwards neither stalls an address nor pays it.**
+    ///
+    /// Left alone, a stamp written while the clock read years ahead would
+    /// stop the address counting anything until real time passed it. Counted,
+    /// every backward correction would buy a walk's worth of evidence towards
+    /// a permanent decision, and four would seal.
     #[test]
-    fn a_stamp_from_a_clock_that_ran_fast_does_not_strand_an_address() {
+    fn a_stamp_from_a_clock_that_ran_fast_neither_strands_nor_pays_an_address() {
+        let now = 1_700_000_000_000;
         let future = Agreement {
             walks: 1,
             last_counted_ms: Some(10_000_000_000_000),
         };
-        let (after, _) = count_walk(future, Walk::Agrees, 1_700_000_000_000);
-        assert_eq!(after.walks, 2, "counted now rather than waiting for years");
+        let (after, seal) = count_walk(future, Walk::Agrees, now);
+        assert!(!seal);
+        assert_eq!(after.walks, 1, "the correction itself is not evidence");
+        assert_eq!(
+            after.last_counted_ms,
+            Some(now),
+            "but the stamp is brought back, so the next walk can count"
+        );
+        let (later, _) = count_walk(after, Walk::Agrees, now + SEAL_SPACING_MS);
+        assert_eq!(later.walks, 2, "and it does, a spacing later");
     }
 }

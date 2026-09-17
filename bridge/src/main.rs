@@ -216,13 +216,14 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
     // few failed rounds rather than a process that publishes nothing until
     // somebody restarts it.
     let publisher = Arc::new(FreenetPublisher::new(&cfg.freenet_ws, &wasm));
-    let address_code_hash = Some(publisher.address_code_hash());
+    let address_code_hash = publisher.address_code_hash();
 
     // If the contract WASM changed since last run, every instance has moved to
     // a new key and the "already published" record refers to contracts nobody
     // reads. Discard it, or the successor contracts come up empty and stay
     // that way -- indistinguishable from an address with no activity.
-    if let Some(h) = address_code_hash {
+    {
+        let h = address_code_hash;
         match store.set_publish_generation(&h) {
             Ok(true) => tracing::warn!(
                 code_hash = %hex::encode(h),
@@ -536,12 +537,28 @@ async fn observe_once(
     // reaches the tip it will stamp those retractions with rather than leaving
     // blocks for the next round to contradict them from. See `scan_ceiling`.
     let ceiling = reorg.scan_ceiling(tip.height, obs.cfg.max_reorg_depth);
+    // The checkpoint is held back while this round has something to publish.
+    //
+    // It used to advance inside this loop, before anything was published, and
+    // `resume_from` is the checkpoint plus one -- so a block whose claims
+    // failed to publish was never scanned again and its payment was never
+    // attested by anyone. That is this bridge's own incident: a payment
+    // confirmed while the observer could not reach the node. While the round
+    // has produced no claims there is nothing a later failure could lose, so
+    // the checkpoint advances as before and a long catch-up over empty blocks
+    // still makes progress.
+    let mut deferred_checkpoint: Option<freenet_bitcoin_common::BlockAnchor> = None;
     for height in next..=ceiling {
         let hash = obs.chain.block_hash_at(height)?;
         let block = obs.chain.scan_block(&hash, &scan)?;
         obs.claims_from_block(store, signer, &block, &tip, &watched, &mut round)?;
         tip_entries.push(obs.tip_entry(signer, &block)?);
-        store.set_checkpoint(obs.network(), &block.anchor)?;
+        if round.is_empty() {
+            store.set_checkpoint(obs.network(), &block.anchor)?;
+            deferred_checkpoint = None;
+        } else {
+            deferred_checkpoint = Some(block.anchor);
+        }
     }
 
     // Now that the rescan has said what is actually on the chain, retract only
@@ -574,13 +591,16 @@ async fn observe_once(
 
     store.prune_blocks(obs.network(), Store::BLOCKS_KEPT)?;
 
+    // Set when the node could not be reached, so the scanned window is kept
+    // for the next round rather than skipped over.
+    let mut node_unreachable = false;
     for (script, script_claims) in round.into_by_script() {
         let params = obs.address_params(&script, signer.bridge_id());
 
-        // Recover a predecessor generation BEFORE this instance is first
-        // written to in this run. Doing it after the first publish would mean
-        // probing state we had just written ourselves, and the recovery would
-        // never find anything -- silently, and looking healthy.
+        // The walk reads predecessor keys only, never this instance's own, so
+        // it does not matter that claims may already have been published to it
+        // this run. `WalkClock` relies on that: it holds the first walk back
+        // for ten minutes while publishing carries on.
         let code_hash = publisher.address_code_hash();
         // Keyed by the contract instance, which derives from the address
         // parameters and so is already per network: the same p2wpkh script is
@@ -606,17 +626,24 @@ async fn observe_once(
             // would lose exactly what the migration exists to carry. Skipped
             // only when it is byte-for-byte what was last published for this
             // address, since a predecessor holds its state indefinitely and
-            // the same merge would otherwise be re-sent on every walk.
+            // the same merge would otherwise be re-sent on every walk. The
+            // trade: re-sending it also re-asserted a state the network had
+            // accepted and then dropped, and that repair is now only made
+            // after a restart, which clears the memo.
             let published = if !found.has_state() {
                 tracing::debug!(script = %hex::encode(&script), "{note}");
                 false
-            } else if !walks.publish_is_new(&instance_key, state_digest(&merged)) {
+            } else if state_digest(&merged)
+                .is_some_and(|digest| !walks.publish_is_new(&instance_key, digest))
+            {
                 tracing::debug!(script = %hex::encode(&script), "{note} (already published)");
                 true
             } else {
                 match publisher.publish_state(&params, &merged).await {
                     Ok(_) => {
-                        walks.published_forward(&instance_key, state_digest(&merged));
+                        if let Some(digest) = state_digest(&merged) {
+                            walks.published_forward(&instance_key, digest);
+                        }
                         tracing::info!(script = %hex::encode(&script), "{note}");
                         true
                     }
@@ -684,6 +711,7 @@ async fn observe_once(
                 "published Bitcoin observations"
             ),
             Err(e) if bitcoin_freenet_bridge::freenet::link_unusable(&e) => {
+                node_unreachable = true;
                 // The remaining scripts are abandoned, because the next one
                 // fails the same way: with the node unreachable each would
                 // otherwise pay its own connect and request timeouts, per
@@ -712,8 +740,23 @@ async fn observe_once(
                 blocks = tip_entries.len(),
                 "published chain tip"
             ),
-            Err(e) => tracing::error!("publishing chain tip failed: {e}"),
+            Err(e) => {
+                node_unreachable |= bitcoin_freenet_bridge::freenet::link_unusable(&e);
+                tracing::error!("publishing chain tip failed: {e:#}");
+            }
         }
+    }
+
+    match deferred_checkpoint {
+        // Kept, so the next round scans these blocks again and re-signs the
+        // claims that did not get out. Re-publishing what did is harmless:
+        // the state is a digest-keyed set and `is_published` skips it.
+        Some(_) if node_unreachable => tracing::warn!(
+            network = ?obs.network(),
+            "the node could not be reached, so the blocks just scanned are kept for the next round"
+        ),
+        Some(anchor) => store.set_checkpoint(obs.network(), &anchor)?,
+        None => {}
     }
     Ok(())
 }
@@ -754,9 +797,15 @@ fn now_ms() -> Option<u64> {
 }
 
 /// A digest of a state, to tell an unchanged forward PUT from a new one.
-fn state_digest(state: &freenet_bitcoin_common::address_state::BitcoinAddressStateV1) -> [u8; 32] {
-    let bytes = freenet_bitcoin_common::to_cbor(state).unwrap_or_default();
-    *blake3::hash(&bytes).as_bytes()
+///
+/// `None` for a state that will not encode, rather than a digest of nothing:
+/// every unencodable state would otherwise share one digest and be taken for
+/// the same state.
+fn state_digest(
+    state: &freenet_bitcoin_common::address_state::BitcoinAddressStateV1,
+) -> Option<[u8; 32]> {
+    let bytes = freenet_bitcoin_common::to_cbor(state).ok()?;
+    Some(*blake3::hash(&bytes).as_bytes())
 }
 
 /// Parse a human-readable Bitcoin address into canonical `scriptPubKey` bytes.
@@ -1037,6 +1086,11 @@ mod migration_wiring_pins {
                 concat!("let (after, seal) = count_", "walk(before, counted, now);"),
                 "the seal is no longer decided by count_walk, so one walk can \
                  record a migration as finished",
+            ),
+            (
+                concat!("if round.is_", "empty() {"),
+                "the checkpoint no longer waits on a round with claims to \
+                 publish, so a payment whose publish failed is never rescanned",
             ),
             (
                 concat!(
