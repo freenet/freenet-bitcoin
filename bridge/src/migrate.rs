@@ -217,7 +217,10 @@ pub fn agreement(found: Found, published_forward: bool) -> Walk {
 pub const WALK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// How far apart two walks must be to count as separate evidence.
-pub const SEAL_SPACING_MS: u64 = 6 * 60 * 60 * 1000;
+pub const SEAL_SPACING: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// [`SEAL_SPACING`] in milliseconds, for the persisted wall-clock stamp.
+pub const SEAL_SPACING_MS: u64 = SEAL_SPACING.as_millis() as u64;
 
 /// How many separate walks must agree before a migration is recorded as
 /// finished.
@@ -271,9 +274,12 @@ pub fn count_walk(prev: Agreement, walk: Walk, now_ms: u64) -> (Agreement, bool)
     if walk == Walk::ProvesNothing {
         return (prev, false);
     }
-    let separate = prev
-        .last_counted_ms
-        .is_none_or(|last| now_ms.saturating_sub(last) >= SEAL_SPACING_MS);
+    let separate = prev.last_counted_ms.is_none_or(|last| {
+        // A stamp in the future is a clock that ran fast and was corrected.
+        // Without this the address waits for real time to catch up, which can
+        // be years: treat it as counted now and carry on.
+        last > now_ms || now_ms - last >= SEAL_SPACING_MS
+    });
     if !separate {
         return (prev, false);
     }
@@ -293,25 +299,74 @@ pub fn count_walk(prev: Agreement, walk: Walk, now_ms: u64) -> (Agreement, bool)
 /// [`WALK_INTERVAL`]. Publishing is not held back meanwhile: the walk reads
 /// only predecessor keys, never the current one, so it cannot read back what
 /// this bridge has just written.
-#[derive(Default)]
+/// # Why nothing is walked for the first [`WALK_INTERVAL`]
+///
+/// This clock is in memory, so every address is due the moment a process
+/// starts. The agreement count is not in memory, so a walk taken seconds
+/// after launch can be the one that counts, and with walks six hours apart it
+/// is usually the ONLY one that can count in its window. A just-started
+/// node's GET dead-ends for want of peers and answers `NotFound` like any
+/// other, so that arrangement drew the evidence for a permanent decision from
+/// the least trustworthy moment available. Nothing is walked until the node
+/// has had this long to find peers.
+///
+/// # Why an agreeing walk waits longer
+///
+/// Nothing a walk finds can be counted until [`SEAL_SPACING`] after the last
+/// one that was, so walking every ten minutes in between only re-sends GETs,
+/// and re-PUTs a recovered state that has not changed. A walk that agreed is
+/// therefore not repeated until it could count again; one that proved nothing
+/// is retried on the shorter interval, because it may be a transient failure.
 pub struct WalkClock {
+    started: std::time::Instant,
     next: std::collections::HashMap<Vec<u8>, std::time::Instant>,
+    /// What was last published forward for an address, so an unchanged
+    /// recovery is not re-sent on every walk.
+    published: std::collections::HashMap<Vec<u8>, [u8; 32]>,
+}
+
+impl Default for WalkClock {
+    fn default() -> Self {
+        WalkClock {
+            started: std::time::Instant::now(),
+            next: std::collections::HashMap::new(),
+            published: std::collections::HashMap::new(),
+        }
+    }
 }
 
 impl WalkClock {
     /// Whether `address` is due a walk.
     pub fn due(&self, address: &[u8], now: std::time::Instant) -> bool {
+        if now.saturating_duration_since(self.started) < WALK_INTERVAL {
+            return false;
+        }
         self.next.get(address).is_none_or(|next| now >= *next)
     }
 
-    /// Record that a walk just ran.
-    pub fn walked(&mut self, address: &[u8], now: std::time::Instant) {
-        self.next.insert(address.to_vec(), now + WALK_INTERVAL);
+    /// Record that a walk just ran, and when the next one is worth taking.
+    pub fn walked(&mut self, address: &[u8], walk: Walk, now: std::time::Instant) {
+        let wait = match walk {
+            Walk::Agrees => SEAL_SPACING,
+            Walk::ProvesNothing => WALK_INTERVAL,
+        };
+        self.next.insert(address.to_vec(), now + wait);
+    }
+
+    /// Whether `digest` is worth publishing forward, or is what was last
+    /// published for this address.
+    pub fn publish_is_new(&mut self, address: &[u8], digest: [u8; 32]) -> bool {
+        if self.published.get(address) == Some(&digest) {
+            return false;
+        }
+        self.published.insert(address.to_vec(), digest);
+        true
     }
 
     /// Forget an address, once its migration is recorded as finished.
     pub fn forget(&mut self, address: &[u8]) {
         self.next.remove(address);
+        self.published.remove(address);
     }
 }
 
@@ -616,15 +671,59 @@ mod walk_tests {
     }
 
     #[test]
-    fn an_address_is_walked_at_once_and_then_not_again_until_the_interval() {
-        let mut clock = WalkClock::default();
+    fn nothing_is_walked_until_the_node_has_had_time_to_find_peers() {
+        let clock = WalkClock::default();
         let t0 = Instant::now();
-        assert!(clock.due(b"a", t0));
-        clock.walked(b"a", t0);
+        assert!(!clock.due(b"a", t0), "a just-started node has few peers");
         assert!(!clock.due(b"a", t0 + WALK_INTERVAL - Duration::from_secs(1)));
         assert!(clock.due(b"a", t0 + WALK_INTERVAL));
+    }
+
+    #[test]
+    fn a_walk_that_agreed_waits_until_it_could_count_again() {
+        let mut clock = WalkClock::default();
+        let t0 = Instant::now() + WALK_INTERVAL;
+        clock.walked(b"a", Walk::Agrees, t0);
+        assert!(
+            !clock.due(b"a", t0 + SEAL_SPACING - Duration::from_secs(1)),
+            "nothing it found could be counted before the spacing anyway"
+        );
+        assert!(clock.due(b"a", t0 + SEAL_SPACING));
+
+        clock.walked(b"a", Walk::ProvesNothing, t0);
+        assert!(
+            clock.due(b"a", t0 + WALK_INTERVAL),
+            "a walk that proved nothing may have failed transiently"
+        );
         assert!(clock.due(b"b", t0), "another address has its own pace");
         clock.forget(b"a");
         assert!(clock.due(b"a", t0));
+    }
+
+    #[test]
+    fn an_unchanged_recovery_is_not_published_again() {
+        let mut clock = WalkClock::default();
+        assert!(clock.publish_is_new(b"a", [1; 32]));
+        assert!(!clock.publish_is_new(b"a", [1; 32]));
+        assert!(
+            clock.publish_is_new(b"a", [2; 32]),
+            "changed, so worth sending"
+        );
+        assert!(clock.publish_is_new(b"b", [1; 32]), "a different address");
+        clock.forget(b"a");
+        assert!(
+            clock.publish_is_new(b"a", [2; 32]),
+            "forgotten, so sent again"
+        );
+    }
+
+    #[test]
+    fn a_stamp_from_a_clock_that_ran_fast_does_not_strand_an_address() {
+        let future = Agreement {
+            walks: 1,
+            last_counted_ms: Some(10_000_000_000_000),
+        };
+        let (after, _) = count_walk(future, Walk::Agrees, 1_700_000_000_000);
+        assert_eq!(after.walks, 2, "counted now rather than waiting for years");
     }
 }

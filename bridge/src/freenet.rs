@@ -116,11 +116,12 @@ impl Link {
         if let Some(at) = self.retry_at {
             let now = Instant::now();
             if now < at {
-                return Err(anyhow!(
+                return Err(LinkUnusable(format!(
                     "the Freenet node at {} was unreachable; next attempt in {}ms",
                     self.ws_url,
                     (at - now).as_millis()
-                ));
+                ))
+                .into());
             }
         }
         match Self::open(&self.ws_url).await {
@@ -132,7 +133,7 @@ impl Link {
             Err(e) => {
                 self.retry_at = Some(Instant::now() + jittered(self.backoff));
                 self.backoff = (self.backoff * 2).min(RECONNECT_BACKOFF_MAX);
-                Err(e)
+                Err(LinkUnusable(format!("{e:#}")).into())
             }
         }
     }
@@ -151,16 +152,17 @@ impl Link {
         let mut api = self.connection().await?;
         match tokio::time::timeout(SEND_TIMEOUT, api.send(ClientRequest::ContractOp(req))).await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(anyhow!("sending to the node: {e}")),
+            Ok(Err(e)) => return Err(LinkUnusable(format!("sending to the node: {e}")).into()),
             Err(_) => {
-                return Err(anyhow!(
-                    "timed out handing a request to the node connection"
-                ))
+                return Err(LinkUnusable(
+                    "timed out handing a request to the node connection".to_string(),
+                )
+                .into())
             }
         }
         let reply = tokio::time::timeout(timeout, api.recv())
             .await
-            .map_err(|_| anyhow!("timed out waiting for the node's reply"))?;
+            .map_err(|_| LinkUnusable("timed out waiting for the node's reply".to_string()))?;
         if reply.is_ok() {
             self.api = Some(api);
         }
@@ -172,6 +174,29 @@ impl Link {
     fn discard(&mut self) {
         self.api = None;
     }
+}
+
+/// The link to the node could not carry a request.
+///
+/// Distinguished from every other publish failure because it says something
+/// about the CONNECTION rather than about what was being published: a caller
+/// that is about to make the same call for another contract will fail the
+/// same way, and can stop. A claim the node rejected, or one this bridge
+/// refuses to publish, says nothing about the next one.
+#[derive(Debug)]
+pub struct LinkUnusable(pub String);
+
+impl std::fmt::Display for LinkUnusable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LinkUnusable {}
+
+/// Whether `e` is [`LinkUnusable`], however deeply it is wrapped.
+pub fn link_unusable(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| cause.is::<LinkUnusable>())
 }
 
 /// `base` scaled by a factor between 0.8 and 1.2, so a restart of the node

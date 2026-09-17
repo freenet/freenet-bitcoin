@@ -215,8 +215,8 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
     // under a backoff, so a node that is slow or not yet up at startup costs a
     // few failed rounds rather than a process that publishes nothing until
     // somebody restarts it.
-    let publisher = Some(Arc::new(FreenetPublisher::new(&cfg.freenet_ws, &wasm)));
-    let address_code_hash = publisher.as_ref().map(|p| p.address_code_hash());
+    let publisher = Arc::new(FreenetPublisher::new(&cfg.freenet_ws, &wasm));
+    let address_code_hash = Some(publisher.address_code_hash());
 
     // If the contract WASM changed since last run, every instance has moved to
     // a new key and the "already published" record refers to contracts nobody
@@ -271,7 +271,8 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
     // what readers will look for. Readers derive it themselves: the tip
     // generation pointer names the code hash, and `BitcoinTipParameters` is
     // the network plus the bridges they already trust.
-    if let Some(p) = publisher.as_ref() {
+    {
+        let p = publisher.as_ref();
         for net_cfg in &cfg.networks {
             let params = freenet_bitcoin_common::BitcoinTipParameters {
                 network: net_cfg.network,
@@ -295,10 +296,7 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
     // which the bridge has already stopped writing to -- and a reader cannot
     // tell that from "no payments yet", which is the whole failure being
     // removed here.
-    let mut pointers_ok = true;
-    if let Some(p) = publisher.as_ref() {
-        pointers_ok = publish_pointers_logged(p, &signer, &store).await;
-    }
+    let pointers_ok = publish_pointers_logged(publisher.as_ref(), &signer, &store).await;
 
     // The inbox worker gets its own OS thread, runtime, SQLite connection and
     // Freenet connection, for the same reasons as the observer below.
@@ -426,7 +424,7 @@ async fn observation_loop(
     cfg: BridgeConfig,
     signer: Signer,
     store: Store,
-    publisher: Option<Arc<FreenetPublisher>>,
+    publisher: Arc<FreenetPublisher>,
     pointers_ok: bool,
 ) {
     let mut observers: Vec<Observer> = Vec::new();
@@ -446,17 +444,14 @@ async fn observation_loop(
 
     loop {
         for obs in &observers {
-            if let Err(e) =
-                observe_once(obs, &signer, &store, publisher.as_deref(), &mut walks).await
+            if let Err(e) = observe_once(obs, &signer, &store, publisher.as_ref(), &mut walks).await
             {
                 tracing::error!(network = ?obs.network(), "observation round failed: {e}");
             }
         }
-        if let Some(p) = publisher.as_deref() {
-            if std::time::Instant::now() >= pointers_due {
-                let ok = publish_pointers_logged(p, &signer, &store).await;
-                pointers_due = std::time::Instant::now() + pointer_wait(ok);
-            }
+        if std::time::Instant::now() >= pointers_due {
+            let ok = publish_pointers_logged(publisher.as_ref(), &signer, &store).await;
+            pointers_due = std::time::Instant::now() + pointer_wait(ok);
         }
         // A short sleep rather than a tight loop. Once the observer has caught
         // up, a round returns almost at once, so this is the polling interval:
@@ -469,7 +464,7 @@ async fn observe_once(
     obs: &Observer,
     signer: &Signer,
     store: &Store,
-    publisher: Option<&FreenetPublisher>,
+    publisher: &FreenetPublisher,
     walks: &mut bitcoin_freenet_bridge::migrate::WalkClock,
 ) -> Result<()> {
     // While the node is still doing initial block download, an absence of
@@ -579,11 +574,6 @@ async fn observe_once(
 
     store.prune_blocks(obs.network(), Store::BLOCKS_KEPT)?;
 
-    let Some(publisher) = publisher else {
-        tracing::debug!("no Freenet connection; observations recorded but not published");
-        return Ok(());
-    };
-
     for (script, script_claims) in round.into_by_script() {
         let params = obs.address_params(&script, signer.bridge_id());
 
@@ -608,45 +598,65 @@ async fn observe_once(
             .unwrap_or(false);
         if !already && walks.due(&instance_key, std::time::Instant::now()) {
             use bitcoin_freenet_bridge::migrate::{agreement, count_walk};
-            walks.walked(&instance_key, std::time::Instant::now());
             let local = freenet_bitcoin_common::address_state::BitcoinAddressStateV1::default();
             let (merged, note, found) = publisher.migrate_address_forward(&params, local).await;
             // Published whenever the walk recovered anything, complete or
             // not: a fold that reached some predecessors and not others holds
             // real claims, and dropping them because the walk was incomplete
-            // would lose exactly what the migration exists to carry.
-            let published = if found.has_state() {
+            // would lose exactly what the migration exists to carry. Skipped
+            // only when it is byte-for-byte what was last published for this
+            // address, since a predecessor holds its state indefinitely and
+            // the same merge would otherwise be re-sent on every walk.
+            let published = if !found.has_state() {
+                tracing::debug!(script = %hex::encode(&script), "{note}");
+                false
+            } else if !walks.publish_is_new(&instance_key, state_digest(&merged)) {
+                tracing::debug!(script = %hex::encode(&script), "{note} (already published)");
+                true
+            } else {
                 match publisher.publish_state(&params, &merged).await {
                     Ok(_) => {
                         tracing::info!(script = %hex::encode(&script), "{note}");
                         true
                     }
                     Err(e) => {
-                        tracing::error!("forward PUT after migration failed: {e}");
+                        tracing::error!("forward PUT after migration failed: {e:#}");
                         false
                     }
                 }
-            } else {
-                tracing::debug!(script = %hex::encode(&script), "{note}");
-                false
             };
             let counted = agreement(found, published);
-            let before = store
-                .migration_agreement(&instance_key, &code_hash)
-                .unwrap_or_default();
-            let (after, seal) = count_walk(before, counted, now_ms());
-            if after != before {
-                if let Err(e) = store.set_migration_agreement(&instance_key, &code_hash, after) {
-                    tracing::warn!("recording a migration walk failed: {e}");
+            walks.walked(&instance_key, counted, std::time::Instant::now());
+            match now_ms() {
+                Some(now) => {
+                    let before = store
+                        .migration_agreement(&instance_key, &code_hash)
+                        .unwrap_or_default();
+                    let (after, seal) = count_walk(before, counted, now);
+                    if after != before {
+                        if let Err(e) =
+                            store.set_migration_agreement(&instance_key, &code_hash, after)
+                        {
+                            tracing::warn!("recording a migration walk failed: {e}");
+                        }
+                    }
+                    if seal {
+                        match store.set_migration_done(&instance_key, &code_hash, &note) {
+                            Ok(()) => walks.forget(&instance_key),
+                            // Left unsealed rather than treated as sealed,
+                            // which costs GETs and not evidence: the count is
+                            // persisted, so the next spaced walk seals again.
+                            Err(e) => {
+                                tracing::warn!("recording a finished migration failed: {e}")
+                            }
+                        }
+                    }
                 }
-            }
-            if seal {
-                match store.set_migration_done(&instance_key, &code_hash, &note) {
-                    Ok(()) => walks.forget(&instance_key),
-                    // Left unsealed rather than treated as sealed: the walks
-                    // start over, which costs GETs, not evidence.
-                    Err(e) => tracing::warn!("recording a finished migration failed: {e}"),
-                }
+                // Nothing is counted against a clock this broken, rather than
+                // counting everything against the epoch.
+                None => tracing::warn!(
+                    "the system clock reads before 1970, so migration walks cannot be dated"
+                ),
             }
         }
 
@@ -672,15 +682,23 @@ async fn observe_once(
                 claims = fresh.len(),
                 "published Bitcoin observations"
             ),
-            Err(e) => {
-                // The remaining scripts are abandoned. Claims stay unmarked so
-                // they are retried, and with the node unreachable every one of
-                // them would otherwise pay its own connect and request
-                // timeouts, per script, on every round. The tip publish below
-                // still gets its one attempt: a signed tip is what lets a
-                // buyer prove how deep a payment is, and it costs one request.
-                tracing::error!("publishing observations failed, abandoning the round: {e}");
+            Err(e) if bitcoin_freenet_bridge::freenet::link_unusable(&e) => {
+                // The remaining scripts are abandoned, because the next one
+                // fails the same way: with the node unreachable each would
+                // otherwise pay its own connect and request timeouts, per
+                // script, on every round. Claims stay unmarked so they are
+                // retried. The tip publish below still gets its one attempt: a
+                // signed tip is what lets a buyer prove how deep a payment is,
+                // and against an armed backoff it fails fast.
+                tracing::error!("the node could not be reached, abandoning the round: {e:#}");
                 break;
+            }
+            Err(e) => {
+                // Anything else says something about THIS script's claims --
+                // a claim this bridge will not publish, or one the contract
+                // refused -- and nothing about the next script's, so the round
+                // carries on.
+                tracing::error!(script = %hex::encode(&script), "publishing observations failed, will retry: {e:#}");
             }
         }
     }
@@ -723,11 +741,21 @@ fn mark_claims_if_published(
 }
 
 /// Wall-clock milliseconds, for evidence that has to outlive the process.
-fn now_ms() -> u64 {
+///
+/// `None` for a clock reading before 1970, rather than 0: dating every walk to
+/// the epoch would make them all look spaced apart, and `Store::open` already
+/// refuses such a clock rather than silently granting nothing.
+fn now_ms() -> Option<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
+        .ok()
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+}
+
+/// A digest of a state, to tell an unchanged forward PUT from a new one.
+fn state_digest(state: &freenet_bitcoin_common::address_state::BitcoinAddressStateV1) -> [u8; 32] {
+    let bytes = freenet_bitcoin_common::to_cbor(state).unwrap_or_default();
+    *blake3::hash(&bytes).as_bytes()
 }
 
 /// Parse a human-readable Bitcoin address into canonical `scriptPubKey` bytes.
@@ -968,6 +996,59 @@ async fn verify_address(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod migration_wiring_pins {
+    /// **The migration step's wiring, which no test here can execute.**
+    ///
+    /// `observe_once` needs a live bitcoind, so the decisions it strings
+    /// together are only reachable from source. Every piece is unit-tested on
+    /// its own (`Found::has_state`, `agreement`, `count_walk`, `WalkClock`),
+    /// and round 2 of review still found a bug in the WIRING: the publish was
+    /// gated on the agreement verdict rather than on what the walk found, so a
+    /// partial recovery was dropped while every unit test stayed green.
+    ///
+    /// Needles are split with `concat!` because `include_str!("main.rs")`
+    /// pulls in this test too, so a needle written as one literal is satisfied
+    /// by its own source text. `observe_once_takes_its_ceiling_from_the_reorg_outcome`
+    /// gives the full account of that trap.
+    #[test]
+    fn the_seal_is_decided_by_spaced_agreement_and_the_publish_by_what_was_found() {
+        let src = include_str!("main.rs");
+        for (needle, why) in [
+            (
+                concat!("if !already && walks.due(", "&instance_key"),
+                "an unsealed address is no longer walked on the walk clock, so \
+                 every round re-sends its predecessor GETs",
+            ),
+            (
+                concat!("let published = if !found.", "has_state() {"),
+                "the forward PUT is no longer gated on what the walk FOUND, so \
+                 a partial recovery is dropped instead of published",
+            ),
+            (
+                concat!("let counted = agree", "ment(found, published);"),
+                "the agreement verdict no longer accounts for whether the \
+                 forward PUT succeeded",
+            ),
+            (
+                concat!("let (after, seal) = count_", "walk(before, counted, now);"),
+                "the seal is no longer decided by count_walk, so one walk can \
+                 record a migration as finished",
+            ),
+            (
+                concat!(
+                    "store.set_migration_done(",
+                    "&instance_key, &code_hash, &note)"
+                ),
+                "the seal is no longer recorded against the contract instance \
+                 id, which is what keeps signet's seal off mainnet",
+            ),
+        ] {
+            assert!(src.contains(needle), "{why}");
+        }
+    }
 }
 
 #[cfg(test)]

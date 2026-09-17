@@ -340,10 +340,12 @@ impl Store {
 
             -- Migration outcomes, recorded per (contract instance, generation).
             --
-            -- Written ONLY for a DEFINITIVE outcome -- a recovery, or a walk in
-            -- which every predecessor positively answered. An indeterminate
-            -- walk (some predecessor never replied) writes nothing and is
-            -- retried on the next run, because a marker saying "predecessor had
+            -- Written ONLY once SEVERAL SEPARATE walks agree: see
+            -- `migrate::count_walk`, which holds the rule and explains why one
+            -- walk cannot decide it (a node answers NotFound when its GET runs
+            -- out of retries, whether or not the contract exists). A walk that
+            -- proves nothing writes nothing and is retried, because a marker
+            -- saying "predecessor had
             -- nothing" is permanent and can never be taken back.
             CREATE TABLE IF NOT EXISTS migration_done (
                 instance_id BLOB NOT NULL,
@@ -922,11 +924,13 @@ impl Store {
         Ok(())
     }
 
-    /// Record a DEFINITIVE migration outcome.
+    /// Record a migration as finished, permanently.
     ///
-    /// Never call this for an indeterminate walk. The marker is permanent, so
-    /// recording "nothing to recover" over a predecessor that merely failed to
-    /// answer would make its data unreachable for good.
+    /// Only [`crate::migrate::count_walk`] may decide this, and only after
+    /// several separate walks agree. The marker stops that address ever being
+    /// probed again, so recording "nothing to recover" over a predecessor that
+    /// merely failed to answer would make its data unreachable for good, and a
+    /// single walk cannot tell the two apart.
     pub fn set_migration_done(
         &self,
         instance_id: &[u8],
@@ -2469,7 +2473,7 @@ mod agreement_tests {
         assert_eq!(
             s.migration_agreement(b"instance", &[8; 32]).unwrap(),
             Agreement::default(),
-            "a re-key starts the evidence over"
+            "a different generation has its own evidence"
         );
     }
 }
