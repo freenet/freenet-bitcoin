@@ -300,6 +300,20 @@ pub fn count_walk(prev: Agreement, walk: Walk, now_ms: u64) -> (Agreement, bool)
     (next, next.walks >= SEAL_AFTER_WALKS)
 }
 
+/// How many rounds in a row a network's scan checkpoint may be held back
+/// because the node could not be reached.
+///
+/// At about two seconds a round this is a few minutes. Holding the checkpoint
+/// keeps a block whose claims failed to publish from being skipped, which is
+/// the whole point, but held forever it stops the observer ever scanning past
+/// that window: one address whose UPDATE always times out would freeze every
+/// other address on the network, silently, and a restart would re-establish
+/// the freeze further back. So the hold has a bound, and reaching it is an
+/// error the operator can see, naming the heights given up on. A first-sight
+/// claim abandoned that way is re-asserted by the deep-confirmation ladder a
+/// block or two later; a frozen observer recovers on its own never.
+pub const MAX_HELD_ROUNDS: u32 = 120;
+
 /// When each address is next due a walk.
 ///
 /// Until sealed, a walk re-sends a GET for every predecessor. Run on every

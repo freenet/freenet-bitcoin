@@ -223,8 +223,8 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
     // reads. Discard it, or the successor contracts come up empty and stay
     // that way -- indistinguishable from an address with no activity.
     {
-        let h = address_code_hash;
-        match store.set_publish_generation(&h) {
+        let h = &address_code_hash;
+        match store.set_publish_generation(h) {
             Ok(true) => tracing::warn!(
                 code_hash = %hex::encode(h),
                 "contract WASM changed since last run; re-publishing all observations \
@@ -442,10 +442,21 @@ async fn observation_loop(
     // an unchanged record is harmless.
     let mut pointers_due = std::time::Instant::now() + pointer_wait(pointers_ok);
     let mut walks = bitcoin_freenet_bridge::migrate::WalkClock::default();
+    // Per network, how many rounds in a row its checkpoint has been held back.
+    let mut held_rounds: std::collections::HashMap<BitcoinNetwork, u32> =
+        std::collections::HashMap::new();
 
     loop {
         for obs in &observers {
-            if let Err(e) = observe_once(obs, &signer, &store, publisher.as_ref(), &mut walks).await
+            if let Err(e) = observe_once(
+                obs,
+                &signer,
+                &store,
+                publisher.as_ref(),
+                &mut walks,
+                &mut held_rounds,
+            )
+            .await
             {
                 tracing::error!(network = ?obs.network(), "observation round failed: {e}");
             }
@@ -467,6 +478,7 @@ async fn observe_once(
     store: &Store,
     publisher: &FreenetPublisher,
     walks: &mut bitcoin_freenet_bridge::migrate::WalkClock,
+    held_rounds: &mut std::collections::HashMap<BitcoinNetwork, u32>,
 ) -> Result<()> {
     // While the node is still doing initial block download, an absence of
     // payments means nothing, so publishing "scanned to height N" would be an
@@ -758,14 +770,44 @@ async fn observe_once(
 
     match deferred_checkpoint {
         // Kept, so the next round scans these blocks again and re-signs the
-        // claims that did not get out. Re-publishing what did is harmless:
-        // the state is a digest-keyed set and `is_published` skips it.
-        Some(_) if node_unreachable => tracing::warn!(
-            network = ?obs.network(),
-            "the node could not be reached, so the blocks just scanned are kept for the next round"
-        ),
-        Some(anchor) => store.set_checkpoint(obs.network(), &anchor)?,
-        None => {}
+        // `claims_from_block` claims that did not get out. Re-publishing what
+        // did is harmless: the state is a digest-keyed set and `is_published`
+        // skips it. Retractions and deep rungs are NOT covered, because the
+        // state they are derived from is consumed before this point (#24).
+        Some(anchor) if node_unreachable => {
+            let held = held_rounds.entry(obs.network()).or_insert(0);
+            *held += 1;
+            if *held <= bitcoin_freenet_bridge::migrate::MAX_HELD_ROUNDS {
+                tracing::warn!(
+                    network = ?obs.network(),
+                    held_rounds = *held,
+                    through = anchor.height,
+                    "the node could not be reached, so the blocks just scanned are kept"
+                );
+            } else {
+                // Given up on, so one address whose publish always fails
+                // cannot freeze the observer here for the life of the
+                // process. See `MAX_HELD_ROUNDS`.
+                tracing::error!(
+                    network = ?obs.network(),
+                    held_rounds = *held,
+                    from = next,
+                    through = anchor.height,
+                    "the node has been unreachable for every round since this window was \
+                     first scanned; moving past it, so a first-sight claim in those blocks \
+                     is published only when the deep-confirmation ladder re-asserts it"
+                );
+                store.set_checkpoint(obs.network(), &anchor)?;
+                *held = 0;
+            }
+        }
+        Some(anchor) => {
+            store.set_checkpoint(obs.network(), &anchor)?;
+            held_rounds.remove(&obs.network());
+        }
+        None => {
+            held_rounds.remove(&obs.network());
+        }
     }
     Ok(())
 }

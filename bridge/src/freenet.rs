@@ -131,8 +131,7 @@ impl Link {
                 Ok(api)
             }
             Err(e) => {
-                self.retry_at = Some(Instant::now() + jittered(self.backoff));
-                self.backoff = (self.backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                self.arm_backoff();
                 Err(LinkUnusable(format!("{e:#}")).into())
             }
         }
@@ -170,11 +169,23 @@ impl Link {
             // the error says about the NODE is worth passing on, so a caller
             // about to make the same request for another contract can stop.
             Err(e) if reply_is_about_the_node(e.kind()) => {
-                return Err(LinkUnusable(format!("the node answered: {e}")).into())
+                // Backed off as if the dial had failed. The dial did NOT fail
+                // -- a node that answers "not joined yet" is listening -- so
+                // without this the bridge opens a fresh connection per request
+                // for the whole of that window, which is the node's worst
+                // moment to be hammered.
+                self.arm_backoff();
+                return Err(LinkUnusable(format!("the node answered: {e}")).into());
             }
             Err(_) => {}
         }
         Ok(reply)
+    }
+
+    /// Wait before dialling again, as if a dial had just failed.
+    fn arm_backoff(&mut self) {
+        self.retry_at = Some(Instant::now() + jittered(self.backoff));
+        self.backoff = (self.backoff * 2).min(RECONNECT_BACKOFF_MAX);
     }
 
     /// Drop the connection, after a reply that is not the answer to what was
@@ -1249,27 +1260,83 @@ mod link_tests {
     /// particular to one address) or hammers a node that has not joined yet,
     /// once per script, every two seconds.
     #[tokio::test]
-    async fn only_a_failure_about_the_node_is_link_unusable() {
-        let asked = key(1);
-        let node = node(Arc::new(move |connection, _| match connection {
-            0 => Action::Reply(Err(ClientError::from(ErrorKind::PeerNotJoined))),
-            1 => Action::Reply(get_response(key(2), vec![9])),
-            _ => Action::Reply(Err(ClientError::from(ErrorKind::Shutdown))),
+    async fn a_failure_about_the_node_is_link_unusable_and_backs_off() {
+        let node = node(Arc::new(|_, _| {
+            Action::Reply(Err(ClientError::from(ErrorKind::PeerNotJoined)))
         }))
         .await;
         let publisher = publisher(&node.url).await;
 
-        let not_joined = publisher.get_state(asked).await.unwrap_err();
+        let not_joined = publisher.get_state(key(1)).await.unwrap_err();
         assert!(link_unusable(&not_joined), "{not_joined:#}");
 
-        let wrong_contract = publisher.get_state(asked).await.unwrap_err();
+        // A node answering "not joined yet" is listening, so the dial
+        // succeeds; without arming the backoff the bridge would open a fresh
+        // connection per request for the whole of that window.
+        let backed_off = publisher.get_state(key(1)).await.unwrap_err();
         assert!(
-            !link_unusable(&wrong_contract),
-            "an answer about another contract says nothing about the node: {wrong_contract:#}"
+            format!("{backed_off:#}").contains("next attempt"),
+            "{backed_off:#}"
         );
+        assert_eq!(
+            node.connections.load(Ordering::SeqCst),
+            1,
+            "the second request did not dial again"
+        );
+    }
 
-        let shutting_down = publisher.get_state(asked).await.unwrap_err();
-        assert!(link_unusable(&shutting_down), "{shutting_down:#}");
+    #[tokio::test]
+    async fn a_failure_about_the_request_is_not_link_unusable() {
+        let asked = key(1);
+        let node = node(Arc::new(move |connection, _| {
+            if connection == 0 {
+                // An answer about another contract: this request's problem,
+                // not the node's.
+                Action::Reply(get_response(key(2), vec![9]))
+            } else {
+                Action::Reply(get_response(asked, vec![5]))
+            }
+        }))
+        .await;
+        let publisher = publisher(&node.url).await;
+
+        let wrong_contract = publisher.get_state(asked).await.unwrap_err();
+        assert!(!link_unusable(&wrong_contract), "{wrong_contract:#}");
+        assert_eq!(
+            publisher.get_state(asked).await.unwrap(),
+            vec![5],
+            "so the next request is tried at once, on a fresh connection"
+        );
+    }
+
+    /// Every kind in the node-level list, and two that are not.
+    #[test]
+    fn the_node_level_error_kinds_are_the_list_that_decides() {
+        for kind in [
+            ErrorKind::EmptyRing,
+            ErrorKind::PeerNotJoined,
+            ErrorKind::NodeUnavailable,
+            ErrorKind::Disconnect,
+            ErrorKind::ChannelClosed,
+            ErrorKind::TransportProtocolDisconnect,
+            ErrorKind::Shutdown,
+        ] {
+            assert!(
+                reply_is_about_the_node(&kind),
+                "{kind:?} says the next request fails the same way"
+            );
+        }
+        for kind in [
+            ErrorKind::FailedOperation,
+            ErrorKind::OperationError {
+                cause: "a contract refused it".into(),
+            },
+        ] {
+            assert!(
+                !reply_is_about_the_node(&kind),
+                "{kind:?} is about this request"
+            );
+        }
     }
 
     #[tokio::test]

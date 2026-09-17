@@ -333,6 +333,14 @@ impl Observer {
 
         store.unconfirm_above(self.cfg.network, fork)?;
         store.forget_blocks_above(self.cfg.network, fork)?;
+        // The checkpoint may name a block above the fork, which the line above
+        // has just deleted. Left there, the next round finds no record at that
+        // height, takes it for a fresh fork, and resumes ABOVE it -- skipping
+        // the replacement blocks. That could not happen while the checkpoint
+        // advanced inside the scan loop, because the first block scanned
+        // overwrote it; it can now that a round holds the checkpoint back
+        // until its claims are published.
+        store.rewind_checkpoint_to(self.cfg.network, fork)?;
         Ok(ReorgOutcome {
             resume_from: fork + 1,
             orphaned,
