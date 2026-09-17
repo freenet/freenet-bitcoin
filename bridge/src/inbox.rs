@@ -1037,9 +1037,20 @@ impl InboxWorker {
 
     /// One connection's worth of serving. Returns only with an error.
     async fn session(&self, floor_armed_at: &mut Option<Instant>) -> Result<()> {
-        let (stream, _) = tokio_tungstenite::connect_async(&self.ws_url)
-            .await
-            .with_context(|| format!("connecting to the Freenet node at {}", self.ws_url))?;
+        // Bounded for the same reason the observer's connect is: a connect
+        // that hangs is a session that never starts and never reports.
+        let (stream, _) = tokio::time::timeout(
+            crate::freenet::CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async(&self.ws_url),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "timed out connecting to the Freenet node at {}",
+                self.ws_url
+            )
+        })?
+        .with_context(|| format!("connecting to the Freenet node at {}", self.ws_url))?;
         let mut api = WebApi::start(stream);
         let store = Store::open(&self.db_path)?;
         let observed: Vec<BitcoinNetwork> = self.networks.iter().map(|n| n.network).collect();
@@ -1346,10 +1357,21 @@ fn read(key: ContractKey) -> ContractRequest<'static> {
     }
 }
 
+/// Hand one request to the connection, or give up on the connection.
+///
+/// A step can send several requests without reading in between, and the
+/// client's channels hold one message each, so a node that answers quickly
+/// can leave the client's task waiting to deliver a reply while this waits to
+/// hand it a request. Neither would ever move. Timing out ends the session,
+/// and `run` reconnects. See `freenet::Link` for the observer's side of this.
 async fn send(api: &mut WebApi, req: ContractRequest<'static>) -> Result<()> {
-    api.send(ClientRequest::ContractOp(req))
-        .await
-        .map_err(|e| anyhow!("sending to the node: {e}"))
+    tokio::time::timeout(
+        crate::freenet::SEND_TIMEOUT,
+        api.send(ClientRequest::ContractOp(req)),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out handing a request to the node connection"))?
+    .map_err(|e| anyhow!("sending to the node: {e}"))
 }
 
 fn connection_lost(kind: &ErrorKind) -> bool {

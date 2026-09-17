@@ -322,12 +322,30 @@ impl Store {
                 code_hash      BLOB NOT NULL
             );
 
+            -- How many separate walks over an address's predecessors have
+            -- agreed, per (contract instance, generation).
+            --
+            -- Persisted because the walks that have to agree are hours apart
+            -- (see `migrate::count_walk`) and a bridge restarts more often
+            -- than that. Held only in memory, an address would never reach the
+            -- count and would pay its predecessor GETs for the life of the
+            -- process. Losing this table only delays a seal.
+            CREATE TABLE IF NOT EXISTS migration_agreement (
+                instance_id     BLOB NOT NULL,
+                generation      BLOB NOT NULL,
+                walks           INTEGER NOT NULL,
+                last_counted_ms INTEGER,
+                PRIMARY KEY (instance_id, generation)
+            );
+
             -- Migration outcomes, recorded per (contract instance, generation).
             --
-            -- Written ONLY for a DEFINITIVE outcome -- a recovery, or a walk in
-            -- which every predecessor positively answered. An indeterminate
-            -- walk (some predecessor never replied) writes nothing and is
-            -- retried on the next run, because a marker saying "predecessor had
+            -- Written ONLY once SEVERAL SEPARATE walks agree: see
+            -- `migrate::count_walk`, which holds the rule and explains why one
+            -- walk cannot decide it (a node answers NotFound when its GET runs
+            -- out of retries, whether or not the contract exists). A walk that
+            -- proves nothing writes nothing and is retried, because a marker
+            -- saying "predecessor had
             -- nothing" is permanent and can never be taken back.
             CREATE TABLE IF NOT EXISTS migration_done (
                 instance_id BLOB NOT NULL,
@@ -453,9 +471,11 @@ impl Store {
     }
 
     /// Move the checkpoint back to `height`, never forward, and never create
-    /// one. Only the startup rewinds call this (the demo scripts' backfill and
-    /// the tip contract's refill), before the observer starts. A watch request
-    /// does not: see freenet/freenet-bitcoin#7.
+    /// one. Called by the startup rewinds (the demo scripts' backfill and the
+    /// tip contract's refill) and, mid-round while the observer is running, by
+    /// `Observer::handle_reorg`, which must not leave a held checkpoint naming
+    /// a block it has just forgotten. A watch request does not: see
+    /// freenet/freenet-bitcoin#7.
     ///
     /// Rewinding is safe because rescanning is idempotent: claims are keyed by
     /// digest, so re-observing a payment produces a claim the contract already
@@ -864,11 +884,55 @@ impl Store {
             .unwrap_or(false))
     }
 
-    /// Record a DEFINITIVE migration outcome.
+    /// How many separate walks have agreed for this instance and generation.
+    pub fn migration_agreement(
+        &self,
+        instance_id: &[u8],
+        generation: &[u8; 32],
+    ) -> anyhow::Result<crate::migrate::Agreement> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT walks, last_counted_ms FROM migration_agreement
+                 WHERE instance_id = ?1 AND generation = ?2",
+                params![instance_id, generation.to_vec()],
+                |row| {
+                    Ok(crate::migrate::Agreement {
+                        walks: row.get::<_, i64>(0)? as u32,
+                        last_counted_ms: row.get::<_, Option<i64>>(1)?.map(|ms| ms as u64),
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    pub fn set_migration_agreement(
+        &self,
+        instance_id: &[u8],
+        generation: &[u8; 32],
+        agreement: crate::migrate::Agreement,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO migration_agreement
+             (instance_id, generation, walks, last_counted_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                instance_id,
+                generation.to_vec(),
+                agreement.walks as i64,
+                agreement.last_counted_ms.map(|ms| ms as i64)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record a migration as finished, permanently.
     ///
-    /// Never call this for an indeterminate walk. The marker is permanent, so
-    /// recording "nothing to recover" over a predecessor that merely failed to
-    /// answer would make its data unreachable for good.
+    /// Only [`crate::migrate::count_walk`] may decide this, and only after
+    /// several separate walks agree. The marker stops that address ever being
+    /// probed again, so recording "nothing to recover" over a predecessor that
+    /// merely failed to answer would make its data unreachable for good, and a
+    /// single walk cannot tell the two apart.
     pub fn set_migration_done(
         &self,
         instance_id: &[u8],
@@ -953,7 +1017,29 @@ impl Store {
 
     // --- published claims --------------------------------------------------
 
+    /// Whether a claim has been published.
+    pub fn is_published(
+        &self,
+        net: BitcoinNetwork,
+        script: &[u8],
+        digest: &[u8; 32],
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM published_claims
+                 WHERE network = ?1 AND script_pubkey = ?2 AND claim_digest = ?3",
+                params![net.as_str(), script, digest.to_vec()],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
     /// Record a claim as published. Returns false if it already was.
+    ///
+    /// Call only after the publish succeeded: a claim marked here is never
+    /// sent again.
     pub fn mark_published(
         &self,
         net: BitcoinNetwork,
@@ -2223,7 +2309,9 @@ mod tests {
     fn published_claims_are_reported_new_exactly_once() {
         let s = store();
         let net = BitcoinNetwork::Signet;
+        assert!(!s.is_published(net, b"spk", &[3; 32]).unwrap());
         assert!(s.mark_published(net, b"spk", &[3; 32]).unwrap());
+        assert!(s.is_published(net, b"spk", &[3; 32]).unwrap());
         assert!(!s.mark_published(net, b"spk", &[3; 32]).unwrap());
     }
 
@@ -2353,5 +2441,41 @@ mod migration_marker_tests {
         let gen = [7u8; 32];
         s.set_migration_done(b"a", &gen, "seed_local").unwrap();
         assert!(!s.migration_done(b"b", &gen).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod agreement_tests {
+    use super::*;
+    use crate::migrate::Agreement;
+
+    #[test]
+    fn agreement_survives_reopening_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        let counted = Agreement {
+            walks: 2,
+            last_counted_ms: Some(1_700_000_000_000),
+        };
+        {
+            let s = Store::open(&path).unwrap();
+            assert_eq!(
+                s.migration_agreement(b"instance", &[7; 32]).unwrap(),
+                Agreement::default(),
+                "an address nobody has walked has no evidence"
+            );
+            s.set_migration_agreement(b"instance", &[7; 32], counted)
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.migration_agreement(b"instance", &[7; 32]).unwrap(),
+            counted
+        );
+        assert_eq!(
+            s.migration_agreement(b"instance", &[8; 32]).unwrap(),
+            Agreement::default(),
+            "a different generation has its own evidence"
+        );
     }
 }

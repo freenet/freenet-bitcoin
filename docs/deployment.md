@@ -253,6 +253,16 @@ start the bridge compares its recorded hash at the checkpoint height with what
 the node reports there now; a mismatch means a reorg happened while it was
 down, and it walks back to the fork point and retracts the orphaned outputs.
 
+A round that found payments does not advance the checkpoint until it has
+published them, so a Freenet node that cannot be reached costs a repeated
+scan of the same blocks rather than a payment nobody ever attests. It says
+so at `WARN` each round, naming the height it is holding at. That hold is
+bounded: after `MAX_HELD_ROUNDS` it gives up and moves on, at `ERROR`,
+naming the blocks abandoned. **That error line is the one to alarm on.** It
+means some payment first seen in those blocks will not be published until
+the deep-confirmation ladder re-asserts it at depth 2, and it says the node
+has been unreachable for the whole of that window.
+
 ### The request inbox
 
 The bridge has no network listener. A client asks it to watch a script by
