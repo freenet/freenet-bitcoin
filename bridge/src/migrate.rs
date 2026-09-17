@@ -161,6 +161,15 @@ pub enum Walk {
 impl<S> From<&Outcome<S>> for Walk {
     fn from(outcome: &Outcome<S>) -> Self {
         match outcome {
+            // A recovery that left generations unprobed or unanswered is not
+            // the whole story: under `FoldAll` the fold is missing what those
+            // generations hold, and the crate says to keep the migration open
+            // for a retry rather than record it as finished.
+            Outcome::Recovered {
+                unresolved,
+                truncated_fold,
+                ..
+            } if !unresolved.is_empty() || *truncated_fold => Walk::Unresolved,
             Outcome::Recovered { .. } => Walk::Recovered,
             Outcome::SeedLocal { .. } => Walk::NothingFound,
             _ => Walk::Unresolved,
@@ -172,11 +181,11 @@ impl<S> From<&Outcome<S>> for Walk {
 pub const WALK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// How far apart two walks must be to count as separate evidence.
-pub const SEAL_SPACING: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+pub const SEAL_SPACING: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 
-/// How many separate walks must end with every predecessor answering before a
-/// migration is recorded as finished.
-pub const SEAL_AFTER_WALKS: u32 = 3;
+/// How many separate walks must agree before a migration is recorded as
+/// finished.
+pub const SEAL_AFTER_WALKS: u32 = 4;
 
 /// When to walk an address's predecessors, and when to stop for good.
 ///
@@ -187,11 +196,32 @@ pub const SEAL_AFTER_WALKS: u32 = 3;
 /// "not found" is weak evidence. A node answers `NotFound` when its GET runs
 /// out of retries, whether or not the contract exists, and freenet-migrate
 /// measured that case at about 99.6% of production not-found traffic. So a
-/// walk in which every predecessor answered is counted, and the migration is
-/// sealed only after [`SEAL_AFTER_WALKS`] such walks at least [`SEAL_SPACING`]
-/// apart. A recovered walk counts the same way: what it recovered is already
-/// published forward, and a later walk may still reach a predecessor the
-/// first one could not.
+/// migration is sealed only after [`SEAL_AFTER_WALKS`] walks agree, each at
+/// least [`SEAL_SPACING`] after the last one counted, which is the better part
+/// of a day of the same answer.
+///
+/// Waiting is close to free, which is why the spacing is hours rather than
+/// minutes: an unsealed address costs one walk per [`WALK_INTERVAL`], and
+/// sealing saves only that. Getting it wrong costs a predecessor's signed
+/// payment evidence, which the module doc explains a chain rescan cannot
+/// always rebuild.
+///
+/// A [`Walk::Recovered`] counts only when its forward PUT succeeded, and only
+/// when the walk left nothing unresolved (see [`Walk::from`]). The caller is
+/// responsible for the first half: pass [`Walk::Unresolved`] if the PUT failed,
+/// because otherwise this would seal on the strength of a recovery that never
+/// landed.
+///
+/// # The residual
+///
+/// A lineage that is unreachable for the whole agreement window still seals.
+/// Nothing available here can tell that from an empty lineage: absence is
+/// unauthenticated, and the bridge's own record of what it published is wiped
+/// on a re-key (`Store::set_publish_generation`), so it cannot serve as a
+/// witness either. freenet-migrate's README suggests a connectivity witness,
+/// a GET for something known to exist; doing that honestly needs a key this
+/// bridge has NOT written locally, or the node answers from its own store and
+/// the witness proves nothing.
 ///
 /// # Why walks are spaced
 ///
@@ -203,10 +233,27 @@ pub const SEAL_AFTER_WALKS: u32 = 3;
 /// only predecessor keys, never the current one, so it cannot read back what
 /// this bridge has just written.
 ///
+/// A walk made in the first [`WARMUP`] after this process started never
+/// counts. A just-started bridge's node has few connections, and a GET that
+/// dead-ends for want of peers answers `NotFound` like any other.
+///
 /// Held in memory. A restart forgets the count, which only delays sealing.
-#[derive(Default)]
 pub struct MigrationPacer {
     addresses: std::collections::HashMap<Vec<u8>, Pace>,
+    /// When this pacer was made, which is process start.
+    started: std::time::Instant,
+}
+
+/// How long after start a walk is still discounted.
+pub const WARMUP: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+impl Default for MigrationPacer {
+    fn default() -> Self {
+        MigrationPacer {
+            addresses: std::collections::HashMap::new(),
+            started: std::time::Instant::now(),
+        }
+    }
 }
 
 struct Pace {
@@ -226,6 +273,7 @@ impl MigrationPacer {
     /// Record a finished walk. Returns true when the migration may now be
     /// recorded as finished, after which this address is forgotten.
     pub fn record(&mut self, address: &[u8], walk: Walk, now: std::time::Instant) -> bool {
+        let started = self.started;
         let pace = self.addresses.entry(address.to_vec()).or_insert(Pace {
             next_walk: now,
             agreeing: 0,
@@ -235,7 +283,8 @@ impl MigrationPacer {
         let separate = pace
             .last_counted
             .is_none_or(|last| now.saturating_duration_since(last) >= SEAL_SPACING);
-        if walk != Walk::Unresolved && separate {
+        let warm = now.saturating_duration_since(started) >= WARMUP;
+        if walk != Walk::Unresolved && separate && warm {
             pace.agreeing += 1;
             pace.last_counted = Some(now);
         }
@@ -438,6 +487,7 @@ mod policy_tests {
 #[cfg(test)]
 mod pacer_tests {
     use super::*;
+    use freenet_stdlib::prelude::ContractInstanceId;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -454,28 +504,67 @@ mod pacer_tests {
     #[test]
     fn one_walk_that_found_nothing_does_not_seal() {
         let mut pacer = MigrationPacer::default();
-        assert!(!pacer.record(b"a", Walk::NothingFound, Instant::now()));
+        assert!(!pacer.record(b"a", Walk::NothingFound, Instant::now() + WARMUP));
+    }
+
+    #[test]
+    fn walks_during_the_warmup_are_not_agreement() {
+        let mut pacer = MigrationPacer::default();
+        let t0 = Instant::now();
+        // Walks inside the warmup window never count, however many there are.
+        let mut warming = t0;
+        while warming < t0 + WARMUP {
+            assert!(!pacer.record(b"a", Walk::NothingFound, warming));
+            warming += WALK_INTERVAL / 4;
+        }
+        // Only the ones after the warmup count, and they still need spacing.
+        let mut t = t0 + WARMUP;
+        for _ in 0..SEAL_AFTER_WALKS - 1 {
+            assert!(!pacer.record(b"a", Walk::NothingFound, t));
+            t += SEAL_SPACING;
+        }
+        assert!(pacer.record(b"a", Walk::NothingFound, t));
+    }
+
+    #[test]
+    fn a_recovery_that_left_a_generation_unresolved_is_not_agreement() {
+        let recovered = |unresolved: Vec<ContractInstanceId>, truncated_fold| Outcome::Recovered {
+            merged: BitcoinAddressStateV1::default(),
+            source: ContractInstanceId::new([1; 32]),
+            truncated_fold,
+            unresolved,
+        };
+        assert_eq!(Walk::from(&recovered(vec![], false)), Walk::Recovered);
+        assert_eq!(
+            Walk::from(&recovered(vec![ContractInstanceId::new([2; 32])], false)),
+            Walk::Unresolved,
+            "a generation that never answered may hold what the fold is missing"
+        );
+        assert_eq!(
+            Walk::from(&recovered(vec![], true)),
+            Walk::Unresolved,
+            "a truncated fold never probed the oldest generations"
+        );
     }
 
     #[test]
     fn walks_close_together_count_once() {
         let mut pacer = MigrationPacer::default();
-        let t0 = Instant::now();
-        for i in 0..10 {
+        let t0 = Instant::now() + WARMUP;
+        let mut i = 0;
+        while WALK_INTERVAL * i < SEAL_SPACING {
             assert!(
                 !pacer.record(b"a", Walk::NothingFound, t0 + WALK_INTERVAL * i),
                 "walk {i}, all within one spacing of the first, must not seal"
             );
-            if WALK_INTERVAL * (i + 1) >= SEAL_SPACING {
-                break;
-            }
+            i += 1;
         }
     }
 
     #[test]
     fn separate_agreeing_walks_seal_and_unresolved_ones_do_not_count() {
         let mut pacer = MigrationPacer::default();
-        let t0 = Instant::now();
+        let t0 = Instant::now() + WARMUP;
         let mut t = t0;
         for _ in 0..SEAL_AFTER_WALKS - 1 {
             assert!(!pacer.record(b"a", Walk::NothingFound, t));
@@ -493,7 +582,7 @@ mod pacer_tests {
     #[test]
     fn only_unresolved_walks_never_seal() {
         let mut pacer = MigrationPacer::default();
-        let t0 = Instant::now();
+        let t0 = Instant::now() + WARMUP;
         for i in 0..20 {
             assert!(!pacer.record(b"a", Walk::Unresolved, t0 + SEAL_SPACING * i));
         }

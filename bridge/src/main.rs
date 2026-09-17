@@ -601,23 +601,38 @@ async fn observe_once(
         // never find anything -- silently, and looking healthy.
         let code_hash = publisher.address_code_hash();
         let instance_key = script.clone();
+        // The pacer is keyed by network as well: a p2wpkh script is the same
+        // bytes on signet and mainnet, so one network's walks must not count
+        // towards the other's.
+        let pace_key = [obs.network().as_str().as_bytes(), &script].concat();
         let already = store
             .migration_done(&instance_key, &code_hash)
             .unwrap_or(false);
-        if !already && migrations.due(&instance_key, std::time::Instant::now()) {
+        if !already && migrations.due(&pace_key, std::time::Instant::now()) {
+            use bitcoin_freenet_bridge::migrate::Walk;
             let local = freenet_bitcoin_common::address_state::BitcoinAddressStateV1::default();
             let (merged, note, walk) = publisher.migrate_address_forward(&params, local).await;
-            if !merged.claims.claims.is_empty() {
+            // A recovery counts as agreement only once it is actually
+            // forward. Counted on the strength of a PUT that failed, three
+            // such walks would seal away what was never carried over.
+            let walk = if walk == Walk::Recovered {
                 match publisher.publish_state(&params, &merged).await {
-                    Ok(_) => tracing::info!(script = %hex::encode(&script), "{note}"),
-                    Err(e) => tracing::error!("forward PUT after migration failed: {e}"),
+                    Ok(_) => {
+                        tracing::info!(script = %hex::encode(&script), "{note}");
+                        Walk::Recovered
+                    }
+                    Err(e) => {
+                        tracing::error!("forward PUT after migration failed: {e}");
+                        Walk::Unresolved
+                    }
                 }
             } else {
                 tracing::debug!(script = %hex::encode(&script), "{note}");
-            }
+                walk
+            };
             // Recorded only once several separate walks agree. See
             // `MigrationPacer` for why one is not enough.
-            if migrations.record(&instance_key, walk, std::time::Instant::now()) {
+            if migrations.record(&pace_key, walk, std::time::Instant::now()) {
                 let _ = store.set_migration_done(&instance_key, &code_hash, &note);
             }
         }
