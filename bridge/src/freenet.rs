@@ -37,8 +37,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// a reply nobody collected, and then it would wait forever.
 pub(crate) const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long opening a connection to the node may take. The node is local.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long opening a connection to the node may take.
+///
+/// The node is local, but it is also the thing under load here: a node busy
+/// enough to be slow completing a websocket upgrade is exactly the case this
+/// module exists for, so this is generous rather than tight.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The first and longest waits before dialling a node that refused.
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -65,6 +69,14 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 ///
 /// Two layers, on purpose: discarding keeps stale replies from piling up, and
 /// the send timeout is what still frees the lock if they ever do.
+///
+/// # What this does not catch
+///
+/// A stale reply for the SAME contract as the request in flight. The client
+/// API carries no request id, so order is all there is, and two consecutive
+/// writes to one address contract are ordinary here. The mitigation is only
+/// that a stale reply cannot survive a timeout or an unmatched reply, both of
+/// which take the connection with them.
 struct Link {
     ws_url: String,
     api: Option<WebApi>,
@@ -209,19 +221,23 @@ pub struct FreenetPublisher {
 }
 
 impl FreenetPublisher {
-    pub async fn connect(ws_url: &str, wasm: &ContractWasm) -> Result<Self> {
-        // Connected up front, so a bridge pointed at no node fails at startup
-        // rather than on its first observation.
-        let api = Link::open(ws_url).await?;
-        Ok(FreenetPublisher {
-            link: Arc::new(Mutex::new(Link::new(ws_url, Some(api)))),
+    /// Build a publisher for the node at `ws_url`.
+    ///
+    /// Deliberately does NOT dial. It used to, and a startup where the node
+    /// was slow or not yet up left `main` with no publisher at all for the
+    /// life of the process, so the bridge silently published nothing until
+    /// somebody restarted it. `Link` reconnects on demand under a backoff, so
+    /// there is nothing to gain from failing here.
+    pub fn new(ws_url: &str, wasm: &ContractWasm) -> Self {
+        FreenetPublisher {
+            link: Arc::new(Mutex::new(Link::new(ws_url, None))),
             address_code: Arc::new(ContractCode::from(wasm.address.clone())),
             tip_code: Arc::new(ContractCode::from(wasm.tip.clone())),
             inbox_code: Arc::new(ContractCode::from(wasm.inbox.clone())),
             pointer_code: Arc::new(ContractCode::from(
                 freenet_bitcoin_generation::POINTER_CONTRACT_WASM.to_vec(),
             )),
-        })
+        }
     }
 
     /// Contract key for a Bitcoin address contract instance.
@@ -312,20 +328,14 @@ impl FreenetPublisher {
     ) -> (
         freenet_bitcoin_common::address_state::BitcoinAddressStateV1,
         String,
-        crate::migrate::Walk,
+        crate::migrate::Found,
     ) {
-        use crate::migrate::{address_lineage, address_policy, describe, AddressOps, Walk};
+        use crate::migrate::{address_lineage, address_policy, describe, AddressOps, Found};
         use freenet_migrate::{migrate_contract, Outcome};
 
         let param_bytes = match to_cbor(params) {
             Ok(b) => b,
-            Err(e) => {
-                return (
-                    local,
-                    format!("cannot encode params: {e}"),
-                    Walk::Unresolved,
-                )
-            }
+            Err(e) => return (local, format!("cannot encode params: {e}"), Found::Unknown),
         };
         let params_wrapped = Parameters::from(param_bytes);
         let ops = AddressOps {
@@ -345,16 +355,13 @@ impl FreenetPublisher {
         {
             Ok(o) => {
                 let note = describe(&o);
-                let walk = Walk::from(&o);
+                let found = Found::from(&o);
                 match o {
-                    Outcome::Recovered { merged, .. } => (merged, note, walk),
-                    // Nothing recovered: publish `local`. That is safe whatever
-                    // the walk found, because nothing is recorded as finished
-                    // here; `MigrationPacer` decides that across walks.
-                    _ => (local, note, walk),
+                    Outcome::Recovered { merged, .. } => (merged, note, found),
+                    _ => (local, note, found),
                 }
             }
-            Err(e) => (local, format!("probe aborted: {e:?}"), Walk::Unresolved),
+            Err(e) => (local, format!("probe aborted: {e:?}"), Found::Unknown),
         }
     }
 
@@ -1006,7 +1013,7 @@ mod link_tests {
     }
 
     async fn publisher(url: &str) -> FreenetPublisher {
-        FreenetPublisher::connect(
+        FreenetPublisher::new(
             url,
             &ContractWasm {
                 address: vec![0, 1, 2, 3],
@@ -1014,8 +1021,6 @@ mod link_tests {
                 inbox: vec![8, 9, 10, 11],
             },
         )
-        .await
-        .unwrap()
     }
 
     /// The PUT's contract. The fake node answers by what it is told to, so

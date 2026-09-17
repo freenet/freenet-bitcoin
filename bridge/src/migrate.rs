@@ -148,32 +148,68 @@ pub fn tip_policy() -> SelectionPolicy {
 }
 
 /// What one walk over an address's predecessors found.
+///
+/// Separate from [`Walk`] on purpose. This decides whether there is anything
+/// to carry forward; `Walk` decides whether the walk may count towards
+/// stopping. Collapsing the two lost a partial recovery: a fold that
+/// recovered from the predecessors it could reach, while one stayed silent,
+/// is incomplete evidence AND real data that must be published.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Walk {
-    /// A predecessor held state, and it was folded forward.
-    Recovered,
+pub enum Found {
+    /// A predecessor held state. `complete` is false when some generation was
+    /// never probed or never answered, so the fold is missing whatever those
+    /// hold.
+    Recovered { complete: bool },
     /// Every predecessor answered, and none held state.
-    NothingFound,
-    /// Some predecessor did not answer.
-    Unresolved,
+    Nothing,
+    /// Some predecessor did not answer, and nothing was recovered.
+    Unknown,
 }
 
-impl<S> From<&Outcome<S>> for Walk {
+impl<S> From<&Outcome<S>> for Found {
     fn from(outcome: &Outcome<S>) -> Self {
         match outcome {
-            // A recovery that left generations unprobed or unanswered is not
-            // the whole story: under `FoldAll` the fold is missing what those
-            // generations hold, and the crate says to keep the migration open
-            // for a retry rather than record it as finished.
             Outcome::Recovered {
                 unresolved,
                 truncated_fold,
                 ..
-            } if !unresolved.is_empty() || *truncated_fold => Walk::Unresolved,
-            Outcome::Recovered { .. } => Walk::Recovered,
-            Outcome::SeedLocal { .. } => Walk::NothingFound,
-            _ => Walk::Unresolved,
+            } => Found::Recovered {
+                complete: unresolved.is_empty() && !truncated_fold,
+            },
+            Outcome::SeedLocal { .. } => Found::Nothing,
+            _ => Found::Unknown,
         }
+    }
+}
+
+impl Found {
+    /// Whether the walk produced state to publish under the current key.
+    pub fn has_state(&self) -> bool {
+        matches!(self, Found::Recovered { .. })
+    }
+}
+
+/// Whether one walk may count towards recording a migration as finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Walk {
+    /// Every predecessor answered, and what any of them held is now published
+    /// under the current key.
+    Agrees,
+    /// Proves nothing: a predecessor did not answer, the fold was incomplete,
+    /// or what was recovered did not get published.
+    ProvesNothing,
+}
+
+/// What a finished walk may be counted as.
+///
+/// A recovery counts only when the forward PUT succeeded: counted on the
+/// strength of a PUT that failed, several such walks would record the
+/// migration as finished over exactly the data they failed to move.
+pub fn agreement(found: Found, published_forward: bool) -> Walk {
+    match found {
+        Found::Recovered { complete: true } if published_forward => Walk::Agrees,
+        Found::Nothing => Walk::Agrees,
+        _ => Walk::ProvesNothing,
     }
 }
 
@@ -181,15 +217,30 @@ impl<S> From<&Outcome<S>> for Walk {
 pub const WALK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// How far apart two walks must be to count as separate evidence.
-pub const SEAL_SPACING: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+pub const SEAL_SPACING_MS: u64 = 6 * 60 * 60 * 1000;
 
 /// How many separate walks must agree before a migration is recorded as
 /// finished.
 pub const SEAL_AFTER_WALKS: u32 = 4;
 
-/// When to walk an address's predecessors, and when to stop for good.
+/// How many separate agreeing walks an address has to its name, and when the
+/// last of them was counted.
 ///
-/// # Why one walk is not enough to stop
+/// Persisted (`Store::migration_agreement`), because the walks that have to
+/// agree are the better part of a day apart and a bridge restarts more often
+/// than that. Held only in memory, an address would never reach the count and
+/// would pay its predecessor GETs forever.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Agreement {
+    pub walks: u32,
+    /// Wall clock, not `Instant`: it outlives the process.
+    pub last_counted_ms: Option<u64>,
+}
+
+/// Count a finished walk, and say whether the migration may now be recorded
+/// as finished.
+///
+/// # Why one walk is not enough
 ///
 /// Recording a migration as finished is permanent: that address is never
 /// probed again, so anything a predecessor still holds is abandoned. And a
@@ -197,20 +248,14 @@ pub const SEAL_AFTER_WALKS: u32 = 4;
 /// out of retries, whether or not the contract exists, and freenet-migrate
 /// measured that case at about 99.6% of production not-found traffic. So a
 /// migration is sealed only after [`SEAL_AFTER_WALKS`] walks agree, each at
-/// least [`SEAL_SPACING`] after the last one counted, which is the better part
-/// of a day of the same answer.
+/// least [`SEAL_SPACING_MS`] after the last one counted, which is the better
+/// part of a day of the same answer.
 ///
 /// Waiting is close to free, which is why the spacing is hours rather than
 /// minutes: an unsealed address costs one walk per [`WALK_INTERVAL`], and
 /// sealing saves only that. Getting it wrong costs a predecessor's signed
 /// payment evidence, which the module doc explains a chain rescan cannot
 /// always rebuild.
-///
-/// A [`Walk::Recovered`] counts only when its forward PUT succeeded, and only
-/// when the walk left nothing unresolved (see [`Walk::from`]). The caller is
-/// responsible for the first half: pass [`Walk::Unresolved`] if the PUT failed,
-/// because otherwise this would seal on the strength of a recovery that never
-/// landed.
 ///
 /// # The residual
 ///
@@ -222,8 +267,24 @@ pub const SEAL_AFTER_WALKS: u32 = 4;
 /// a GET for something known to exist; doing that honestly needs a key this
 /// bridge has NOT written locally, or the node answers from its own store and
 /// the witness proves nothing.
-///
-/// # Why walks are spaced
+pub fn count_walk(prev: Agreement, walk: Walk, now_ms: u64) -> (Agreement, bool) {
+    if walk == Walk::ProvesNothing {
+        return (prev, false);
+    }
+    let separate = prev
+        .last_counted_ms
+        .is_none_or(|last| now_ms.saturating_sub(last) >= SEAL_SPACING_MS);
+    if !separate {
+        return (prev, false);
+    }
+    let next = Agreement {
+        walks: prev.walks + 1,
+        last_counted_ms: Some(now_ms),
+    };
+    (next, next.walks >= SEAL_AFTER_WALKS)
+}
+
+/// When each address is next due a walk.
 ///
 /// Until sealed, a walk re-sends a GET for every predecessor. Run on every
 /// observation round, that was eight GETs every few seconds per watched
@@ -232,67 +293,25 @@ pub const SEAL_AFTER_WALKS: u32 = 4;
 /// [`WALK_INTERVAL`]. Publishing is not held back meanwhile: the walk reads
 /// only predecessor keys, never the current one, so it cannot read back what
 /// this bridge has just written.
-///
-/// A walk made in the first [`WARMUP`] after this process started never
-/// counts. A just-started bridge's node has few connections, and a GET that
-/// dead-ends for want of peers answers `NotFound` like any other.
-///
-/// Held in memory. A restart forgets the count, which only delays sealing.
-pub struct MigrationPacer {
-    addresses: std::collections::HashMap<Vec<u8>, Pace>,
-    /// When this pacer was made, which is process start.
-    started: std::time::Instant,
+#[derive(Default)]
+pub struct WalkClock {
+    next: std::collections::HashMap<Vec<u8>, std::time::Instant>,
 }
 
-/// How long after start a walk is still discounted.
-pub const WARMUP: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-
-impl Default for MigrationPacer {
-    fn default() -> Self {
-        MigrationPacer {
-            addresses: std::collections::HashMap::new(),
-            started: std::time::Instant::now(),
-        }
-    }
-}
-
-struct Pace {
-    next_walk: std::time::Instant,
-    agreeing: u32,
-    last_counted: Option<std::time::Instant>,
-}
-
-impl MigrationPacer {
+impl WalkClock {
     /// Whether `address` is due a walk.
     pub fn due(&self, address: &[u8], now: std::time::Instant) -> bool {
-        self.addresses
-            .get(address)
-            .is_none_or(|pace| now >= pace.next_walk)
+        self.next.get(address).is_none_or(|next| now >= *next)
     }
 
-    /// Record a finished walk. Returns true when the migration may now be
-    /// recorded as finished, after which this address is forgotten.
-    pub fn record(&mut self, address: &[u8], walk: Walk, now: std::time::Instant) -> bool {
-        let started = self.started;
-        let pace = self.addresses.entry(address.to_vec()).or_insert(Pace {
-            next_walk: now,
-            agreeing: 0,
-            last_counted: None,
-        });
-        pace.next_walk = now + WALK_INTERVAL;
-        let separate = pace
-            .last_counted
-            .is_none_or(|last| now.saturating_duration_since(last) >= SEAL_SPACING);
-        let warm = now.saturating_duration_since(started) >= WARMUP;
-        if walk != Walk::Unresolved && separate && warm {
-            pace.agreeing += 1;
-            pace.last_counted = Some(now);
-        }
-        let seal = pace.agreeing >= SEAL_AFTER_WALKS;
-        if seal {
-            self.addresses.remove(address);
-        }
-        seal
+    /// Record that a walk just ran.
+    pub fn walked(&mut self, address: &[u8], now: std::time::Instant) {
+        self.next.insert(address.to_vec(), now + WALK_INTERVAL);
+    }
+
+    /// Forget an address, once its migration is recorded as finished.
+    pub fn forget(&mut self, address: &[u8]) {
+        self.next.remove(address);
     }
 }
 
@@ -485,106 +504,127 @@ mod policy_tests {
 }
 
 #[cfg(test)]
-mod pacer_tests {
+mod walk_tests {
     use super::*;
     use freenet_stdlib::prelude::ContractInstanceId;
     use std::time::{Duration, Instant};
 
-    #[test]
-    fn a_new_address_is_walked_at_once_and_then_not_again_until_the_interval() {
-        let mut pacer = MigrationPacer::default();
-        let t0 = Instant::now();
-        assert!(pacer.due(b"a", t0));
-        assert!(!pacer.record(b"a", Walk::NothingFound, t0));
-        assert!(!pacer.due(b"a", t0 + WALK_INTERVAL - Duration::from_secs(1)));
-        assert!(pacer.due(b"a", t0 + WALK_INTERVAL));
-        assert!(pacer.due(b"b", t0), "another address has its own pace");
-    }
-
-    #[test]
-    fn one_walk_that_found_nothing_does_not_seal() {
-        let mut pacer = MigrationPacer::default();
-        assert!(!pacer.record(b"a", Walk::NothingFound, Instant::now() + WARMUP));
-    }
-
-    #[test]
-    fn walks_during_the_warmup_are_not_agreement() {
-        let mut pacer = MigrationPacer::default();
-        let t0 = Instant::now();
-        // Walks inside the warmup window never count, however many there are.
-        let mut warming = t0;
-        while warming < t0 + WARMUP {
-            assert!(!pacer.record(b"a", Walk::NothingFound, warming));
-            warming += WALK_INTERVAL / 4;
-        }
-        // Only the ones after the warmup count, and they still need spacing.
-        let mut t = t0 + WARMUP;
-        for _ in 0..SEAL_AFTER_WALKS - 1 {
-            assert!(!pacer.record(b"a", Walk::NothingFound, t));
-            t += SEAL_SPACING;
-        }
-        assert!(pacer.record(b"a", Walk::NothingFound, t));
-    }
-
-    #[test]
-    fn a_recovery_that_left_a_generation_unresolved_is_not_agreement() {
-        let recovered = |unresolved: Vec<ContractInstanceId>, truncated_fold| Outcome::Recovered {
+    fn recovered(
+        unresolved: Vec<ContractInstanceId>,
+        truncated_fold: bool,
+    ) -> Outcome<BitcoinAddressStateV1> {
+        Outcome::Recovered {
             merged: BitcoinAddressStateV1::default(),
             source: ContractInstanceId::new([1; 32]),
             truncated_fold,
             unresolved,
-        };
-        assert_eq!(Walk::from(&recovered(vec![], false)), Walk::Recovered);
-        assert_eq!(
-            Walk::from(&recovered(vec![ContractInstanceId::new([2; 32])], false)),
-            Walk::Unresolved,
-            "a generation that never answered may hold what the fold is missing"
+        }
+    }
+
+    #[test]
+    fn a_partial_recovery_is_still_state_to_publish() {
+        let partial = Found::from(&recovered(vec![ContractInstanceId::new([2; 32])], false));
+        assert_eq!(partial, Found::Recovered { complete: false });
+        assert!(
+            partial.has_state(),
+            "the fold recovered real claims from the predecessors it did reach"
         );
         assert_eq!(
-            Walk::from(&recovered(vec![], true)),
-            Walk::Unresolved,
+            agreement(partial, true),
+            Walk::ProvesNothing,
+            "but a generation that never answered may hold what the fold is missing"
+        );
+        assert_eq!(
+            Found::from(&recovered(vec![], true)),
+            Found::Recovered { complete: false },
             "a truncated fold never probed the oldest generations"
         );
     }
 
     #[test]
-    fn walks_close_together_count_once() {
-        let mut pacer = MigrationPacer::default();
-        let t0 = Instant::now() + WARMUP;
-        let mut i = 0;
-        while WALK_INTERVAL * i < SEAL_SPACING {
-            assert!(
-                !pacer.record(b"a", Walk::NothingFound, t0 + WALK_INTERVAL * i),
-                "walk {i}, all within one spacing of the first, must not seal"
-            );
-            i += 1;
-        }
-    }
-
-    #[test]
-    fn separate_agreeing_walks_seal_and_unresolved_ones_do_not_count() {
-        let mut pacer = MigrationPacer::default();
-        let t0 = Instant::now() + WARMUP;
-        let mut t = t0;
-        for _ in 0..SEAL_AFTER_WALKS - 1 {
-            assert!(!pacer.record(b"a", Walk::NothingFound, t));
-            t += SEAL_SPACING;
-            assert!(!pacer.record(b"a", Walk::Unresolved, t));
-            t += SEAL_SPACING;
-        }
-        assert!(
-            pacer.record(b"a", Walk::Recovered, t),
-            "the third separate walk seals"
+    fn a_recovery_counts_only_once_it_is_published_forward() {
+        let complete = Found::from(&recovered(vec![], false));
+        assert_eq!(complete, Found::Recovered { complete: true });
+        assert_eq!(agreement(complete, true), Walk::Agrees);
+        assert_eq!(
+            agreement(complete, false),
+            Walk::ProvesNothing,
+            "a PUT that failed moved nothing, so it proves nothing"
         );
-        assert!(pacer.due(b"a", t), "a sealed address is forgotten");
     }
 
     #[test]
-    fn only_unresolved_walks_never_seal() {
-        let mut pacer = MigrationPacer::default();
-        let t0 = Instant::now() + WARMUP;
-        for i in 0..20 {
-            assert!(!pacer.record(b"a", Walk::Unresolved, t0 + SEAL_SPACING * i));
+    fn nothing_found_agrees_and_needs_no_publish() {
+        assert_eq!(agreement(Found::Nothing, false), Walk::Agrees);
+        assert!(!Found::Nothing.has_state());
+        assert_eq!(agreement(Found::Unknown, true), Walk::ProvesNothing);
+    }
+
+    #[test]
+    fn one_agreeing_walk_does_not_seal() {
+        let (after, seal) = count_walk(Agreement::default(), Walk::Agrees, 1_000);
+        assert_eq!(after.walks, 1);
+        assert!(!seal);
+    }
+
+    #[test]
+    fn walks_close_together_count_once() {
+        let mut state = Agreement::default();
+        let mut now = 1_000_000;
+        let (first, _) = count_walk(state, Walk::Agrees, now);
+        state = first;
+        for _ in 0..20 {
+            now += SEAL_SPACING_MS / 30;
+            let (next, seal) = count_walk(state, Walk::Agrees, now);
+            assert!(!seal);
+            assert_eq!(next.walks, 1, "still one walk's worth of evidence");
+            state = next;
         }
+    }
+
+    #[test]
+    fn separate_agreeing_walks_seal_and_walks_that_prove_nothing_do_not_count() {
+        let mut state = Agreement::default();
+        let mut now = 1_000_000;
+        for _ in 0..SEAL_AFTER_WALKS - 1 {
+            let (next, seal) = count_walk(state, Walk::Agrees, now);
+            assert!(!seal);
+            state = next;
+            now += SEAL_SPACING_MS;
+            let (unchanged, seal) = count_walk(state, Walk::ProvesNothing, now);
+            assert!(!seal);
+            assert_eq!(
+                unchanged, state,
+                "a walk that proves nothing changes nothing"
+            );
+            now += SEAL_SPACING_MS;
+        }
+        let (final_state, seal) = count_walk(state, Walk::Agrees, now);
+        assert!(seal, "the fourth separate agreeing walk seals");
+        assert_eq!(final_state.walks, SEAL_AFTER_WALKS);
+    }
+
+    #[test]
+    fn walks_that_prove_nothing_never_seal() {
+        let mut state = Agreement::default();
+        for i in 0..20u64 {
+            let (next, seal) = count_walk(state, Walk::ProvesNothing, i * SEAL_SPACING_MS);
+            assert!(!seal);
+            state = next;
+        }
+        assert_eq!(state, Agreement::default());
+    }
+
+    #[test]
+    fn an_address_is_walked_at_once_and_then_not_again_until_the_interval() {
+        let mut clock = WalkClock::default();
+        let t0 = Instant::now();
+        assert!(clock.due(b"a", t0));
+        clock.walked(b"a", t0);
+        assert!(!clock.due(b"a", t0 + WALK_INTERVAL - Duration::from_secs(1)));
+        assert!(clock.due(b"a", t0 + WALK_INTERVAL));
+        assert!(clock.due(b"b", t0), "another address has its own pace");
+        clock.forget(b"a");
+        assert!(clock.due(b"a", t0));
     }
 }

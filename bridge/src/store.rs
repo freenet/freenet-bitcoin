@@ -322,6 +322,22 @@ impl Store {
                 code_hash      BLOB NOT NULL
             );
 
+            -- How many separate walks over an address's predecessors have
+            -- agreed, per (contract instance, generation).
+            --
+            -- Persisted because the walks that have to agree are hours apart
+            -- (see `migrate::count_walk`) and a bridge restarts more often
+            -- than that. Held only in memory, an address would never reach the
+            -- count and would pay its predecessor GETs for the life of the
+            -- process. Losing this table only delays a seal.
+            CREATE TABLE IF NOT EXISTS migration_agreement (
+                instance_id     BLOB NOT NULL,
+                generation      BLOB NOT NULL,
+                walks           INTEGER NOT NULL,
+                last_counted_ms INTEGER,
+                PRIMARY KEY (instance_id, generation)
+            );
+
             -- Migration outcomes, recorded per (contract instance, generation).
             --
             -- Written ONLY for a DEFINITIVE outcome -- a recovery, or a walk in
@@ -862,6 +878,48 @@ impl Store {
             )
             .optional()?
             .unwrap_or(false))
+    }
+
+    /// How many separate walks have agreed for this instance and generation.
+    pub fn migration_agreement(
+        &self,
+        instance_id: &[u8],
+        generation: &[u8; 32],
+    ) -> anyhow::Result<crate::migrate::Agreement> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT walks, last_counted_ms FROM migration_agreement
+                 WHERE instance_id = ?1 AND generation = ?2",
+                params![instance_id, generation.to_vec()],
+                |row| {
+                    Ok(crate::migrate::Agreement {
+                        walks: row.get::<_, i64>(0)? as u32,
+                        last_counted_ms: row.get::<_, Option<i64>>(1)?.map(|ms| ms as u64),
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    pub fn set_migration_agreement(
+        &self,
+        instance_id: &[u8],
+        generation: &[u8; 32],
+        agreement: crate::migrate::Agreement,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO migration_agreement
+             (instance_id, generation, walks, last_counted_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                instance_id,
+                generation.to_vec(),
+                agreement.walks as i64,
+                agreement.last_counted_ms.map(|ms| ms as i64)
+            ],
+        )?;
+        Ok(())
     }
 
     /// Record a DEFINITIVE migration outcome.
@@ -2377,5 +2435,41 @@ mod migration_marker_tests {
         let gen = [7u8; 32];
         s.set_migration_done(b"a", &gen, "seed_local").unwrap();
         assert!(!s.migration_done(b"b", &gen).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod agreement_tests {
+    use super::*;
+    use crate::migrate::Agreement;
+
+    #[test]
+    fn agreement_survives_reopening_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        let counted = Agreement {
+            walks: 2,
+            last_counted_ms: Some(1_700_000_000_000),
+        };
+        {
+            let s = Store::open(&path).unwrap();
+            assert_eq!(
+                s.migration_agreement(b"instance", &[7; 32]).unwrap(),
+                Agreement::default(),
+                "an address nobody has walked has no evidence"
+            );
+            s.set_migration_agreement(b"instance", &[7; 32], counted)
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.migration_agreement(b"instance", &[7; 32]).unwrap(),
+            counted
+        );
+        assert_eq!(
+            s.migration_agreement(b"instance", &[8; 32]).unwrap(),
+            Agreement::default(),
+            "a re-key starts the evidence over"
+        );
     }
 }

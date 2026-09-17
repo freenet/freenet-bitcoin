@@ -211,19 +211,11 @@ async fn run(cfg: BridgeConfig) -> Result<()> {
 
     let wasm = ContractWasm::load(&cfg.contract_dir)?;
 
-    let publisher = match FreenetPublisher::connect(&cfg.freenet_ws, &wasm).await {
-        Ok(p) => Some(Arc::new(p)),
-        Err(e) => {
-            // The bridge still observes the chain, and the inbox worker has
-            // its own connection that reconnects. Failing hard here would make
-            // a node restart take the bridge down with it.
-            tracing::error!(
-                "cannot reach the Freenet node ({e}); observations will not be published \
-                 until the bridge restarts"
-            );
-            None
-        }
-    };
+    // Not dialled here. `FreenetPublisher` connects on demand and reconnects
+    // under a backoff, so a node that is slow or not yet up at startup costs a
+    // few failed rounds rather than a process that publishes nothing until
+    // somebody restarts it.
+    let publisher = Some(Arc::new(FreenetPublisher::new(&cfg.freenet_ws, &wasm)));
     let address_code_hash = publisher.as_ref().map(|p| p.address_code_hash());
 
     // If the contract WASM changed since last run, every instance has moved to
@@ -450,12 +442,12 @@ async fn observation_loop(
     // inbox, or reads an old generation of the other contracts. Republishing
     // an unchanged record is harmless.
     let mut pointers_due = std::time::Instant::now() + pointer_wait(pointers_ok);
-    let mut migrations = bitcoin_freenet_bridge::migrate::MigrationPacer::default();
+    let mut walks = bitcoin_freenet_bridge::migrate::WalkClock::default();
 
     loop {
         for obs in &observers {
             if let Err(e) =
-                observe_once(obs, &signer, &store, publisher.as_deref(), &mut migrations).await
+                observe_once(obs, &signer, &store, publisher.as_deref(), &mut walks).await
             {
                 tracing::error!(network = ?obs.network(), "observation round failed: {e}");
             }
@@ -478,7 +470,7 @@ async fn observe_once(
     signer: &Signer,
     store: &Store,
     publisher: Option<&FreenetPublisher>,
-    migrations: &mut bitcoin_freenet_bridge::migrate::MigrationPacer,
+    walks: &mut bitcoin_freenet_bridge::migrate::WalkClock,
 ) -> Result<()> {
     // While the node is still doing initial block download, an absence of
     // payments means nothing, so publishing "scanned to height N" would be an
@@ -600,40 +592,61 @@ async fn observe_once(
         // probing state we had just written ourselves, and the recovery would
         // never find anything -- silently, and looking healthy.
         let code_hash = publisher.address_code_hash();
-        let instance_key = script.clone();
-        // The pacer is keyed by network as well: a p2wpkh script is the same
-        // bytes on signet and mainnet, so one network's walks must not count
-        // towards the other's.
-        let pace_key = [obs.network().as_str().as_bytes(), &script].concat();
+        // Keyed by the contract instance, which derives from the address
+        // parameters and so is already per network: the same p2wpkh script is
+        // the same bytes on signet and mainnet, and a seal recorded against
+        // the bare script stopped the other network's migration ever running.
+        let instance_key = match publisher.address_key(&params) {
+            Ok(key) => key.id().as_bytes().to_vec(),
+            Err(e) => {
+                tracing::error!("cannot derive the address contract's key: {e}");
+                continue;
+            }
+        };
         let already = store
             .migration_done(&instance_key, &code_hash)
             .unwrap_or(false);
-        if !already && migrations.due(&pace_key, std::time::Instant::now()) {
-            use bitcoin_freenet_bridge::migrate::Walk;
+        if !already && walks.due(&instance_key, std::time::Instant::now()) {
+            use bitcoin_freenet_bridge::migrate::{agreement, count_walk};
+            walks.walked(&instance_key, std::time::Instant::now());
             let local = freenet_bitcoin_common::address_state::BitcoinAddressStateV1::default();
-            let (merged, note, walk) = publisher.migrate_address_forward(&params, local).await;
-            // A recovery counts as agreement only once it is actually
-            // forward. Counted on the strength of a PUT that failed, three
-            // such walks would seal away what was never carried over.
-            let walk = if walk == Walk::Recovered {
+            let (merged, note, found) = publisher.migrate_address_forward(&params, local).await;
+            // Published whenever the walk recovered anything, complete or
+            // not: a fold that reached some predecessors and not others holds
+            // real claims, and dropping them because the walk was incomplete
+            // would lose exactly what the migration exists to carry.
+            let published = if found.has_state() {
                 match publisher.publish_state(&params, &merged).await {
                     Ok(_) => {
                         tracing::info!(script = %hex::encode(&script), "{note}");
-                        Walk::Recovered
+                        true
                     }
                     Err(e) => {
                         tracing::error!("forward PUT after migration failed: {e}");
-                        Walk::Unresolved
+                        false
                     }
                 }
             } else {
                 tracing::debug!(script = %hex::encode(&script), "{note}");
-                walk
+                false
             };
-            // Recorded only once several separate walks agree. See
-            // `MigrationPacer` for why one is not enough.
-            if migrations.record(&pace_key, walk, std::time::Instant::now()) {
-                let _ = store.set_migration_done(&instance_key, &code_hash, &note);
+            let counted = agreement(found, published);
+            let before = store
+                .migration_agreement(&instance_key, &code_hash)
+                .unwrap_or_default();
+            let (after, seal) = count_walk(before, counted, now_ms());
+            if after != before {
+                if let Err(e) = store.set_migration_agreement(&instance_key, &code_hash, after) {
+                    tracing::warn!("recording a migration walk failed: {e}");
+                }
+            }
+            if seal {
+                match store.set_migration_done(&instance_key, &code_hash, &note) {
+                    Ok(()) => walks.forget(&instance_key),
+                    // Left unsealed rather than treated as sealed: the walks
+                    // start over, which costs GETs, not evidence.
+                    Err(e) => tracing::warn!("recording a finished migration failed: {e}"),
+                }
             }
         }
 
@@ -651,23 +664,22 @@ async fn observe_once(
         if fresh.is_empty() {
             continue;
         }
-        match publisher.publish_claims(&params, &fresh).await {
-            Ok(key) => {
-                // Marked only now. Marked before the publish, a claim whose
-                // publish failed was never sent again: a confirmed payment
-                // that no retry, and no restart, would ever publish.
-                for claim in &fresh {
-                    if let Err(e) = store.mark_published(obs.network(), &script, &claim.digest()) {
-                        tracing::warn!("recording a published claim failed: {e}");
-                    }
-                }
-                tracing::info!(
-                    contract = %key.id(),
-                    claims = fresh.len(),
-                    "published Bitcoin observations"
-                )
+        let published = publisher.publish_claims(&params, &fresh).await;
+        mark_claims_if_published(store, obs.network(), &script, &fresh, &published);
+        match published {
+            Ok(key) => tracing::info!(
+                contract = %key.id(),
+                claims = fresh.len(),
+                "published Bitcoin observations"
+            ),
+            Err(e) => {
+                // The rest of the round is abandoned. Claims stay unmarked so
+                // they are retried, and with the node unreachable every one of
+                // them would otherwise pay its own connect and request
+                // timeouts, per script, on every round.
+                tracing::error!("publishing observations failed, abandoning the round: {e}");
+                return Ok(());
             }
-            Err(e) => tracing::error!("publishing observations failed, will retry: {e}"),
         }
     }
 
@@ -683,6 +695,37 @@ async fn observe_once(
         }
     }
     Ok(())
+}
+
+/// Record `fresh` as published, but only if it was.
+///
+/// Split out from the publish so the ordering can be tested without a node:
+/// marked before the publish, a claim whose publish failed was never sent
+/// again, so a confirmed payment that no retry and no restart would publish
+/// was lost for good.
+fn mark_claims_if_published(
+    store: &Store,
+    network: BitcoinNetwork,
+    script: &[u8],
+    fresh: &[freenet_bitcoin_common::SignedClaim],
+    published: &Result<freenet_stdlib::prelude::ContractKey>,
+) {
+    if published.is_err() {
+        return;
+    }
+    for claim in fresh {
+        if let Err(e) = store.mark_published(network, script, &claim.digest()) {
+            tracing::warn!("recording a published claim failed: {e}");
+        }
+    }
+}
+
+/// Wall-clock milliseconds, for evidence that has to outlive the process.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Parse a human-readable Bitcoin address into canonical `scriptPubKey` bytes.
@@ -742,7 +785,7 @@ async fn print_generation(cfg: BridgeConfig) -> Result<()> {
         }
     }
 
-    let publisher = FreenetPublisher::connect(&cfg.freenet_ws, &wasm).await?;
+    let publisher = FreenetPublisher::new(&cfg.freenet_ws, &wasm);
     let store = Store::open(&cfg.database_path)?;
     let mut disagreed = false;
     for result in
@@ -785,7 +828,7 @@ async fn verify_address(
     let script = parse_address(address, network)?;
 
     let wasm = ContractWasm::load(&cfg.contract_dir)?;
-    let publisher = FreenetPublisher::connect(&cfg.freenet_ws, &wasm).await?;
+    let publisher = FreenetPublisher::new(&cfg.freenet_ws, &wasm);
 
     let params = BitcoinAddressParameters {
         network,
@@ -923,6 +966,86 @@ async fn verify_address(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod publish_marking_tests {
+    use super::*;
+    use freenet_bitcoin_common::spv::testing as spv_testing;
+    use freenet_bitcoin_common::{
+        BitcoinAddressParameters, BlockAnchor, Claim, ClaimBody, OutPoint, SignedClaim,
+    };
+
+    fn claim(signer: &Signer, params: &BitcoinAddressParameters, seed: u8) -> SignedClaim {
+        let (spv, txid, block) =
+            spv_testing::payment_proof(&params.script_pubkey, 1_000, 1, [seed; 32]);
+        SignedClaim::sign(
+            signer.key(),
+            &ClaimBody {
+                script_id: params.script_id(),
+                network: params.network,
+                as_of: BlockAnchor {
+                    height: 100,
+                    hash: block,
+                },
+                claim: Claim::ConfirmedOutput {
+                    outpoint: OutPoint { txid, vout: 0 },
+                    value_sats: 1_000,
+                    anchor: BlockAnchor {
+                        height: 99,
+                        hash: block,
+                    },
+                    spv,
+                },
+            },
+        )
+        .unwrap()
+    }
+
+    /// **A claim whose publish failed is not recorded as published.**
+    ///
+    /// It used to be: the mark ran while the claims were being selected, so a
+    /// publish that failed left a confirmed payment recorded as sent and it
+    /// was never sent again, across restarts. That is the loss this PR exists
+    /// to close, and `observe_once` needs a live bitcoind, so the ordering is
+    /// tested here rather than through it.
+    #[test]
+    fn a_claim_is_recorded_as_published_only_when_the_publish_succeeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let signer = Signer::load_or_create(&dir.path().join("key.pem")).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let net = BitcoinNetwork::Signet;
+        let params = BitcoinAddressParameters {
+            network: net,
+            script_pubkey: vec![0x00, 0x14, 0xaa, 0xbb],
+            trusted_bridges: vec![signer.bridge_id()],
+            pow_floor: net.default_pow_floor(),
+        };
+        let script = params.script_pubkey.clone();
+        let fresh = vec![claim(&signer, &params, 1), claim(&signer, &params, 2)];
+
+        let failed: Result<freenet_stdlib::prelude::ContractKey> =
+            Err(anyhow::anyhow!("timed out waiting for the node's reply"));
+        mark_claims_if_published(&store, net, &script, &fresh, &failed);
+        for claim in &fresh {
+            assert!(
+                !store.is_published(net, &script, &claim.digest()).unwrap(),
+                "a claim that was not published must be sent again"
+            );
+        }
+
+        let key = freenet_stdlib::prelude::ContractKey::from_params_and_code(
+            freenet_stdlib::prelude::Parameters::from(vec![1u8]),
+            freenet_stdlib::prelude::ContractCode::from(vec![0u8, 1, 2]),
+        );
+        mark_claims_if_published(&store, net, &script, &fresh, &Ok(key));
+        for claim in &fresh {
+            assert!(
+                store.is_published(net, &script, &claim.digest()).unwrap(),
+                "a published claim is not sent again"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

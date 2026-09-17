@@ -1037,9 +1037,20 @@ impl InboxWorker {
 
     /// One connection's worth of serving. Returns only with an error.
     async fn session(&self, floor_armed_at: &mut Option<Instant>) -> Result<()> {
-        let (stream, _) = tokio_tungstenite::connect_async(&self.ws_url)
-            .await
-            .with_context(|| format!("connecting to the Freenet node at {}", self.ws_url))?;
+        // Bounded for the same reason the observer's connect is: a connect
+        // that hangs is a session that never starts and never reports.
+        let (stream, _) = tokio::time::timeout(
+            crate::freenet::CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async(&self.ws_url),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "timed out connecting to the Freenet node at {}",
+                self.ws_url
+            )
+        })?
+        .with_context(|| format!("connecting to the Freenet node at {}", self.ws_url))?;
         let mut api = WebApi::start(stream);
         let store = Store::open(&self.db_path)?;
         let observed: Vec<BitcoinNetwork> = self.networks.iter().map(|n| n.network).collect();
