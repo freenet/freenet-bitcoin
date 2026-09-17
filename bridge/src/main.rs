@@ -577,12 +577,21 @@ async fn observe_once(
     // tip would assert coverage the bridge does not have -- turning the one
     // signal that distinguishes "looked, found nothing" from "has not looked"
     // into a lie in exactly the case where the distinction matters.
-    let scanned_anchor = match store.checkpoint(obs.network())? {
-        Some(cp) => cp,
-        // No checkpoint yet means nothing has been scanned. Fall back to the
-        // tip only because there is nothing else to say, and the IBD guard
-        // above already prevents publishing during catch-up from a cold start.
-        None => tip,
+    // Taken from the block this round scanned to, not from the checkpoint:
+    // when the round has claims the checkpoint is not committed until they are
+    // published, so reading it here would stamp the watermark one round behind
+    // what was actually scanned, which is the understatement this comment
+    // exists to rule out.
+    let scanned_anchor = match deferred_checkpoint {
+        Some(anchor) => anchor,
+        None => match store.checkpoint(obs.network())? {
+            Some(cp) => cp,
+            // No checkpoint yet means nothing has been scanned. Fall back to
+            // the tip only because there is nothing else to say, and the IBD
+            // guard above already prevents publishing during catch-up from a
+            // cold start.
+            None => tip,
+        },
     };
     for script in &watched {
         let wm = obs.scan_watermark(signer, script, &scanned_anchor)?;
