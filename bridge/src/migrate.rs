@@ -353,14 +353,21 @@ impl WalkClock {
         self.next.insert(address.to_vec(), now + wait);
     }
 
-    /// Whether `digest` is worth publishing forward, or is what was last
-    /// published for this address.
-    pub fn publish_is_new(&mut self, address: &[u8], digest: [u8; 32]) -> bool {
-        if self.published.get(address) == Some(&digest) {
-            return false;
-        }
+    /// Whether `digest` differs from what was last published FORWARD and
+    /// accepted for this address.
+    ///
+    /// Read-only on purpose. Recorded here rather than in
+    /// [`Self::published_forward`], a PUT that then failed would leave the
+    /// digest behind, the next walk would skip the PUT as unchanged and report
+    /// success, and the address could reach agreement over state the node
+    /// never stored.
+    pub fn publish_is_new(&self, address: &[u8], digest: [u8; 32]) -> bool {
+        self.published.get(address) != Some(&digest)
+    }
+
+    /// Record that `digest` is now published forward for this address.
+    pub fn published_forward(&mut self, address: &[u8], digest: [u8; 32]) {
         self.published.insert(address.to_vec(), digest);
-        true
     }
 
     /// Forget an address, once its migration is recorded as finished.
@@ -704,6 +711,7 @@ mod walk_tests {
     fn an_unchanged_recovery_is_not_published_again() {
         let mut clock = WalkClock::default();
         assert!(clock.publish_is_new(b"a", [1; 32]));
+        clock.published_forward(b"a", [1; 32]);
         assert!(!clock.publish_is_new(b"a", [1; 32]));
         assert!(
             clock.publish_is_new(b"a", [2; 32]),
@@ -712,9 +720,28 @@ mod walk_tests {
         assert!(clock.publish_is_new(b"b", [1; 32]), "a different address");
         clock.forget(b"a");
         assert!(
-            clock.publish_is_new(b"a", [2; 32]),
+            clock.publish_is_new(b"a", [1; 32]),
             "forgotten, so sent again"
         );
+    }
+
+    /// **A forward PUT that failed is tried again, not remembered as done.**
+    ///
+    /// The digest was recorded when the decision to publish was taken, so a
+    /// PUT that then failed left the memo behind: the next walk skipped the
+    /// PUT as unchanged and reported success, and the address could reach
+    /// agreement over state the node never stored.
+    #[test]
+    fn a_recovery_whose_publish_failed_is_published_again() {
+        let mut clock = WalkClock::default();
+        assert!(clock.publish_is_new(b"a", [1; 32]), "first attempt");
+        // The PUT failed, so nothing is recorded.
+        assert!(
+            clock.publish_is_new(b"a", [1; 32]),
+            "the same state must be sent again after a failed PUT"
+        );
+        clock.published_forward(b"a", [1; 32]);
+        assert!(!clock.publish_is_new(b"a", [1; 32]));
     }
 
     #[test]

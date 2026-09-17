@@ -616,6 +616,7 @@ async fn observe_once(
             } else {
                 match publisher.publish_state(&params, &merged).await {
                     Ok(_) => {
+                        walks.published_forward(&instance_key, state_digest(&merged));
                         tracing::info!(script = %hex::encode(&script), "{note}");
                         true
                     }
