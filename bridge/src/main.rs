@@ -673,12 +673,14 @@ async fn observe_once(
                 "published Bitcoin observations"
             ),
             Err(e) => {
-                // The rest of the round is abandoned. Claims stay unmarked so
+                // The remaining scripts are abandoned. Claims stay unmarked so
                 // they are retried, and with the node unreachable every one of
                 // them would otherwise pay its own connect and request
-                // timeouts, per script, on every round.
+                // timeouts, per script, on every round. The tip publish below
+                // still gets its one attempt: a signed tip is what lets a
+                // buyer prove how deep a payment is, and it costs one request.
                 tracing::error!("publishing observations failed, abandoning the round: {e}");
-                return Ok(());
+                break;
             }
         }
     }
