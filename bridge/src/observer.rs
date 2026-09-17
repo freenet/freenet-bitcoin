@@ -666,6 +666,27 @@ mod tests {
     use super::*;
     use freenet_bitcoin_common::{BlockHash, OutpointStatus, Txid};
 
+    /// **A reorg leaves the checkpoint on the chain the bridge now believes.**
+    ///
+    /// `handle_reorg` needs a chain client, which the helper below
+    /// deliberately never connects, so the call cannot be executed here.
+    /// Deleting it left every test green, and what it prevents is silent: the
+    /// checkpoint names a block `forget_blocks_above` has just deleted, the
+    /// next round reads the missing record as a fresh fork, resumes ABOVE it,
+    /// and the replacement blocks are never scanned. That became reachable
+    /// only when a round began holding the checkpoint back, so nothing older
+    /// pins it. The needle is split because `include_str!` pulls in this test
+    /// too.
+    #[test]
+    fn a_reorg_rewinds_the_checkpoint_to_the_fork() {
+        let src = include_str!("observer.rs");
+        assert!(
+            src.contains(concat!("rewind_checkpoint_to(", "self.cfg.network, fork)")),
+            "a reorg no longer rewinds the checkpoint, so a held checkpoint can \
+             name a block it just forgot"
+        );
+    }
+
     /// An observer whose chain client is never used.
     ///
     /// `bitcoincore_rpc::Client::new` builds a transport rather than opening a

@@ -471,9 +471,11 @@ impl Store {
     }
 
     /// Move the checkpoint back to `height`, never forward, and never create
-    /// one. Only the startup rewinds call this (the demo scripts' backfill and
-    /// the tip contract's refill), before the observer starts. A watch request
-    /// does not: see freenet/freenet-bitcoin#7.
+    /// one. Called by the startup rewinds (the demo scripts' backfill and the
+    /// tip contract's refill) and, mid-round while the observer is running, by
+    /// `Observer::handle_reorg`, which must not leave a held checkpoint naming
+    /// a block it has just forgotten. A watch request does not: see
+    /// freenet/freenet-bitcoin#7.
     ///
     /// Rewinding is safe because rescanning is idempotent: claims are keyed by
     /// digest, so re-observing a payment produces a claim the contract already

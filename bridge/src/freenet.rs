@@ -126,8 +126,12 @@ impl Link {
         }
         match Self::open(&self.ws_url).await {
             Ok(api) => {
+                // The backoff is NOT reset here. A node that answers "not
+                // joined yet" completes the dial every time, so resetting on a
+                // successful dial pinned the wait at its minimum for the whole
+                // of that window. It is reset by a successful REQUEST, which
+                // is what says the node is actually serving.
                 self.retry_at = None;
-                self.backoff = RECONNECT_BACKOFF_MIN;
                 Ok(api)
             }
             Err(e) => {
@@ -163,7 +167,12 @@ impl Link {
             .await
             .map_err(|_| LinkUnusable("timed out waiting for the node's reply".to_string()))?;
         match &reply {
-            Ok(_) => self.api = Some(api),
+            Ok(_) => {
+                // A served request is what says the node is working, so this
+                // is where the backoff is cleared.
+                self.backoff = RECONNECT_BACKOFF_MIN;
+                self.api = Some(api);
+            }
             // An error reply names no contract, so it cannot be checked
             // against what was asked; the connection goes either way. What
             // the error says about the NODE is worth passing on, so a caller
@@ -1282,6 +1291,45 @@ mod link_tests {
             node.connections.load(Ordering::SeqCst),
             1,
             "the second request did not dial again"
+        );
+    }
+
+    /// **The wait grows while the node keeps answering that it cannot
+    /// serve.**
+    ///
+    /// It did not, because a node answering "not joined yet" completes the
+    /// dial, and the backoff was reset on every successful dial. So the
+    /// bridge dialled about once a second for the whole of that window
+    /// instead of backing away from it.
+    #[tokio::test]
+    async fn the_wait_grows_while_the_node_keeps_refusing_to_serve() {
+        let node = node(Arc::new(|_, _| {
+            Action::Reply(Err(ClientError::from(ErrorKind::EmptyRing)))
+        }))
+        .await;
+        let mut link = link(&node.url).await;
+
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            // The reply arms the backoff; the next request is refused by it
+            // and says how long is left.
+            let _ = link.request(get(id(1)), Duration::from_secs(5)).await;
+            let refused = link
+                .request(get(id(1)), Duration::from_secs(5))
+                .await
+                .unwrap_err();
+            let text = format!("{refused:#}");
+            let ms: u64 = text
+                .rsplit_once("in ")
+                .and_then(|(_, tail)| tail.trim_end_matches("ms").parse().ok())
+                .unwrap_or_else(|| panic!("no wait in {text}"));
+            waits.push(ms);
+            // Let it expire so the next request reaches the node again.
+            tokio::time::sleep(Duration::from_millis(ms + 50)).await;
+        }
+        assert!(
+            waits.windows(2).all(|w| w[1] > w[0]),
+            "each wait must be longer than the last: {waits:?}"
         );
     }
 

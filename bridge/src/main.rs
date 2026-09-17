@@ -793,9 +793,10 @@ async fn observe_once(
                     held_rounds = *held,
                     from = next,
                     through = anchor.height,
-                    "the node has been unreachable for every round since this window was \
-                     first scanned; moving past it, so a first-sight claim in those blocks \
-                     is published only when the deep-confirmation ladder re-asserts it"
+                    "the node has been unreachable for every one of the last {} rounds; \
+                     moving past these blocks, so a first-sight claim in them is published \
+                     only when the deep-confirmation ladder re-asserts it, at depth 2",
+                    bitcoin_freenet_bridge::migrate::MAX_HELD_ROUNDS
                 );
                 store.set_checkpoint(obs.network(), &anchor)?;
                 *held = 0;
@@ -1137,6 +1138,11 @@ mod migration_wiring_pins {
                 concat!("let (after, seal) = count_", "walk(before, counted, now);"),
                 "the seal is no longer decided by count_walk, so one walk can \
                  record a migration as finished",
+            ),
+            (
+                concat!("migrate::MAX_HELD", "_ROUNDS {"),
+                "the checkpoint hold is no longer bounded, so one address whose \
+                 publish always fails freezes the whole network's observer",
             ),
             (
                 concat!("if round.is_", "empty() {"),

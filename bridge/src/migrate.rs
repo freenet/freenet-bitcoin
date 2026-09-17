@@ -303,7 +303,17 @@ pub fn count_walk(prev: Agreement, walk: Walk, now_ms: u64) -> (Agreement, bool)
 /// How many rounds in a row a network's scan checkpoint may be held back
 /// because the node could not be reached.
 ///
-/// At about two seconds a round this is a few minutes. Holding the checkpoint
+/// How long that is depends on why the node is failing, and the two cases
+/// pull in opposite directions. A node answering "not joined yet" fails fast,
+/// so rounds run at the loop's two-second cadence and this is about four
+/// minutes: short, which is what a transient failure wants. An address whose
+/// UPDATE times out pays `freenet::REQUEST_TIMEOUT` each round, so the same
+/// count is a couple of hours: long, where the failure is likely permanent. A
+/// wall-clock bound would behave the same in both; this count is the simpler
+/// thing that fixes the freeze, and the numbers are written down here so the
+/// next person tuning it knows which one they are changing.
+///
+/// Holding the checkpoint
 /// keeps a block whose claims failed to publish from being skipped, which is
 /// the whole point, but held forever it stops the observer ever scanning past
 /// that window: one address whose UPDATE always times out would freeze every
