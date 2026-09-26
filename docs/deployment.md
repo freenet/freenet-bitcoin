@@ -330,6 +330,13 @@ contract id as `serving the request inbox`.
   nobody renews lingers, at most about 6000 updates per unused script. The
   heights live in `script_interests.until_height`, added empty on upgrade; a
   build from before it ignores the column and gives every watch its day.
+  **So rolling the bridge back past #26 is not harmless:** every held watch
+  then ends a day after its last Watch, and a client that handed out a
+  payment address counting on its height (Harvest issues invoices this way
+  with no tab open) misses any payment made after that. Its only signal is
+  the script's scan watermark going stale, after the fact. Roll forward
+  instead where you can; if you must roll back, expect those payments to be
+  missed until each client's next visit re-sends its Watches.
 - **A watch lasts about a day** after the Watch that last asked for it
   (`WATCH_LIFETIME_MS`), or through the height it names if that is later,
   and then ends as if its requester had withdrawn it.
@@ -363,7 +370,8 @@ contract id as `serving the request inbox`.
   such a checkpoint is repaired when the bridge opens it. A network's first scan starts at its tip,
   so a Watch read before then is not scanned for the blocks before it (#7).
   Only mined blocks are scanned: a client waiting on a payment keeps
-  renewing until it is buried. The day a watch inherited from an older
+  renewing until it is buried, or names a height past which it no longer
+  needs the script. The day a watch inherited from an older
   bridge gets is dated by the host's clock alone, since no block carries a
   time yet at that moment, so a clock behind by more than a day at the
   upgrade grants less than a day: check it before upgrading. Nor does a watch

@@ -1770,6 +1770,7 @@ mod sealing {
     fn the_largest_allowed_request_fits_in_an_entry() {
         let mut r = request();
         r.scripts = vec![ByteBuf(vec![0xab; MAX_SCRIPT_BYTES]); MAX_SCRIPTS_PER_REQUEST];
+        r.watch_until_height = Some(u32::MAX);
         let sealed = seal(&bridge(), &gk(), 100, &r).unwrap();
         let body = InboxEntryBody {
             bridge: bridge(),

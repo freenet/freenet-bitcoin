@@ -1109,11 +1109,27 @@ impl Store {
                 },
             )
             .optional()?;
-        if let Some((prev_watching, prev, _)) = existing {
+        if let Some((prev_watching, prev, prev_until)) = existing {
             // Same millisecond: a withdrawal wins over a watch, so a Watch and
             // an Unwatch that tie end unwatched whichever arrives first.
             let newer = request_ms > prev || (request_ms == prev && prev_watching && !i.watching);
             if !newer {
+                // Entries at one inbox height are read in key order, not the
+                // order they were made, so a Watch naming a height can be
+                // read after its sender's later renewal naming none. It
+                // changes nothing else, but its height still raises a running
+                // watch's, as it would have read in order. Against a watch
+                // that is not running it is ignored with the rest of it. Read
+                // out of order around an Unwatch this can hold a watch to a
+                // height its sender later dropped: it errs towards watching,
+                // within the limit the height was held to when read.
+                if i.watching && prev_watching && i.until_height > prev_until {
+                    self.conn.execute(
+                        "UPDATE script_interests SET until_height = ?4
+                         WHERE network = ?1 AND script_pubkey = ?2 AND ghostkey = ?3",
+                        params![net, i.script, gk, i.until_height],
+                    )?;
+                }
                 return Ok(InterestChange::Stale);
             }
         }
@@ -1121,8 +1137,11 @@ impl Store {
         // A Watch never lowers the height a watch still running is held
         // through: a renewal that names none, or a lower one, is a repair,
         // not a request to end sooner. Only a running watch's height is kept,
-        // so one withdrawn or run out (`expire_interest`) is forgotten, even
-        // where a build from before heights left it on a withdrawn row.
+        // so one withdrawn or run out (`expire_interest`) is forgotten when
+        // this build records the next Watch. A build from before heights
+        // leaves the column alone, so a Watch it records after a withdrawal
+        // leaves the old height on a running row: rolling back and forward
+        // again can hold that watch to a height its sender once asked for.
         let until_height = if i.watching {
             let held = existing.and_then(|(w, _, u)| if w { u } else { None });
             held.max(i.until_height)

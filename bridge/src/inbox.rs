@@ -94,7 +94,9 @@ const WITHDRAWAL_MEMORY_MS: i64 = 24 * 60 * 60 * 1000;
 /// request.
 pub const REMOVAL_SHARE_PER_GHOSTKEY: usize = REMOVAL_BUDGET / 64;
 
-/// How long a watch lasts after the Watch that last asked for it: a day.
+/// How long a watch lasts after the Watch that last asked for it: a day, or
+/// longer where a Watch named a height to be held through
+/// (`freenet_bitcoin_inbox::MAX_WATCH_AHEAD_BLOCKS` has the rule).
 ///
 /// Watching costs the bridge an update to the script's address contract with
 /// every block, and an application typically watches an address for one
@@ -498,6 +500,10 @@ impl Processor<'_> {
     /// A watch's day counts from the later of its sender's timestamp and the
     /// time the bridge read it (see [`REQUEST_AHEAD_MAX_MS`]).
     ///
+    /// Nor while that deciding block is at or below a height the Watch asked
+    /// to be held through (freenet-bitcoin#26), so a payment mined at that
+    /// height is buried as deep as any other before the watch ends.
+    ///
     /// And not while a payment to the script has been seen and is not yet
     /// `deep_confirmations` deep, so the watch lasts until the payment's
     /// proof is complete. A reorg after that finds a moved payment anyway:
@@ -576,7 +582,10 @@ impl Processor<'_> {
                 }
                 // Checked again inside the transaction that ends the watch, so
                 // the observer's progress, the deciding block and the outputs
-                // are read as they stand.
+                // are read as they stand. The interest itself (its day and
+                // height) is not read again: this worker is the only writer
+                // of `script_interests`, so nothing can renew it in between.
+                // A second writer would have to re-check it here.
                 let outcome = self.store.with_transaction(|| {
                     let still_scanned = self
                         .store
@@ -625,7 +634,7 @@ impl Processor<'_> {
             tracing::info!(
                 ended,
                 stopped,
-                "watches nobody renewed for a day ended; `stopped` scripts are no longer scanned"
+                "watches that ran out ended (a day with no renewal, and past any height they were held through); `stopped` scripts are no longer scanned"
             );
         }
         Ok(lagging)
@@ -697,10 +706,17 @@ impl Processor<'_> {
                     tracing::debug!(network = ?net, "a watch's rescan hint was not acted on (freenet-bitcoin#7)");
                 }
                 // The height the sender wants these scripts watched through,
-                // held to MAX_WATCH_AHEAD_BLOCKS above the tip (the checkpoint
-                // where the tip is unreadable). Knowing neither, the bridge
-                // cannot bound it, so the watch gets its day and no more.
-                let until_height = match (req.watch_until_height, tip) {
+                // held to MAX_WATCH_AHEAD_BLOCKS above the higher of the tip
+                // and the scan position: a node that is resyncing reports a
+                // tip below blocks already scanned, and a sender dates from
+                // this bridge's tip contract, which follows the scan. Knowing
+                // neither, the bridge cannot bound the height, so the watch
+                // gets its day and no more.
+                let reference = match (tips.by_network.get(&net).copied(), checkpoint) {
+                    (Some(t), Some(c)) => Some(t.max(c)),
+                    (t, c) => t.or(c),
+                };
+                let until_height = match (req.watch_until_height, reference) {
                     (Some(h), Some(t)) => Some(h.min(t.saturating_add(MAX_WATCH_AHEAD_BLOCKS))),
                     (Some(_), None) => {
                         tracing::warn!(network = ?net, "a watch's height was not kept: neither the tip nor the scan position is known");
@@ -1970,6 +1986,167 @@ mod tests {
             1,
         );
         assert_eq!(watched(&store), vec![b"s1".to_vec()]);
+    }
+
+    /// A held watch whose height the deciding block has passed still waits
+    /// for a payment to it to be buried, as any watch does.
+    #[test]
+    fn a_held_watch_still_waits_for_a_payment_being_buried() {
+        let until = SIGNET_TIP + 300;
+        for (paid_at, kept) in [(Some(until + 3), true), (None, true), (Some(until), false)] {
+            let store = Store::open_in_memory().unwrap();
+            scanned_at(&store, T0);
+            watch_until_at(&store, &ghostkeys()[0], 1, T0, &tips(), Some(until));
+            payment(&store, paid_at);
+            tick(&store, &tips(), when_scanned_to(until + 6));
+            assert_eq!(!watched(&store).is_empty(), kept, "paid at {paid_at:?}");
+        }
+    }
+
+    /// A held watch past its height is not ended while its owner's request
+    /// waits on the removal budget, as any watch is not.
+    #[test]
+    fn a_held_watch_is_kept_while_its_owners_request_waits() {
+        let store = Store::open_in_memory().unwrap();
+        scanned_at(&store, T0);
+        let owner = &ghostkeys()[0];
+        let until = SIGNET_TIP + 300;
+        watch_until_at(&store, owner, 1, T0, &tips(), Some(until));
+        let later = when_scanned_to(until + 6);
+        scanned_at(&store, later);
+        store
+            .with_transaction(|| {
+                for i in 0..REMOVAL_BUDGET as u64 {
+                    let mut k = [0xffu8; 32];
+                    k[..8].copy_from_slice(&i.to_be_bytes());
+                    store.mark_handled(&k, FLOOR + 1, &k)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let renewal = entry(owner, FLOOR + 1, &request(Action::Watch, b"spk", 2));
+        let pass = run_at(&store, &inbox(FLOOR, vec![renewal]), &tips(), later);
+        assert_eq!(pass.deferred, 1);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()], "waits for it");
+        tick(&store, &tips(), later);
+        assert!(watched(&store).is_empty());
+    }
+
+    /// One requester's height keeps the script scanned after another's watch
+    /// on it runs out, and only until that height.
+    #[test]
+    fn one_requesters_height_holds_a_script_another_stopped_wanting() {
+        let store = Store::open_in_memory().unwrap();
+        scanned_at(&store, T0);
+        let until = SIGNET_TIP + 300;
+        watch_until_at(&store, &ghostkeys()[0], 1, T0, &tips(), Some(until));
+        watch_until_at(&store, &ghostkeys()[1], 1, T0, &tips(), None);
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        run_at(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![entry(
+                    &ghostkeys()[1],
+                    FLOOR + 1,
+                    &request(Action::Unwatch, b"spk", 2),
+                )],
+            ),
+            &tips(),
+            T0 + 25 * HOUR,
+        );
+        assert_eq!(
+            watched(&store),
+            vec![b"spk".to_vec()],
+            "the other's Unwatch"
+        );
+        tick(&store, &tips(), when_scanned_to(until + 5));
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        tick(&store, &tips(), when_scanned_to(until + 6));
+        assert!(watched(&store).is_empty());
+    }
+
+    /// After an Unwatch, a new Watch naming a height is held to that height,
+    /// not the one before.
+    #[test]
+    fn a_watch_after_an_unwatch_is_held_to_its_own_height() {
+        let store = Store::open_in_memory().unwrap();
+        scanned_at(&store, T0);
+        let gk = &ghostkeys()[0];
+        watch_until_at(&store, gk, 1, T0, &tips(), Some(SIGNET_TIP + 1000));
+        run_at(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![entry(gk, FLOOR + 1, &request(Action::Unwatch, b"spk", 2))],
+            ),
+            &tips(),
+            T0,
+        );
+        watch_until_at(&store, gk, 3, T0, &tips(), Some(SIGNET_TIP + 300));
+        tick(&store, &tips(), when_scanned_to(SIGNET_TIP + 305));
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        tick(&store, &tips(), when_scanned_to(SIGNET_TIP + 306));
+        assert!(
+            watched(&store).is_empty(),
+            "the old height went with the Unwatch"
+        );
+    }
+
+    /// Entries at one height are read in key order, so a Watch naming a
+    /// height can be read after its sender's later renewal naming none. Its
+    /// height still holds the watch; against a later Unwatch it does nothing.
+    #[test]
+    fn a_height_read_after_a_later_renewal_still_holds_the_watch() {
+        let store = Store::open_in_memory().unwrap();
+        scanned_at(&store, T0);
+        let gk = &ghostkeys()[0];
+        let until = SIGNET_TIP + 300;
+        watch_until_at(&store, gk, 2, T0, &tips(), None);
+        watch_until_at(&store, gk, 1, T0, &tips(), Some(until));
+        tick(&store, &tips(), when_scanned_to(until + 5));
+        assert_eq!(watched(&store), vec![b"spk".to_vec()], "held");
+        tick(&store, &tips(), when_scanned_to(until + 6));
+        assert!(watched(&store).is_empty());
+
+        let store = Store::open_in_memory().unwrap();
+        scanned_at(&store, T0);
+        watch_until_at(&store, gk, 1, T0, &tips(), None);
+        run_at(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![entry(gk, FLOOR + 1, &request(Action::Unwatch, b"spk", 3))],
+            ),
+            &tips(),
+            T0,
+        );
+        watch_until_at(&store, gk, 2, T0, &tips(), Some(until));
+        assert!(
+            watched(&store).is_empty(),
+            "an older Watch after the Unwatch"
+        );
+    }
+
+    /// A node that is resyncing reports a tip below blocks already scanned.
+    /// The height is held above the scan position then, not the low tip.
+    #[test]
+    fn a_watchs_height_is_held_above_the_scan_when_the_tip_is_behind_it() {
+        let store = Store::open_in_memory().unwrap();
+        scanned_at(&store, T0);
+        let behind = Tips {
+            by_network: HashMap::from([
+                (BitcoinNetwork::Bitcoin, MAINNET_TIP),
+                (SIGNET, SIGNET_TIP - 5000),
+            ]),
+        };
+        watch_until_at(&store, &ghostkeys()[0], 1, T0, &behind, Some(u32::MAX));
+        let limit = SIGNET_TIP + MAX_WATCH_AHEAD_BLOCKS;
+        tick(&store, &tips(), when_scanned_to(limit + 5));
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        tick(&store, &tips(), when_scanned_to(limit + 6));
+        assert!(watched(&store).is_empty());
     }
 
     #[test]

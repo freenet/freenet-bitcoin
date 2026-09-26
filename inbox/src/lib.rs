@@ -61,7 +61,7 @@
 //! that asked for it and is above its [`InboxRequest::watch_until_height`], if it named one, unless
 //! a payment to the script is still being buried. A sender that still wants the script sends the
 //! Watch again, with a newer `made_at_ms`, well before then: a renewal on its way to the bridge's
-//! node when the watch ends does not save it. (Why wider lines: see [`MAX_WATCH_AHEAD_BLOCKS`].)
+//! node when the watch ends does not save it.
 //!
 //! A sender sends its entry together with the floor it read
 //! ([`InboxDelta::submission`]), so a peer whose floor lags takes the floor
@@ -849,6 +849,9 @@ impl RemovalBatch {
 // on purpose: the inbox contract's bytes include the line and column of every
 // panic site in this file, so a line added above one re-keys the contract.
 // The docs this change touched above were rewrapped to keep their line counts.
+// To check an edit above: `git diff -U0 origin/main -- inbox/src/lib.rs` must
+// net zero lines before this block, and scripts/build-contracts.sh must print
+// the inbox hash CI printed for main.
 // ---------------------------------------------------------------------------
 
 /// How far above its own tip a bridge holds a Watch's
@@ -871,11 +874,46 @@ impl RemovalBatch {
 /// script counts once against the sender's limit of watched scripts, however
 /// far ahead it is held.
 ///
+/// Entries at one inbox height are read in key order, not the order their
+/// sender made them, so a Watch naming a height may be read after the same
+/// sender's later renewal naming none. Its height still raises the running
+/// watch's; nothing else about it is applied.
+///
 /// The field is left out of the encoding when `None`, so a request without it
 /// is the same bytes as before it existed. A bridge from before the field
-/// ignores it and gives the watch its day; a sender can tell, because the scan
-/// watermark that bridge publishes to the script's address contract stops
-/// advancing.
+/// ignores it and gives the watch its day.
+///
+/// # What a sender can rely on
+///
+/// * **The height it will get.** At least `min(h, T + MAX_WATCH_AHEAD_BLOCKS)`
+///   for a requested `h`, where `T` is the height in this bridge's own tip
+///   contract for the network, read before sending. The bridge clamps above
+///   the higher of its node's tip and its scan position, and its tip contract
+///   follows its scan, so only a reorg that shortens the chain can make it
+///   less, by that reorg's depth.
+/// * **That the bridge read the request**, from the removal naming the entry
+///   ([`InboxStateV1::is_removed`]). Read is not accepted: a Watch past the
+///   sender's limit of watched scripts is removed the same way.
+/// * **That the script is being scanned now**, from the scan watermark this
+///   bridge publishes to the script's address contract every block for every
+///   script it watches, used or not.
+///
+/// What it cannot tell in advance is that the bridge honours heights at all:
+/// a bridge from before the field, one rolled back to such a build included,
+/// scans the script exactly as a new one does until the day runs out, and then
+/// stops. A sender that must not be wrong for that day either knows which
+/// build the bridge it trusts runs, or counts only on the day until it has
+/// seen a script's watermark keep advancing for more than a day after the last
+/// Watch naming it.
+///
+/// # Asking for only what is needed
+///
+/// A held script keeps its place under the sender's limit of watched scripts
+/// until its height passes, and only an Unwatch frees it sooner. A sender that
+/// asks for the whole six weeks on every script it may use fills that limit
+/// far sooner than one whose watches lapse after a day, and a Watch past the
+/// limit is refused without a word. Ask for the height the script is actually
+/// needed to, and Unwatch what is no longer needed while you can.
 ///
 /// # Why six weeks
 ///
@@ -889,5 +927,11 @@ impl RemovalBatch {
 /// scripts does that, and a key that renews daily could always hold that many
 /// for ever. Each watched script costs the bridge an address contract update
 /// per block, so a script held this far ahead and never used costs about 6000
-/// updates, where one renewed for a day costs about 150.
+/// updates, where one renewed for a day costs about 150: one request now
+/// commits the bridge to about 40 times the work it did, which is the price of
+/// a client being able to go away.
+///
+/// Senders compute what they can rely on from this value, so it is part of the
+/// protocol rather than an operator's setting: a bridge that wanted a lower
+/// limit would have to say so where senders can read it.
 pub const MAX_WATCH_AHEAD_BLOCKS: u32 = 6 * 7 * 144;
