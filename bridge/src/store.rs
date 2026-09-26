@@ -59,6 +59,10 @@ pub struct Interest<'a> {
     pub watching: bool,
     /// When the sender made the request, by the sender's clock.
     pub request_ms: u64,
+    /// For a Watch, the height the bridge holds it through, already limited
+    /// to [`freenet_bitcoin_inbox::MAX_WATCH_AHEAD_BLOCKS`] above the tip
+    /// (freenet-bitcoin#26). Ignored for a withdrawal.
+    pub until_height: Option<u32>,
 }
 
 /// What [`Store::set_interest`] did.
@@ -387,6 +391,9 @@ impl Store {
                 watching       INTEGER NOT NULL,
                 request_ms     INTEGER NOT NULL,
                 recorded_ms    INTEGER NOT NULL,
+                -- The height a Watch holds its script through, whatever its
+                -- day says (freenet-bitcoin#26). NULL for none.
+                until_height   INTEGER,
                 PRIMARY KEY (network, script_pubkey, ghostkey)
             );
             CREATE INDEX IF NOT EXISTS script_interests_by_ghostkey
@@ -431,6 +438,21 @@ impl Store {
             DROP TABLE IF EXISTS challenges;
             "#,
         )?;
+        // `script_interests` first had no `until_height`, when every watch
+        // lasted a day. Every watch recorded before it named no height, which
+        // is what NULL says, so the column is added empty. A build from before
+        // it still reads and writes the table, by column name, so rolling back
+        // costs only the heights.
+        let interests_have_until = self
+            .conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('script_interests') WHERE name = 'until_height'",
+            )?
+            .exists([])?;
+        if !interests_have_until {
+            self.conn
+                .execute_batch("ALTER TABLE script_interests ADD COLUMN until_height INTEGER;")?;
+        }
         // A checkpoint below every block record kept reads as a reorg at a
         // height nothing was recorded for, and the round retracts every
         // payment above it. `rewind_checkpoint_to` stops at the oldest record
@@ -654,6 +676,17 @@ impl Store {
                 |r| r.get::<_, i64>(0),
             )
             .optional()?)
+    }
+
+    /// The height of the newest block recorded on `net`. Unlike the
+    /// checkpoint, a startup rewind does not lower it; a reorg does, by
+    /// forgetting the blocks it replaced.
+    pub fn latest_block_height(&self, net: BitcoinNetwork) -> anyhow::Result<Option<u32>> {
+        Ok(self.conn.query_row(
+            "SELECT MAX(height) FROM seen_blocks WHERE network = ?1",
+            params![net.as_str()],
+            |r| r.get::<_, Option<u32>>(0),
+        )?)
     }
 
     pub fn block_at(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<Option<BlockHash>> {
@@ -1072,24 +1105,60 @@ impl Store {
         let net = i.network.as_str();
         let gk = i.ghostkey.to_vec();
         let request_ms = i.request_ms.min(i64::MAX as u64) as i64;
-        let existing: Option<(bool, i64)> = self
+        let existing: Option<(bool, i64, Option<u32>)> = self
             .conn
             .query_row(
-                "SELECT watching, request_ms FROM script_interests
+                "SELECT watching, request_ms, until_height FROM script_interests
                  WHERE network = ?1 AND script_pubkey = ?2 AND ghostkey = ?3",
                 params![net, i.script, gk],
-                |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? != 0,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<u32>>(2)?,
+                    ))
+                },
             )
             .optional()?;
-        if let Some((prev_watching, prev)) = existing {
+        if let Some((prev_watching, prev, prev_until)) = existing {
             // Same millisecond: a withdrawal wins over a watch, so a Watch and
             // an Unwatch that tie end unwatched whichever arrives first.
             let newer = request_ms > prev || (request_ms == prev && prev_watching && !i.watching);
             if !newer {
+                // Entries at one inbox height are read in key order, not the
+                // order they were made, so a Watch naming a height can be
+                // read after its sender's later renewal naming none. It
+                // changes nothing else, but its height still raises a running
+                // watch's, as it would have read in order. Against a watch
+                // that is not running it is ignored with the rest of it. Read
+                // out of order around an Unwatch this can hold a watch to a
+                // height its sender later dropped: it errs towards watching,
+                // within the limit the height was held to when read.
+                if i.watching && prev_watching && i.until_height > prev_until {
+                    self.conn.execute(
+                        "UPDATE script_interests SET until_height = ?4
+                         WHERE network = ?1 AND script_pubkey = ?2 AND ghostkey = ?3",
+                        params![net, i.script, gk, i.until_height],
+                    )?;
+                }
                 return Ok(InterestChange::Stale);
             }
         }
-        let was_watching = existing.is_some_and(|(w, _)| w);
+        let was_watching = existing.is_some_and(|(w, _, _)| w);
+        // A Watch never lowers the height a watch still running is held
+        // through: a renewal that names none, or a lower one, is a repair,
+        // not a request to end sooner. Only a running watch's height is kept,
+        // so one withdrawn or run out (`expire_interest`) is forgotten when
+        // this build records the next Watch. A build from before heights
+        // leaves the column alone, so a Watch it records after a withdrawal
+        // leaves the old height on a running row: rolling back and forward
+        // again can hold that watch to a height its sender once asked for.
+        let until_height = if i.watching {
+            let held = existing.and_then(|(w, _, u)| if w { u } else { None });
+            held.max(i.until_height)
+        } else {
+            None
+        };
 
         // A withdrawal is kept so a delayed older Watch cannot land after it.
         // Each requester may hold a bounded number, like watches, or one could
@@ -1132,11 +1201,20 @@ impl Store {
 
         self.conn.execute(
             "INSERT INTO script_interests
-                 (network, script_pubkey, ghostkey, watching, request_ms, recorded_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 (network, script_pubkey, ghostkey, watching, request_ms, recorded_ms,
+                  until_height)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(network, script_pubkey, ghostkey) DO UPDATE SET
-                 watching = ?4, request_ms = ?5, recorded_ms = ?6",
-            params![net, i.script, gk, i.watching as i64, request_ms, now_ms],
+                 watching = ?4, request_ms = ?5, recorded_ms = ?6, until_height = ?7",
+            params![
+                net,
+                i.script,
+                gk,
+                i.watching as i64,
+                request_ms,
+                now_ms,
+                until_height
+            ],
         )?;
 
         Ok(match (i.watching, was_watching) {
@@ -1160,20 +1238,23 @@ impl Store {
     }
 
     /// Requesters on `net` whose latest request is a Watch whose day began at
-    /// or before `began_by_ms`, as (script, Ghost Key): the watches that have
-    /// run out. A watch's day begins at the later of its sender's timestamp,
-    /// counted at most `ahead_max_ms` past the bridge's, and the time the
-    /// bridge read it. Operator interests never run out and are left out.
+    /// or before `began_by_ms` and whose height, if it named one, is below
+    /// `past_height`, as (script, Ghost Key): the watches that have run out.
+    /// A watch's day begins at the later of its sender's timestamp, counted
+    /// at most `ahead_max_ms` past the bridge's, and the time the bridge read
+    /// it. Operator interests never run out and are left out.
     pub fn watches_run_out(
         &self,
         net: BitcoinNetwork,
         began_by_ms: i64,
         ahead_max_ms: i64,
+        past_height: u32,
     ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut stmt = self.conn.prepare(
             "SELECT script_pubkey, ghostkey FROM script_interests
              WHERE network = ?1 AND watching = 1 AND ghostkey != ?2
                AND MAX(MIN(request_ms, recorded_ms + ?4), recorded_ms) <= ?3
+               AND (until_height IS NULL OR until_height < ?5)
              ORDER BY script_pubkey, ghostkey",
         )?;
         let rows = stmt
@@ -1182,7 +1263,8 @@ impl Store {
                     net.as_str(),
                     OPERATOR_INTEREST.to_vec(),
                     began_by_ms,
-                    ahead_max_ms
+                    ahead_max_ms,
+                    past_height
                 ],
                 |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
             )?
@@ -1416,10 +1498,12 @@ mod tests {
     #[test]
     fn a_watch_row_that_cannot_be_read_fails_the_expiry() {
         let s = store();
-        s.execute_for_test("INSERT INTO script_interests VALUES ('signet', X'00', 7, 1, 0, 0);")
-            .unwrap();
+        s.execute_for_test(
+            "INSERT INTO script_interests VALUES ('signet', X'00', 7, 1, 0, 0, NULL);",
+        )
+        .unwrap();
         assert!(s
-            .watches_run_out(BitcoinNetwork::Signet, i64::MAX, 0)
+            .watches_run_out(BitcoinNetwork::Signet, i64::MAX, 0, u32::MAX)
             .is_err());
     }
 
@@ -1527,6 +1611,7 @@ mod tests {
             ghostkey: gk,
             watching,
             request_ms,
+            until_height: None,
         }
     }
 
@@ -1710,6 +1795,95 @@ mod tests {
             InterestChange::Withdrawn { last: false },
             "the operator still wants it"
         );
+    }
+
+    /// A height left on a withdrawn row, as a build from before heights
+    /// leaves one when it records an Unwatch after this build recorded the
+    /// Watch, is not taken up by a later Watch.
+    #[test]
+    fn a_height_on_a_withdrawn_row_is_not_taken_up_again() {
+        let s = store();
+        let gk = [1u8; 32];
+        s.execute_for_test(&format!(
+            "INSERT INTO script_interests VALUES ('signet', X'616263', X'{}', 0, 5, 5, 900);",
+            "01".repeat(32)
+        ))
+        .unwrap();
+        s.set_interest(&interest(b"abc", &gk, true, 6), 10, 0)
+            .unwrap();
+        assert!(
+            !s.watches_run_out(BitcoinNetwork::Signet, i64::MAX, 0, 0)
+                .unwrap()
+                .is_empty(),
+            "runs out with its day: the old height was not taken up"
+        );
+    }
+
+    /// A database from before watches could be held through a height keeps
+    /// its watches, each with no height, which is what they had.
+    #[test]
+    fn a_database_from_before_held_watches_keeps_its_watches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE script_interests (
+                     network TEXT NOT NULL, script_pubkey BLOB NOT NULL,
+                     ghostkey BLOB NOT NULL, watching INTEGER NOT NULL,
+                     request_ms INTEGER NOT NULL, recorded_ms INTEGER NOT NULL,
+                     PRIMARY KEY (network, script_pubkey, ghostkey));
+                 INSERT INTO script_interests VALUES ('signet', X'616263', X'0101010101010101010101010101010101010101010101010101010101010101', 1, 5, 5);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.watches_run_out(BitcoinNetwork::Signet, 10, 0, 0).unwrap(),
+            vec![(b"abc".to_vec(), vec![1u8; 32])],
+            "kept, with no height holding it"
+        );
+        drop(s);
+        Store::open(&path).expect("and opens again once migrated");
+    }
+
+    /// The height a watch is held through only ever rises while it runs, and
+    /// a withdrawal or the watch running out forgets it.
+    #[test]
+    fn a_watchs_height_rises_while_it_runs_and_goes_when_it_ends() {
+        let s = store();
+        let gk = [1u8; 32];
+        let held = |until: Option<u32>, ms: u64| Interest {
+            until_height: until,
+            ..interest(b"abc", &gk, true, ms)
+        };
+        let run_out_before = |h: u32| -> bool {
+            !s.watches_run_out(BitcoinNetwork::Signet, i64::MAX, 0, h)
+                .unwrap()
+                .is_empty()
+        };
+        s.set_interest(&held(Some(100), 1), 10, 0).unwrap();
+        assert!(!run_out_before(100) && run_out_before(101));
+        s.set_interest(&held(None, 2), 10, 0).unwrap();
+        assert!(!run_out_before(100), "a renewal naming none keeps it");
+        s.set_interest(&held(Some(50), 3), 10, 0).unwrap();
+        assert!(!run_out_before(100), "nor does a lower one lower it");
+        s.set_interest(&held(Some(200), 4), 10, 0).unwrap();
+        assert!(
+            !run_out_before(200) && run_out_before(201),
+            "a higher one raises it"
+        );
+
+        s.expire_interest(BitcoinNetwork::Signet, b"abc", &gk, 0)
+            .unwrap();
+        s.set_interest(&held(None, 5), 10, 0).unwrap();
+        assert!(run_out_before(0), "running out forgot it");
+
+        s.set_interest(&held(Some(300), 6), 10, 0).unwrap();
+        s.set_interest(&interest(b"abc", &gk, false, 7), 10, 0)
+            .unwrap();
+        s.set_interest(&held(None, 8), 10, 0).unwrap();
+        assert!(run_out_before(0), "a withdrawal forgot it");
     }
 
     #[test]
@@ -1972,7 +2146,7 @@ mod tests {
         // Any time before this test ran: the watch was read again since.
         let before_the_upgrade = 1_700_000_000_000;
         assert!(s
-            .watches_run_out(BitcoinNetwork::Signet, before_the_upgrade, 0)
+            .watches_run_out(BitcoinNetwork::Signet, before_the_upgrade, 0, u32::MAX)
             .unwrap()
             .is_empty());
     }
@@ -1989,7 +2163,7 @@ mod tests {
         }
         let s = Store::open(&path).unwrap();
         assert!(
-            s.watches_run_out(BitcoinNetwork::Signet, ahead - 1, 0)
+            s.watches_run_out(BitcoinNetwork::Signet, ahead - 1, 0, u32::MAX)
                 .unwrap()
                 .is_empty(),
             "a read time already ahead was lowered to the clock"
@@ -2012,7 +2186,7 @@ mod tests {
         drop(s);
         let s = Store::open(&path).unwrap();
         assert_eq!(
-            s.watches_run_out(BitcoinNetwork::Signet, 1_700_000_000_000, 0)
+            s.watches_run_out(BitcoinNetwork::Signet, 1_700_000_000_000, 0, u32::MAX)
                 .unwrap()
                 .len(),
             1,

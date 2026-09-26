@@ -101,6 +101,20 @@ pub fn unseal(
     mainnet_height: u32,
     sealed: &Sealed,
 ) -> Result<InboxRequest, String> {
+    let plaintext = open(signing, ghostkey, mainnet_height, sealed)?;
+    let request: InboxRequest = from_cbor(&plaintext)?;
+    request.check()?;
+    Ok(request)
+}
+
+/// Decrypt a sealed request to the CBOR it was sealed from, without decoding
+/// it: [`unseal`] does that, and a test decodes it as an older bridge would.
+pub(crate) fn open(
+    signing: &SigningKey,
+    ghostkey: &GhostkeyId,
+    mainnet_height: u32,
+    sealed: &Sealed,
+) -> Result<Vec<u8>, String> {
     let secret = bridge_decryption_key(signing);
     let recipient = PublicKey::from(&secret);
     let bridge = BridgeId(signing.verifying_key().to_bytes());
@@ -122,7 +136,5 @@ pub fn unseal(
             },
         )
         .map_err(|_| "request does not open for this bridge, sender and entry")?;
-    let request: InboxRequest = from_cbor(&plaintext)?;
-    request.check()?;
-    Ok(request)
+    Ok(plaintext)
 }

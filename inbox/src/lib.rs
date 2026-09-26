@@ -56,12 +56,12 @@
 //! real floor by three blocks or more dates below it and is dropped at once,
 //! so a sender should read the floor just before sending.
 //!
-//! **A Watch lasts about a day.** The bridge ends a watch once a block it has
-//! scanned, buried as deep as it requires of payments, is dated a day after
-//! the last Watch that asked for it, unless a payment to the script is still
-//! being buried. A sender that still wants the script sends the Watch again,
-//! with a newer `made_at_ms`, well before the day is out: a renewal on its way
-//! to the bridge's node when the watch ends does not save it.
+//! **A Watch lasts a day, or through the height it names.** The bridge ends a watch once a block
+//! it has scanned, buried as deep as it requires of payments, is dated a day after the last Watch
+//! that asked for it and is above its [`InboxRequest::watch_until_height`], if it named one, unless
+//! a payment to the script is still being buried. A sender that still wants the script sends the
+//! Watch again, with a newer `made_at_ms`, well before then: a renewal on its way to the bridge's
+//! node when the watch ends does not save it.
 //!
 //! A sender sends its entry together with the floor it read
 //! ([`InboxDelta::submission`]), so a peer whose floor lags takes the floor
@@ -375,13 +375,12 @@ pub fn production_master() -> MasterKey {
 /// What a request asks the bridge to do.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
-    /// Start, or keep, synchronizing these scripts for a day of block time
-    /// from the later of `made_at_ms` and when the bridge reads it (by its
-    /// clock, or the newest block it has scanned where that is later),
-    /// counting `made_at_ms` at most a week past that. Send it again, with a
-    /// newer `made_at_ms`, to keep a script watched longer, and keep doing so
-    /// until any payment awaited is buried: a transaction still unmined when
-    /// the day ends is not found.
+    /// Start, or keep, synchronizing these scripts for a day of block time from the later of
+    /// `made_at_ms` and when the bridge reads it (by its clock, or the newest block it has scanned
+    /// where that is later), counting `made_at_ms` at most a week past that, or through
+    /// [`InboxRequest::watch_until_height`] where that is later. Send it again, with a newer
+    /// `made_at_ms`, to keep a script watched longer, and keep doing so until any payment awaited
+    /// is buried: a transaction still unmined when the watch ends is not found.
     Watch,
     /// Stop wanting these scripts synchronized. Removes only the sender's own
     /// interest: the bridge stops scanning a script when nobody still wants it.
@@ -397,18 +396,19 @@ pub struct InboxRequest {
     /// A hint that nothing before this height needs scanning: a freshly
     /// derived address has no history. The bridge may ignore it.
     pub scan_from_height: Option<u32>,
-    /// When the sender made this request, in milliseconds since the Unix
-    /// epoch by the sender's own clock. Only the bridge reads it, to apply one
-    /// sender's requests about one script in the order they were made, which
-    /// neither the entries' heights nor their arrival order can tell it.
-    /// Untrusted, and only ever compared with the same sender's requests.
-    ///
-    /// It must strictly increase across one sender's requests: a sender making
-    /// two in one millisecond adds one to the second. On a tie the bridge
-    /// takes a withdrawal over a watch. So a sender whose clock ran ahead
-    /// keeps its timestamps above those it sent meanwhile: until its clock
-    /// passes them, a request dated lower is ignored, a renewal included.
+    /// When the sender made this request, in milliseconds since the Unix epoch by the sender's own
+    /// clock. Only the bridge reads it, to apply one sender's requests about one script in the
+    /// order they were made, which neither the entries' heights nor their arrival order can tell
+    /// it. Untrusted, and only ever compared with the same sender's requests. It must strictly
+    /// increase across one sender's requests: a sender making two in one millisecond adds one to
+    /// the second. On a tie the bridge takes a withdrawal over a watch. So a sender whose clock ran
+    /// ahead keeps its timestamps above those it sent meanwhile: until its clock passes them, a
+    /// request dated lower is ignored, a renewal included.
     pub made_at_ms: u64,
+    /// For a Watch, the last block of `network` to scan these scripts through: see
+    /// [`MAX_WATCH_AHEAD_BLOCKS`], which says what the bridge does with it (freenet-bitcoin#26).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_until_height: Option<u32>,
 }
 
 impl InboxRequest {
@@ -843,3 +843,95 @@ impl RemovalBatch {
         true
     }
 }
+
+// ---------------------------------------------------------------------------
+// Watches held through a height (freenet-bitcoin#26). At the end of the file
+// on purpose: the inbox contract's bytes include the line and column of every
+// panic site in this file, so a line added above one re-keys the contract.
+// The docs this change touched above were rewrapped to keep their line counts.
+// To check an edit above: `git diff -U0 origin/main -- inbox/src/lib.rs` must
+// net zero lines before this block, and scripts/build-contracts.sh must print
+// the inbox hash CI printed for main.
+// ---------------------------------------------------------------------------
+
+/// How far above its own tip a bridge holds a Watch's
+/// [`InboxRequest::watch_until_height`]: 6048 blocks, six weeks at ten minutes
+/// a block.
+///
+/// # What the bridge does with the height
+///
+/// It keeps the watch until the block it buries as deep as it requires of
+/// payments (its deciding block) is above the height, or for the usual day,
+/// whichever is later. So a payment mined at or below the height is found and
+/// buried in full before the watch ends. The height is held to at most this
+/// many blocks above the bridge's tip for the request's network when it reads
+/// the request, or above its scan position where the tip cannot be read; a
+/// bridge that knows neither keeps no height and gives the watch its day.
+///
+/// A later Watch never lowers a height already held, so a renewal that names
+/// none, from a sender that predates the field, is harmless. An Unwatch ends
+/// the watch at once and forgets it, as does the watch running out. Every
+/// script counts once against the sender's limit of watched scripts, however
+/// far ahead it is held.
+///
+/// Entries at one inbox height are read in key order, not the order their
+/// sender made them, so a Watch naming a height may be read after the same
+/// sender's later renewal naming none. Its height still raises the running
+/// watch's; nothing else about it is applied.
+///
+/// The field is left out of the encoding when `None`, so a request without it
+/// is the same bytes as before it existed. A bridge from before the field
+/// ignores it and gives the watch its day.
+///
+/// # What a sender can rely on
+///
+/// * **The height it will get.** At least `min(h, T + MAX_WATCH_AHEAD_BLOCKS)`
+///   for a requested `h`, where `T` is the height in this bridge's own tip
+///   contract for the network, read before sending. The bridge clamps above
+///   the highest of its node's tip, its scan position and the newest block it
+///   has recorded, and its tip contract follows its scan, so only a reorg that
+///   shortens the chain can make it less, by that reorg's depth.
+/// * **That the bridge read the request**, from the removal naming the entry
+///   ([`InboxStateV1::is_removed`]). Read is not accepted: a Watch past the
+///   sender's limit of watched scripts is removed the same way.
+/// * **That the script is being scanned now**, from the scan watermark this
+///   bridge publishes to the script's address contract every block for every
+///   script it watches, used or not.
+///
+/// What it cannot tell in advance is that the bridge honours heights at all:
+/// a bridge from before the field, one rolled back to such a build included,
+/// scans the script exactly as a new one does until the day runs out, and then
+/// stops. A sender that must not be wrong for that day either knows which
+/// build the bridge it trusts runs, or counts only on the day until it has
+/// seen a script's watermark keep advancing for more than a day after the last
+/// Watch naming it.
+///
+/// # Asking for only what is needed
+///
+/// A held script keeps its place under the sender's limit of watched scripts
+/// until its height passes, and only an Unwatch frees it sooner. A sender that
+/// asks for the whole six weeks on every script it may use fills that limit
+/// far sooner than one whose watches lapse after a day, and a Watch past the
+/// limit is refused without a word. Ask for the height the script is actually
+/// needed to, and Unwatch what is no longer needed while you can.
+///
+/// # Why six weeks
+///
+/// Sized for an application that hands out payment addresses from a pool
+/// watched in advance, then needs each one watched for a payment window after
+/// handing it out: Harvest needs 2208 blocks for that, which leaves a pool
+/// watched this far ahead usable for about four weeks with nobody renewing it.
+///
+/// It bounds how long a watch nobody renews outlives its requester, not how
+/// much a Ghost Key can have watched: the per-Ghost Key limit of watched
+/// scripts does that, and a key that renews daily could always hold that many
+/// for ever. Each watched script costs the bridge an address contract update
+/// per block, so a script held this far ahead and never used costs about 6000
+/// updates, where one renewed for a day costs about 150: one request now
+/// commits the bridge to about 40 times the work it did, which is the price of
+/// a client being able to go away.
+///
+/// Senders compute what they can rely on from this value, so it is part of the
+/// protocol rather than an operator's setting: a bridge that wanted a lower
+/// limit would have to say so where senders can read it.
+pub const MAX_WATCH_AHEAD_BLOCKS: u32 = 6 * 7 * 144;

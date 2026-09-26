@@ -79,6 +79,12 @@ The bridge necessarily learns, and can correlate:
   when. It records this in its own database (`script_interests`), because that
   is what lets one requester's unwatch leave other requesters' interest in
   place.
+- how long the requester wants X watched, when a Watch names a height to hold
+  it through (`watch_until_height`). A client that watches a pool of fresh
+  addresses ahead of use, as Harvest does, tells the bridge the pool's
+  addresses, as the renewals it replaces already did. It does not hand over an
+  extended public key: the bridge learns the addresses it is asked about and
+  no others.
 
 It is no longer handed the requester's IP address: a request travels through
 Freenet rather than over a connection to the bridge. Freenet traffic analysis
@@ -140,7 +146,8 @@ Ghost Key, and never learns that Freenet was involved.
    database. Mitigated by self-hosting, not eliminated by anything in this repo.
 2. **Inbox metadata.** Anyone reading a bridge's inbox sees which Ghost Keys
    send it requests, when, and how large each sealed request is. Requests are
-   not padded, so size hints at how many scripts one names.
+   not padded, so size hints at how many scripts one names, and whether a
+   Watch names a height to be held through (about 24 bytes more).
 3. **Freenet traffic analysis.** Subscribing to `BitcoinAddressContract(X)`
    signals interest in X to an observer well-placed on the network. Inherent to
    the platform.

@@ -1705,6 +1705,7 @@ mod sealing {
             scripts: vec![ByteBuf(vec![0x00, 0x14, 1, 2, 3])],
             scan_from_height: Some(900_000),
             made_at_ms: 1_757_000_000_000,
+            watch_until_height: None,
         }
     }
 
@@ -1769,6 +1770,7 @@ mod sealing {
     fn the_largest_allowed_request_fits_in_an_entry() {
         let mut r = request();
         r.scripts = vec![ByteBuf(vec![0xab; MAX_SCRIPT_BYTES]); MAX_SCRIPTS_PER_REQUEST];
+        r.watch_until_height = Some(u32::MAX);
         let sealed = seal(&bridge(), &gk(), 100, &r).unwrap();
         let body = InboxEntryBody {
             bridge: bridge(),
@@ -1810,6 +1812,102 @@ mod sealing {
                 "scan_from_height",
                 "scripts"
             ]
+        );
+
+        // The horizon (freenet-bitcoin#26) is the one addition, and appears
+        // only when set. It tells the bridge how long its sender wants the
+        // scripts watched, which the bridge learned anyway from the renewals
+        // it replaces.
+        let mut r = request();
+        r.watch_until_height = Some(200_000);
+        let bytes = freenet_bitcoin_common::to_cbor(&r).unwrap();
+        let value: ciborium::Value = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let mut fields: Vec<String> = value
+            .as_map()
+            .expect("a request encodes as a map")
+            .iter()
+            .map(|(k, _)| k.as_text().expect("field names are text").to_string())
+            .collect();
+        fields.sort();
+        assert_eq!(
+            fields,
+            [
+                "action",
+                "made_at_ms",
+                "network",
+                "scan_from_height",
+                "scripts",
+                "watch_until_height"
+            ]
+        );
+    }
+
+    /// `InboxRequest` exactly as it was before `watch_until_height`
+    /// (freenet-bitcoin#26), which every bridge deployed before it decodes
+    /// requests with. Copied, not derived, so a later change to the real type
+    /// cannot quietly change what this stands for.
+    #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Debug)]
+    struct RequestBeforeHorizon {
+        action: Action,
+        network: freenet_bitcoin_common::BitcoinNetwork,
+        scripts: Vec<ByteBuf>,
+        scan_from_height: Option<u32>,
+        made_at_ms: u64,
+    }
+
+    fn before_horizon(r: &InboxRequest) -> RequestBeforeHorizon {
+        RequestBeforeHorizon {
+            action: r.action,
+            network: r.network,
+            scripts: r.scripts.clone(),
+            scan_from_height: r.scan_from_height,
+            made_at_ms: r.made_at_ms,
+        }
+    }
+
+    /// A sender that names no horizon sends exactly the bytes it sent before
+    /// the field existed, so nothing about such a request changed.
+    #[test]
+    fn a_request_without_a_horizon_is_the_same_bytes_as_before() {
+        let r = request();
+        assert_eq!(to_cbor(&r).unwrap(), to_cbor(&before_horizon(&r)).unwrap());
+    }
+
+    /// A bridge from before the field opens a request that names a horizon,
+    /// reads everything else in it, and ignores the horizon: the watch gets
+    /// its day, and its sender sees the scan watermark stop a day later.
+    /// Through the real seal, since that is where an old bridge decodes it.
+    #[test]
+    fn an_old_bridge_ignores_watch_until_height() {
+        let mut r = request();
+        r.watch_until_height = Some(u32::MAX);
+        let sealed = seal(&bridge(), &gk(), 100, &r).unwrap();
+        let plaintext = open(&bridge_sk(), &gk(), 100, &sealed).unwrap();
+        let old: RequestBeforeHorizon =
+            freenet_bitcoin_common::from_cbor(&plaintext).expect("an old bridge reads it");
+        assert_eq!(old, before_horizon(&r));
+    }
+
+    /// A new bridge reads a request from a sender that predates the field as
+    /// naming no horizon.
+    #[test]
+    fn a_new_bridge_reads_an_old_request_as_naming_no_horizon() {
+        let old = before_horizon(&request());
+        let new: InboxRequest = freenet_bitcoin_common::from_cbor(&to_cbor(&old).unwrap()).unwrap();
+        assert_eq!(new, request());
+        assert_eq!(new.watch_until_height, None);
+    }
+
+    #[test]
+    fn a_horizon_survives_sealing() {
+        let mut r = request();
+        r.watch_until_height = Some(123_456);
+        let s = seal(&bridge(), &gk(), 100, &r).unwrap();
+        assert_eq!(
+            unseal(&bridge_sk(), &gk(), 100, &s)
+                .unwrap()
+                .watch_until_height,
+            Some(123_456)
         );
     }
 }
