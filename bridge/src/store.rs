@@ -678,6 +678,17 @@ impl Store {
             .optional()?)
     }
 
+    /// The height of the newest block recorded on `net`. Unlike the
+    /// checkpoint, a startup rewind does not lower it; a reorg does, by
+    /// forgetting the blocks it replaced.
+    pub fn latest_block_height(&self, net: BitcoinNetwork) -> anyhow::Result<Option<u32>> {
+        Ok(self.conn.query_row(
+            "SELECT MAX(height) FROM seen_blocks WHERE network = ?1",
+            params![net.as_str()],
+            |r| r.get::<_, Option<u32>>(0),
+        )?)
+    }
+
     pub fn block_at(&self, net: BitcoinNetwork, height: u32) -> anyhow::Result<Option<BlockHash>> {
         let row = self
             .conn

@@ -706,16 +706,25 @@ impl Processor<'_> {
                     tracing::debug!(network = ?net, "a watch's rescan hint was not acted on (freenet-bitcoin#7)");
                 }
                 // The height the sender wants these scripts watched through,
-                // held to MAX_WATCH_AHEAD_BLOCKS above the higher of the tip
-                // and the scan position: a node that is resyncing reports a
-                // tip below blocks already scanned, and a sender dates from
-                // this bridge's tip contract, which follows the scan. Knowing
-                // neither, the bridge cannot bound the height, so the watch
-                // gets its day and no more.
-                let reference = match (tips.by_network.get(&net).copied(), checkpoint) {
-                    (Some(t), Some(c)) => Some(t.max(c)),
-                    (t, c) => t.or(c),
+                // held to MAX_WATCH_AHEAD_BLOCKS above the highest of the
+                // node's tip, the scan position and the newest block recorded.
+                // A sender dates from this bridge's tip contract, which
+                // follows the scan; a node that is resyncing reports a tip
+                // below blocks already scanned, and every start rewinds the
+                // scan position, but neither lowers the newest block
+                // recorded. Knowing none, the bridge cannot bound the height,
+                // so the watch gets its day and no more.
+                let newest = match self.store.latest_block_height(net) {
+                    Ok(h) => h,
+                    Err(err) => {
+                        tracing::warn!(network = ?net, "reading the newest block's height failed: {err:#}");
+                        None
+                    }
                 };
+                let reference = [tips.by_network.get(&net).copied(), checkpoint, newest]
+                    .into_iter()
+                    .flatten()
+                    .max();
                 let until_height = match (req.watch_until_height, reference) {
                     (Some(h), Some(t)) => Some(h.min(t.saturating_add(MAX_WATCH_AHEAD_BLOCKS))),
                     (Some(_), None) => {
@@ -2127,6 +2136,43 @@ mod tests {
             watched(&store).is_empty(),
             "an older Watch after the Unwatch"
         );
+        // Nor did it leave its height behind for the next Watch to find.
+        watch_until_at(&store, gk, 4, T0, &tips(), None);
+        tick(&store, &tips(), T0 + 25 * HOUR);
+        assert!(
+            watched(&store).is_empty(),
+            "the next Watch gets only its day"
+        );
+    }
+
+    /// Every start rewinds the scan position, and a node may be behind at the
+    /// same time; the newest block recorded still bounds the height, so a
+    /// sender dating from the tip contract gets what it computed.
+    #[test]
+    fn a_watchs_height_is_held_above_the_newest_block_after_a_rewind() {
+        let store = Store::open_in_memory().unwrap();
+        scanned_at(&store, T0);
+        store
+            .set_checkpoint(
+                SIGNET,
+                &BlockAnchor {
+                    height: SIGNET_TIP - 9,
+                    hash: BlockHash([0; 32]),
+                },
+            )
+            .unwrap();
+        let behind = Tips {
+            by_network: HashMap::from([
+                (BitcoinNetwork::Bitcoin, MAINNET_TIP),
+                (SIGNET, SIGNET_TIP - 5000),
+            ]),
+        };
+        watch_until_at(&store, &ghostkeys()[0], 1, T0, &behind, Some(u32::MAX));
+        let limit = SIGNET_TIP + MAX_WATCH_AHEAD_BLOCKS;
+        tick(&store, &tips(), when_scanned_to(limit + 5));
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        tick(&store, &tips(), when_scanned_to(limit + 6));
+        assert!(watched(&store).is_empty());
     }
 
     /// A node that is resyncing reports a tip below blocks already scanned.

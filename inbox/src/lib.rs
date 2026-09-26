@@ -888,9 +888,9 @@ impl RemovalBatch {
 /// * **The height it will get.** At least `min(h, T + MAX_WATCH_AHEAD_BLOCKS)`
 ///   for a requested `h`, where `T` is the height in this bridge's own tip
 ///   contract for the network, read before sending. The bridge clamps above
-///   the higher of its node's tip and its scan position, and its tip contract
-///   follows its scan, so only a reorg that shortens the chain can make it
-///   less, by that reorg's depth.
+///   the highest of its node's tip, its scan position and the newest block it
+///   has recorded, and its tip contract follows its scan, so only a reorg that
+///   shortens the chain can make it less, by that reorg's depth.
 /// * **That the bridge read the request**, from the removal naming the entry
 ///   ([`InboxStateV1::is_removed`]). Read is not accepted: a Watch past the
 ///   sender's limit of watched scripts is removed the same way.
