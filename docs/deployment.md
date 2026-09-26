@@ -316,8 +316,23 @@ contract id as `serving the request inbox`.
   each script (`script_interests`), and a script stops being scanned only when
   the last requester withdraws. A watch registered before the inbox existed has
   no requester on record, so no unwatch ends it.
+- **A Watch may name a height to be held through** (`watch_until_height`,
+  #26), so a client that goes away stays watched: the bridge keeps such a
+  watch past its day until the block `deep_confirmations - 1` below its scan
+  position is above that height. It holds the height to
+  `MAX_WATCH_AHEAD_BLOCKS` (6048, six weeks) above its tip for the network
+  when it reads the Watch, or above its scan position when the tip cannot be
+  read, and keeps none when it knows neither. A later Watch never lowers a
+  held height; an Unwatch ends the watch at once. The per-Ghost Key limit of
+  watched scripts is unchanged and counts a held script once, so the most one
+  Ghost Key can cost stays 1000 scripts' updates per block, as it already was
+  for a key that renews daily; what the height changes is how long a watch
+  nobody renews lingers, at most about 6000 updates per unused script. The
+  heights live in `script_interests.until_height`, added empty on upgrade; a
+  build from before it ignores the column and gives every watch its day.
 - **A watch lasts about a day** after the Watch that last asked for it
-  (`WATCH_LIFETIME_MS`), and then ends as if its requester had withdrawn it.
+  (`WATCH_LIFETIME_MS`), or through the height it names if that is later,
+  and then ends as if its requester had withdrawn it.
   Watching costs an update to the script's address contract every block, and
   a client typically watches an address for one payment. A client that still
   wants the script sends the Watch again, with a newer timestamp, well before
