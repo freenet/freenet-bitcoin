@@ -234,7 +234,8 @@ pub struct Pass {
     /// pass, since a waiting request may be the Watch that renews one.
     pub waiting: BTreeSet<[u8; 32]>,
     /// Entries left unread because they are under a delegation this bridge
-    /// refuses: revoked, or superseded by a newer one. They hold nothing
+    /// refuses: revoked, or superseded by a later one (not one conflicting
+    /// at the same height, which is read and removed). They hold nothing
     /// back, since no request under such a delegation is ever acted on.
     pub refused_unread: usize,
     /// Something was held back that the same state and tips could release:
@@ -382,20 +383,34 @@ impl Processor<'_> {
                 }
             }
             // An entry under a delegation this bridge already refuses (the
-            // Ghost Key revoked it, or has since used a newer one) is left
+            // Ghost Key revoked it, or has since used a later one) is left
             // unread: reading it would spend its Ghost Key's share, and hold
             // its watches back while waiting, for nothing. The contract cannot
             // know of a revocation, so such entries keep arriving while their
             // key sends them; unread, they cost nothing here, and the floor
-            // drops them.
+            // drops them. They cannot keep the admitted key's entries out of
+            // the inbox either, since the contract ranks a later-issued
+            // delegation first.
+            //
+            // Not so a Conflicting one, issued at the same height as the
+            // delegation admitted, under another key: the contract breaks
+            // that tie its own way, so left unread it could hold the admitted
+            // key's place until the floor passed it. It is read and removed,
+            // which frees the place.
+            //
+            // A removal batch a skipped entry needed and that failed to land
+            // is not sent again for it: the entry only lingers until the
+            // floor passes it, outranking nothing.
             if let Some(d) = &e.delegation {
                 if let Ok(body) = d.body() {
-                    if self.store.delegation_check(
-                        &e.ghostkey.0,
-                        body.issued_mainnet_height,
-                        &body.watch_key.0,
-                    )? != DelegationCheck::Admitted
-                    {
+                    if matches!(
+                        self.store.delegation_check(
+                            &e.ghostkey.0,
+                            body.issued_mainnet_height,
+                            &body.watch_key.0,
+                        )?,
+                        DelegationCheck::Revoked | DelegationCheck::Superseded
+                    ) {
                         pass.refused_unread += 1;
                         continue;
                     }
@@ -705,7 +720,22 @@ impl Processor<'_> {
         // not lost with it. On a request a watch key signed the field is
         // ignored, so a stolen watch key cannot lock its owner's newer one out.
         if e.delegation.is_none() {
-            if let Some(through) = req.revoke_watch_keys_through {
+            // Not past the chain, so a mistake in units cannot lock the Ghost
+            // Key out of delegations for decades: see the field's docs.
+            let bound = tips.mainnet().map(|t| t.saturating_add(WINDOW_BLOCKS));
+            let through = match (req.revoke_watch_keys_through, bound) {
+                (Some(t), Some(b)) if t <= b => Some(t),
+                (Some(t), _) => {
+                    tracing::warn!(
+                        through = t,
+                        "ignoring a revocation of watch keys through a height past the mainnet tip, \
+                         or with the tip unreadable"
+                    );
+                    None
+                }
+                (None, _) => None,
+            };
+            if let Some(through) = through {
                 // Restating a revocation already in force changes nothing,
                 // and clients are asked to restate theirs on every request.
                 if let Some(unwatched) = self.store.revoke_delegations_through(
@@ -736,8 +766,10 @@ impl Processor<'_> {
         // once the delegation checks out here. The contract has checked the
         // signatures and the expiry against the entry's date; this checks the
         // expiry against the mainnet tip as well, which holds while the floor
-        // and whether the Ghost Key has revoked it or a newer delegation of it
-        // has been used.
+        // is held back, and whether the Ghost Key has revoked it or a later
+        // delegation of it has been used (`pass` has already left unread an
+        // entry under a revoked or superseded one; this also refuses one
+        // conflicting at the same height, and stands on its own).
         let mut delegation_serial = None;
         let mut request_ms = req.made_at_ms;
         if let Some(d) = &e.delegation {
@@ -2290,6 +2322,52 @@ mod tests {
             1,
             "only the revocation"
         );
+    }
+
+    /// A revocation through a height past the mainnet tip, a mistake in units
+    /// say, is ignored rather than locking the Ghost Key out for good.
+    #[test]
+    fn a_revocation_past_the_tip_is_ignored() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        revoke_at(&store, gk, MAINNET_TIP + WINDOW_BLOCKS + 1, 1, FLOOR + 1);
+        let d = delegation(gk, 1, FLOOR);
+        let w = delegated(gk, &d, 1, FLOOR + 1, &request(Action::Watch, b"spk", 2));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert!(watched(&store).contains(&b"spk".to_vec()), "not revoked");
+        revoke_at(&store, gk, MAINNET_TIP, 3, FLOOR + 2);
+        assert!(
+            !watched(&store).contains(&b"spk".to_vec()),
+            "within the bound, revoked"
+        );
+    }
+
+    /// A delegation issued at the same height as the one admitted, to another
+    /// key, is read and removed, not left holding the watch key's place.
+    #[test]
+    fn a_conflicting_delegations_entry_is_read_and_removed() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        let (a, b) = (delegation(gk, 1, 5), delegation(gk, 2, 5));
+        run(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![delegated(
+                    gk,
+                    &a,
+                    1,
+                    FLOOR + 1,
+                    &request(Action::Watch, b"a", 1),
+                )],
+            ),
+            &tips(),
+        );
+        let w = delegated(gk, &b, 2, FLOOR + 2, &request(Action::Watch, b"b", 2));
+        let pass = run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(pass.refused_unread, 0);
+        assert_eq!(removed(&pass), 1, "read, so its place is freed");
+        assert_eq!(watched(&store), vec![b"a".to_vec()], "but not acted on");
     }
 
     /// A watch key's Unwatch ends a watch as the Ghost Key's own would.

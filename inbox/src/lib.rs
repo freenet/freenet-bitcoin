@@ -440,6 +440,11 @@ pub struct InboxRequest {
     /// be issued no later than the entries that use it are dated, so revoking
     /// through a height far ahead blocks every delegation until then.
     ///
+    /// The bridge ignores a value more than [`WINDOW_BLOCKS`] above its
+    /// mainnet tip, or any value while it cannot read the tip, so a mistake
+    /// in units (a Unix time in seconds fits a `u32`) cannot lock the Ghost
+    /// Key out of delegations for decades. Send it again on a later request.
+    ///
     /// Applied whatever the request's `made_at_ms`, as a mark that only rises
     /// need not be ordered. Ignored on a request a watch key signed, so a
     /// stolen watch key cannot lock its owner's newer one out. A sender may
@@ -566,11 +571,18 @@ pub const MAX_DELEGATION_BYTES: usize = 1024;
 /// has gone away, including for addresses derived after they left.
 ///
 /// **One watch key per Ghost Key and bridge.** The bridge honours only the
-/// newest delegation of a Ghost Key it has seen used, so two applications, or
-/// two devices, that each delegate the same Ghost Key to their own key disable
-/// whichever delegated first. A request so refused is removed like any other
-/// read request; its sender learns only from the script's scan watermark never
-/// appearing. Share one watch key, or use a Ghost Key each.
+/// latest-issued delegation of a Ghost Key it has seen used, and of two issued
+/// at the same height the one it saw used first, so two applications, or two
+/// devices, that each delegate the same Ghost Key to their own key disable
+/// one of them. A request under a delegation the bridge refuses as revoked or
+/// superseded is left unread, and vanishes when the floor passes it, with no
+/// removal; one refused for sharing its delegation's height with another key's
+/// is removed as though acted on. Either way nothing says it was refused but
+/// the script's scan watermark never appearing, and a sender that resends a
+/// request which vanished unremoved will resend such a one for ever: a sender
+/// that sees its watch key's requests go unwatched after being sent twice
+/// should stop and ask for a new delegation. Share one watch key, or use a
+/// Ghost Key each.
 ///
 /// **What the Ghost Key keeps for itself.** An entry a watch key signs takes at
 /// most one of its Ghost Key's places in the inbox, and at most all but
@@ -604,8 +616,13 @@ pub struct DelegationBody {
     ///
     /// The contract refuses an entry dated before its delegation was issued,
     /// and entries are dated within a few blocks of the real chain, so no
-    /// delegation can claim a height ahead of the chain to outrank, or
-    /// outlast, every delegation issued after it.
+    /// delegation can be used while it claims a height ahead of the chain.
+    /// One signed for a future height becomes usable when the chain reaches
+    /// it, and then outranks those issued before it: revoking through that
+    /// height, and issuing anew above it, undoes it within a block.
+    ///
+    /// Two delegations issued at the same height to different keys conflict:
+    /// the bridge honours the one it saw used first.
     pub issued_mainnet_height: u32,
     /// The last Bitcoin mainnet height an entry under this delegation may be
     /// dated. The contract enforces it, as entries are dated by the mainnet
