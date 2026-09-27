@@ -272,11 +272,11 @@ fn watch_sk() -> SigningKey {
     SigningKey::from_bytes(&[77u8; 32])
 }
 
-fn delegation_body(serial: u64) -> DelegationBody {
+fn delegation_body(issued: u32) -> DelegationBody {
     DelegationBody {
         bridge: bridge(),
         watch_key: WatchKeyId(watch_sk().verifying_key().to_bytes()),
-        serial,
+        issued_mainnet_height: issued,
         expires_mainnet_height: None,
     }
 }
@@ -521,6 +521,27 @@ fn the_newest_delegation_keeps_the_watch_keys_place() {
     }
 }
 
+/// A delegation cannot claim to be issued after the entries that use it are
+/// dated, so none can claim a height ahead of the chain to outrank every
+/// delegation issued after it.
+#[test]
+fn an_entry_dated_before_its_delegation_was_issued_is_refused() {
+    let gk = &ghostkeys()[0];
+    let at = |issued| {
+        admit(delegated_entry(
+            gk,
+            delegate(gk, &delegation_body(issued)),
+            &watch_sk(),
+            102,
+            1,
+        ))
+    };
+    assert!(at(102).is_ok(), "issued at the entry's own height");
+    let err = at(103).unwrap_err();
+    assert!(err.contains("issued"), "{err}");
+    assert!(at(u32::MAX).is_err());
+}
+
 /// A watch key's signature holds only under the delegation it was made
 /// under: re-wrapped in another delegation to the same key, the entry is
 /// refused, so nobody can copy it into new entries that take its Ghost Key's
@@ -620,7 +641,7 @@ fn a_real_sized_delegation_fits() {
         gk,
         &DelegationBody {
             expires_mainnet_height: Some(u32::MAX),
-            serial: u64::MAX,
+            issued_mainnet_height: u32::MAX,
             ..delegation_body(1)
         },
     );
@@ -1156,8 +1177,10 @@ fn verify_refuses_an_unused_certificate_before_checking_any() {
 fn pool(gks: &[Gk], per_key: usize) -> (Vec<WireEntry>, Vec<RemovalBatch>) {
     let mut entries = Vec::new();
     for (gi, gk) in gks.iter().enumerate() {
-        let d = delegate(gk, &delegation_body(1));
         for i in 0..per_key {
+            // Delegations issued at different heights, so which one keeps a
+            // Ghost Key's watch-key place is exercised too.
+            let d = delegate(gk, &delegation_body(90 + ((i + gi) % 7) as u32));
             let height = 100 + ((i * 3 + gi) as u32 % (WINDOW_BLOCKS + 1));
             let tag = (i + 10 * gi) as u8;
             // Every third entry a watch key signed, so the merge laws and the
@@ -2296,7 +2319,7 @@ mod sealing {
     #[test]
     fn an_old_bridge_ignores_revoke_watch_keys_through() {
         let mut r = request();
-        r.revoke_watch_keys_through = Some(u64::MAX);
+        r.revoke_watch_keys_through = Some(u32::MAX);
         r.watch_until_height = Some(7);
         let sealed = seal(&bridge(), &gk(), 100, &r).unwrap();
         let plaintext = open(&bridge_sk(), &gk(), 100, &sealed).unwrap();
@@ -2307,7 +2330,7 @@ mod sealing {
             unseal(&bridge_sk(), &gk(), 100, &sealed)
                 .unwrap()
                 .revoke_watch_keys_through,
-            Some(u64::MAX)
+            Some(u32::MAX)
         );
     }
 

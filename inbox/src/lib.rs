@@ -99,8 +99,9 @@
 //!   again on each exchange.
 //!
 //! The caps overflow when more requests are waiting than they allow: more
-//! than [`MAX_ENTRIES`] in all, which is a flood, or a third from one Ghost
-//! Key before the bridge has read its first two. Either way some request is
+//! than [`MAX_ENTRIES`] in all, which is a flood, a third from one Ghost
+//! Key before the bridge has read its first two, or a second from one Ghost
+//! Key's watch keys (see [`Delegation`]). Either way some request is
 //! dropped whatever the rule, and a sender whose entry vanished without
 //! being removed sends it again.
 
@@ -429,21 +430,24 @@ pub struct InboxRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch_until_height: Option<u32>,
     /// From the Ghost Key itself: revoke every [`Delegation`] of this Ghost
-    /// Key whose `serial` is at or below this. The bridge refuses them from
-    /// then on and withdraws every watch a request under one of them
+    /// Key issued at or below this Bitcoin mainnet height
+    /// ([`DelegationBody::issued_mainnet_height`]). The bridge refuses them
+    /// from then on and withdraws every watch a request under one of them
     /// recorded, renewals of the Ghost Key's own watches included, so send
-    /// Watch again for everything still wanted. Revoke through the newest
-    /// serial issued before the delegation that is to stay, not through
-    /// "now" (a clock can run ahead), and never through a value past every
-    /// serial you will use: nothing lowers a revocation. It raises a mark the bridge keeps per Ghost Key, which never
-    /// falls, and is applied whatever the request's `made_at_ms`, as a mark
-    /// that only rises need not be ordered. Ignored on a request a watch key
-    /// signed, so a stolen watch key cannot lock its owner's newer one out.
-    /// A sender may send its current value on every request of its own, which
-    /// also restores it to a bridge that lost its database. Left out of the
+    /// Watch again for everything still wanted. To rotate, issue the new
+    /// delegation at a later height than the old one and revoke through the
+    /// height just below it. Nothing lowers a revocation, and a delegation can
+    /// be issued no later than the entries that use it are dated, so revoking
+    /// through a height far ahead blocks every delegation until then.
+    ///
+    /// Applied whatever the request's `made_at_ms`, as a mark that only rises
+    /// need not be ordered. Ignored on a request a watch key signed, so a
+    /// stolen watch key cannot lock its owner's newer one out. A sender may
+    /// send its current value on every request of its own, which also
+    /// restores it to a bridge that lost its database. Left out of the
     /// encoding when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revoke_watch_keys_through: Option<u64>,
+    pub revoke_watch_keys_through: Option<u32>,
 }
 
 impl InboxRequest {
@@ -573,25 +577,36 @@ pub const MAX_DELEGATION_BYTES: usize = 1024;
 /// `OWNER_RESERVE` of its share of the bridge's reading, so a stolen watch key
 /// cannot crowd out the Ghost Key's own requests, its revocation included.
 ///
+/// **One request waiting at a time.** That one place means a watch key's
+/// second entry, sent before the bridge has read its first, replaces one of
+/// the two, not necessarily the older: send one request naming every script
+/// (up to [`MAX_SCRIPTS_PER_REQUEST`]), and send the next only once the inbox
+/// holds a removal naming it or it has gone.
+///
 /// It is in the clear in the inbox, where every peer checks it, so it names
 /// nothing the inbox otherwise keeps sealed: no network, and no script. A
-/// reader of the inbox learns that a Ghost Key delegated to some key, when it
-/// says it did (`serial`, if that is a time), and that a request came from
-/// the delegated key rather than the Ghost Key.
+/// reader of the inbox learns that a Ghost Key delegated to some key, at which
+/// block height, and that a request came from the delegated key rather than
+/// the Ghost Key.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct DelegationBody {
     /// The one bridge this delegation is for.
     pub bridge: BridgeId,
     /// The key that may sign requests.
     pub watch_key: WatchKeyId,
-    /// When the delegation was made, in milliseconds since the Unix epoch by
-    /// the Ghost Key holder's clock, and what orders one Ghost Key's
-    /// delegations: the bridge refuses one below the newest it has seen used,
-    /// one at or below the mark the Ghost Key raised
-    /// ([`InboxRequest::revoke_watch_keys_through`]), and one dated more than
-    /// a week past its own clock, so no delegation can be numbered beyond
-    /// every revocation.
-    pub serial: u64,
+    /// The Bitcoin mainnet height the delegation was made at: a sender uses
+    /// the height it dates its entries by, [`sender_height`] of the floor it
+    /// read. It orders one Ghost Key's delegations: the contract keeps, of a
+    /// Ghost Key's entries a watch key signed, only the one under the latest
+    /// delegation, and the bridge refuses one issued before the latest it has
+    /// seen used, or at or below the height the Ghost Key revoked through
+    /// ([`InboxRequest::revoke_watch_keys_through`]).
+    ///
+    /// The contract refuses an entry dated before its delegation was issued,
+    /// and entries are dated within a few blocks of the real chain, so no
+    /// delegation can claim a height ahead of the chain to outrank, or
+    /// outlast, every delegation issued after it.
+    pub issued_mainnet_height: u32,
     /// The last Bitcoin mainnet height an entry under this delegation may be
     /// dated. The contract enforces it, as entries are dated by the mainnet
     /// height and the floor keeps those dates honest. `None` for none.
@@ -898,6 +913,9 @@ pub(crate) fn verify_entry_signature(
         // entry. Both Ed25519, so a forgery still costs no RSA check.
         Some(delegation) => {
             let d = delegation.verify(&claimed, params)?;
+            if d.issued_mainnet_height > entry.mainnet_height {
+                return Err("entry is dated before its delegation was issued".into());
+            }
             if d.expires_mainnet_height
                 .is_some_and(|last| entry.mainnet_height > last)
             {

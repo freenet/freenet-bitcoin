@@ -63,9 +63,9 @@ pub struct Interest<'a> {
     /// to [`freenet_bitcoin_inbox::MAX_WATCH_AHEAD_BLOCKS`] above the tip
     /// (freenet-bitcoin#26). Ignored for a withdrawal.
     pub until_height: Option<u32>,
-    /// The serial of the delegation a watch key made the request under, or
-    /// `None` for the Ghost Key's own.
-    pub delegation_serial: Option<u64>,
+    /// The height the delegation a watch key made the request under was
+    /// issued at (its serial), or `None` for the Ghost Key's own.
+    pub delegation_serial: Option<u32>,
 }
 
 /// What [`Store::set_interest`] did.
@@ -413,8 +413,8 @@ impl Store {
                 -- The height a Watch holds its script through, whatever its
                 -- day says (freenet-bitcoin#26). NULL for none.
                 until_height   INTEGER,
-                -- The serial of the delegation a watch key made this request
-                -- under; NULL for the Ghost Key's own. Revoking the delegation
+                -- The height the delegation a watch key made this request
+                -- under was issued at; NULL for the Ghost Key's own. Revoking the delegation
                 -- withdraws what it recorded.
                 delegation_serial INTEGER,
                 PRIMARY KEY (network, script_pubkey, ghostkey)
@@ -457,12 +457,11 @@ impl Store {
             CREATE INDEX IF NOT EXISTS inbox_handled_by_ghostkey
                 ON inbox_handled (ghostkey);
 
-            -- Per Ghost Key, the watch keys it has delegated to: the serial
-            -- its delegations are revoked through (raised by the Ghost Key's
-            -- own requests, never lowered; NULL for none), and the newest
-            -- delegation seen used. Serials are milliseconds, and the bridge
-            -- refuses one more than a week past its clock before it gets here,
-            -- so they fit an INTEGER. The only record of a revocation: see
+            -- Per Ghost Key, the watch keys it has delegated to: the mainnet
+            -- height its delegations are revoked through (raised by the Ghost
+            -- Key's own requests, never lowered; NULL for none), and the
+            -- latest delegation seen used. A delegation's serial is the
+            -- mainnet height it was issued at. The only record of a revocation: see
             -- docs/deployment.md before deleting this database.
             CREATE TABLE IF NOT EXISTS watch_delegations (
                 ghostkey        BLOB PRIMARY KEY,
@@ -1250,7 +1249,6 @@ impl Store {
             }
         }
 
-        let delegation_serial = i.delegation_serial.map(|s| s.min(i64::MAX as u64) as i64);
         self.conn.execute(
             "INSERT INTO script_interests
                  (network, script_pubkey, ghostkey, watching, request_ms, recorded_ms,
@@ -1267,7 +1265,7 @@ impl Store {
                 request_ms,
                 now_ms,
                 until_height,
-                delegation_serial
+                i.delegation_serial
             ],
         )?;
 
@@ -1284,16 +1282,35 @@ impl Store {
     /// `ghostkey` numbered `serial` may be acted on, recording the delegation
     /// as the newest seen when it is. Refused at or below the serial the Ghost
     /// Key revoked through, below the newest delegation seen used, or at the
-    /// same serial for another key. `serial` must already be bounded (see
-    /// `Processor::act`). Call inside [`Store::with_transaction`].
+    /// same serial for another key. Call inside [`Store::with_transaction`].
     pub fn admit_delegation(
         &self,
         ghostkey: &[u8],
-        serial: u64,
+        serial: u32,
         watch_key: &[u8],
     ) -> anyhow::Result<DelegationCheck> {
-        let serial = i64::try_from(serial)
-            .map_err(|_| anyhow::anyhow!("a delegation serial past i64 reached the store"))?;
+        let check = self.delegation_check(ghostkey, serial, watch_key)?;
+        if check != DelegationCheck::Admitted {
+            return Ok(check);
+        }
+        self.conn.execute(
+            "INSERT INTO watch_delegations (ghostkey, newest_serial, newest_key)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(ghostkey) DO UPDATE SET newest_serial = ?2, newest_key = ?3
+             WHERE newest_serial IS NULL OR newest_serial < ?2",
+            params![ghostkey, i64::from(serial), watch_key],
+        )?;
+        Ok(DelegationCheck::Admitted)
+    }
+
+    /// What [`Self::admit_delegation`] would decide, recording nothing.
+    pub fn delegation_check(
+        &self,
+        ghostkey: &[u8],
+        serial: u32,
+        watch_key: &[u8],
+    ) -> anyhow::Result<DelegationCheck> {
+        let serial = i64::from(serial);
         type Row = (Option<i64>, Option<i64>, Option<Vec<u8>>);
         let row: Option<Row> = self
             .conn
@@ -1323,12 +1340,6 @@ impl Store {
                 });
             }
         }
-        self.conn.execute(
-            "INSERT INTO watch_delegations (ghostkey, newest_serial, newest_key)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(ghostkey) DO UPDATE SET newest_serial = ?2, newest_key = ?3",
-            params![ghostkey, serial, watch_key],
-        )?;
         Ok(DelegationCheck::Admitted)
     }
 
@@ -1347,11 +1358,11 @@ impl Store {
     pub fn revoke_delegations_through(
         &self,
         ghostkey: &[u8],
-        through: u64,
+        through: u32,
         made_at_ms: u64,
         now_ms: i64,
     ) -> anyhow::Result<Option<Vec<NetworkScript>>> {
-        let through = through.min(i64::MAX as u64) as i64;
+        let through = i64::from(through);
         let made_at_ms = made_at_ms.min(i64::MAX as u64) as i64;
         let held: Option<i64> = self
             .conn

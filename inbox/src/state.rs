@@ -418,19 +418,19 @@ impl InboxStateV1 {
             .collect();
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         // Of each Ghost Key's entries a watch key signed, only the one under
-        // the newest delegation (highest serial, then newest, then lowest
-        // key) may stay. A revoked key's entries can then never keep the
+        // the latest delegation (highest issued height, then newest entry,
+        // then lowest key) may stay. A revoked key's entries can then never keep the
         // place from the key that replaced it, however they are dated. It
         // takes at most MAX_DELEGATED_ENTRIES_PER_GHOSTKEY (one) of the Ghost
         // Key's places, however it ranks, so the Ghost Key's own entry always
         // has one. Both are facts about the entries alone, so this is as
         // order-free as the rest.
         debug_assert_eq!(MAX_DELEGATED_ENTRIES_PER_GHOSTKEY, 1);
-        let mut best_delegated: BTreeMap<GhostkeyId, (u64, u32, std::cmp::Reverse<EntryKey>)> =
+        let mut best_delegated: BTreeMap<GhostkeyId, (u32, u32, std::cmp::Reverse<EntryKey>)> =
             BTreeMap::new();
         for (k, e) in &self.entries {
             if let Some(d) = &e.delegation {
-                let serial = d.body().map(|b| b.serial).unwrap_or(0);
+                let serial = d.body().map(|b| b.issued_mainnet_height).unwrap_or(0);
                 let rank = (serial, e.mainnet_height, std::cmp::Reverse(*k));
                 let best = best_delegated.entry(e.ghostkey).or_insert(rank);
                 if rank > *best {

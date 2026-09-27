@@ -110,8 +110,8 @@ Mitigations, in descending order of effectiveness:
 watch key (see `freenet_bitcoin_inbox::Delegation`). The delegation travels
 in the clear with every entry the watch key signs, because every peer checks
 it, so a reader of the inbox also learns that the Ghost Key delegated to that
-key, the serial it gave the delegation (a time, if the sender uses one), any
-expiry, and which of its requests came from the watch key. The delegation names
+key, the block height it did so at, any expiry, and which of its requests came
+from the watch key. The delegation names
 no network and no script: those stay sealed.
 
 The bridge is trusted with this correlation. Nobody else is. It stays in one
@@ -157,8 +157,8 @@ Ghost Key, and never learns that Freenet was involved.
    not padded, so size hints at how many scripts one names, and whether a
    Watch names a height to be held through (about 24 bytes more). A request a
    watch key signed also shows, in the clear, the delegation it was made
-   under: that the Ghost Key delegated to that key, the delegation's serial
-   (the time it was made) and any expiry.
+   under: that the Ghost Key delegated to that key, the block height it did so
+   at, and any expiry.
 3. **Freenet traffic analysis.** Subscribing to `BitcoinAddressContract(X)`
    signals interest in X to an observer well-placed on the network. Inherent to
    the platform.

@@ -233,6 +233,10 @@ pub struct Pass {
     /// The Ghost Keys of those entries. Their watches do not end in this
     /// pass, since a waiting request may be the Watch that renews one.
     pub waiting: BTreeSet<[u8; 32]>,
+    /// Entries left unread because they are under a delegation this bridge
+    /// refuses: revoked, or superseded by a newer one. They hold nothing
+    /// back, since no request under such a delegation is ever acted on.
+    pub refused_unread: usize,
     /// Something was held back that the same state and tips could release:
     /// the floor was held, or ending watches failed or found the observer
     /// gone back. Such a pass must run again, not be passed over as quiet.
@@ -375,6 +379,26 @@ impl Processor<'_> {
                     // contract disagree about the window, which is
                     // freenet-bitcoin#21.
                     continue;
+                }
+            }
+            // An entry under a delegation this bridge already refuses (the
+            // Ghost Key revoked it, or has since used a newer one) is left
+            // unread: reading it would spend its Ghost Key's share, and hold
+            // its watches back while waiting, for nothing. The contract cannot
+            // know of a revocation, so such entries keep arriving while their
+            // key sends them; unread, they cost nothing here, and the floor
+            // drops them.
+            if let Some(d) = &e.delegation {
+                if let Ok(body) = d.body() {
+                    if self.store.delegation_check(
+                        &e.ghostkey.0,
+                        body.issued_mainnet_height,
+                        &body.watch_key.0,
+                    )? != DelegationCheck::Admitted
+                    {
+                        pass.refused_unread += 1;
+                        continue;
+                    }
                 }
             }
             if !self.store.is_handled(&k.0)? {
@@ -712,7 +736,6 @@ impl Processor<'_> {
         // once the delegation checks out here. The contract has checked the
         // signatures and the expiry against the entry's date; this checks the
         // expiry against the mainnet tip as well, which holds while the floor
-        // is held back, that the serial is not dated beyond every revocation,
         // and whether the Ghost Key has revoked it or a newer delegation of it
         // has been used.
         let mut delegation_serial = None;
@@ -727,34 +750,28 @@ impl Processor<'_> {
                     return Ok(());
                 }
             };
-            if body.serial > now_ms.saturating_add(REQUEST_AHEAD_MAX_MS).max(0) as u64 {
-                tracing::info!(
-                    serial = body.serial,
-                    "dropping a request under a delegation dated more than a week ahead"
-                );
-                return Ok(());
-            }
             if let (Some(last), Some(tip)) = (body.expires_mainnet_height, tips.mainnet()) {
                 if tip > last {
                     tracing::info!("dropping a request under a delegation that has expired");
                     return Ok(());
                 }
             }
-            match self
-                .store
-                .admit_delegation(&e.ghostkey.0, body.serial, &body.watch_key.0)?
-            {
+            match self.store.admit_delegation(
+                &e.ghostkey.0,
+                body.issued_mainnet_height,
+                &body.watch_key.0,
+            )? {
                 DelegationCheck::Admitted => {}
                 refused => {
                     tracing::info!(
                         ?refused,
-                        serial = body.serial,
+                        issued = body.issued_mainnet_height,
                         "dropping a request under a watch key its Ghost Key no longer honours"
                     );
                     return Ok(());
                 }
             }
-            delegation_serial = Some(body.serial);
+            delegation_serial = Some(body.issued_mainnet_height);
             // Ordered with the Ghost Key's own requests, but never as though
             // made more than DELEGATED_AHEAD_MS past the bridge's clock: a
             // stolen key must not be able to date a request so far ahead that
@@ -1905,9 +1922,9 @@ mod tests {
         SigningKey::from_bytes(&[tag; 32])
     }
 
-    /// `gk`'s delegation to `watch_key(tag)`, numbered `serial`.
-    fn delegation(gk: &TestGhostkey, tag: u8, serial: u64) -> freenet_bitcoin_inbox::Delegation {
-        gk.delegation(bridge(), &watch_key(tag), serial)
+    /// `gk`'s delegation to `watch_key(tag)`, issued at mainnet height `issued`.
+    fn delegation(gk: &TestGhostkey, tag: u8, issued: u32) -> freenet_bitcoin_inbox::Delegation {
+        gk.delegation(bridge(), &watch_key(tag), issued)
     }
 
     fn delegated(
@@ -2028,7 +2045,7 @@ mod tests {
         assert_eq!(watched(&store), vec![b"own".to_vec(), b"spk".to_vec()]);
     }
 
-    fn revoke_at(store: &Store, gk: &TestGhostkey, through: u64, made: u64, height: u32) {
+    fn revoke_at(store: &Store, gk: &TestGhostkey, through: u32, made: u64, height: u32) {
         let revoke = InboxRequest {
             revoke_watch_keys_through: Some(through),
             ..request(Action::Watch, b"own", made)
@@ -2191,24 +2208,6 @@ mod tests {
         assert!(watched(&store).is_empty());
     }
 
-    /// No delegation can be numbered past every revocation: one dated more
-    /// than a week past the bridge's clock is refused.
-    #[test]
-    fn a_delegation_dated_far_ahead_is_refused() {
-        let gk = &ghostkeys()[0];
-        let now = 1_000_000;
-        for (serial, acted) in [
-            ((now + REQUEST_AHEAD_MAX_MS) as u64, true),
-            (u64::MAX, false),
-        ] {
-            let store = Store::open_in_memory().unwrap();
-            let d = delegation(gk, 1, serial);
-            let w = delegated(gk, &d, 1, FLOOR + 1, &request(Action::Watch, b"spk", 1));
-            run_at(&store, &inbox(FLOOR, vec![w]), &tips(), now);
-            assert_eq!(!watched(&store).is_empty(), acted, "serial {serial}");
-        }
-    }
-
     /// Past its expiry by the mainnet tip, a delegation is refused, even when
     /// the entry's own date (all the contract can see) is not past it.
     #[test]
@@ -2271,6 +2270,26 @@ mod tests {
         let pass = run(&store, &inbox(FLOOR, vec![w, own]), &tips());
         assert_eq!(pass.deferred, 1);
         assert_eq!(watched(&store), vec![b"mine".to_vec()]);
+    }
+
+    /// A revoked key's entries are left unread, so they spend none of the
+    /// Ghost Key's share and hold none of its watches back.
+    #[test]
+    fn a_revoked_keys_entries_are_left_unread() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        revoke_at(&store, gk, 1, 1, FLOOR + 1);
+        let d = delegation(gk, 1, 1);
+        let w = delegated(gk, &d, 1, FLOOR + 2, &request(Action::Watch, b"spk", 2));
+        let pass = run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(pass.refused_unread, 1);
+        assert_eq!(removed(&pass), 0, "not read, so not removed");
+        assert!(pass.waiting.is_empty());
+        assert_eq!(
+            store.handled_count_for(&gk.id().0).unwrap(),
+            1,
+            "only the revocation"
+        );
     }
 
     /// A watch key's Unwatch ends a watch as the Ghost Key's own would.
@@ -2362,7 +2381,7 @@ mod tests {
         let gk = &ghostkeys()[0];
         let d1 = delegation(gk, 1, 1);
         let lockout = InboxRequest {
-            revoke_watch_keys_through: Some(u64::MAX),
+            revoke_watch_keys_through: Some(u32::MAX),
             ..request(Action::Watch, b"a", 1)
         };
         run(

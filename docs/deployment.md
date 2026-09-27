@@ -327,17 +327,19 @@ contract id as `serving the request inbox`.
   inbox crate): a key a Ghost Key signed a delegation to, so an application's
   background process can ask for watches with no Ghost Key at hand. The
   contract checks the Ghost Key's certificate, its signature on the delegation,
-  that the delegation names this bridge and has not expired by the entry's
-  date, and the watch key's signature on the entry, which covers the
-  delegation. A watch key holds at most one of its Ghost Key's two places. The
+  that the delegation names this bridge, was issued no later than the entry
+  is dated and has not expired by it, and the watch key's signature on the
+  entry, which covers the delegation. A watch key holds at most one of its
+  Ghost Key's two places, and of a Ghost Key's watch keys' entries only the
+  one under the latest-issued delegation keeps it. The
   bridge acts on the request as the Ghost Key's own (the same interests,
   limits and ordering, the request's time counted at most an hour past the
   bridge's clock), reads a watch key's requests only up to all but
   `OWNER_RESERVE` of the Ghost Key's share, and refuses one under a delegation
   that is revoked (`revoke_watch_keys_through` on the Ghost Key's own request,
   which also withdraws what the revoked key recorded), superseded by a newer
-  one seen used, dated more than a week past its clock, or expired by the
-  mainnet tip. `watch_delegations` in the database is where revocations live:
+  one seen used, or expired by the mainnet tip; an entry under a delegation
+  it already refuses is left unread. `watch_delegations` in the database is where revocations live:
   see Recovery.
 - **Rolling back past delegated watch keys is not supported.** A bridge from
   before them, reading the inbox that admits them, cannot verify a delegated
