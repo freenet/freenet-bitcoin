@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     canonical_certificate, cert_key, certifies, names_claimed_key, verify_certificate,
     verify_entry_signature, BatchKey, ByteBuf, CertKey, EntryKey, GhostkeyId, InboxEntry,
-    InboxEntryBody, InboxParameters, RemovalBatch, RemovedPrefix, SignedFloor, MAX_ENTRIES,
-    MAX_ENTRIES_PER_GHOSTKEY, MAX_REMOVAL_BATCHES, MAX_REMOVED, WINDOW_BLOCKS,
+    InboxEntryBody, InboxParameters, RemovalBatch, RemovedPrefix, SignedFloor,
+    MAX_DELEGATED_ENTRIES_PER_GHOSTKEY, MAX_ENTRIES, MAX_ENTRIES_PER_GHOSTKEY, MAX_REMOVAL_BATCHES,
+    MAX_REMOVED, WINDOW_BLOCKS,
 };
 use freenet_bitcoin_common::from_cbor;
 
@@ -64,6 +65,7 @@ impl WireEntry {
                 cert: cert_key(&certificate_pem),
                 scoped_payload: ByteBuf(scoped_payload),
                 signature: ByteBuf(signature),
+                delegation: None,
             },
             certificate_pem,
         })
@@ -300,6 +302,7 @@ impl InboxStateV1 {
 
         let mut referenced: BTreeSet<CertKey> = BTreeSet::new();
         let mut per: BTreeMap<GhostkeyId, usize> = BTreeMap::new();
+        let mut delegated: BTreeMap<GhostkeyId, usize> = BTreeMap::new();
         for (k, e) in &self.entries {
             if e.key() != *k {
                 return Err("entry filed under a key that is not its digest".into());
@@ -323,6 +326,16 @@ impl InboxStateV1 {
                 return Err(format!(
                     "a Ghost Key holds more than {MAX_ENTRIES_PER_GHOSTKEY} entries"
                 ));
+            }
+            if e.delegation.is_some() {
+                let d = delegated.entry(e.ghostkey).or_insert(0);
+                *d += 1;
+                if *d > MAX_DELEGATED_ENTRIES_PER_GHOSTKEY {
+                    return Err(format!(
+                        "a Ghost Key's watch keys hold more than \
+                         {MAX_DELEGATED_ENTRIES_PER_GHOSTKEY} entries"
+                    ));
+                }
             }
         }
         if referenced.len() != self.certificates.len() {
@@ -404,11 +417,37 @@ impl InboxStateV1 {
             .map(|(k, e)| (e.mainnet_height, *k, e.ghostkey))
             .collect();
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        // Of each Ghost Key's entries a watch key signed, only the one under
+        // the latest delegation (highest issued height, then newest entry,
+        // then lowest key) may stay. A revoked key's entries can then never keep the
+        // place from the key that replaced it, however they are dated. It
+        // takes at most MAX_DELEGATED_ENTRIES_PER_GHOSTKEY (one) of the Ghost
+        // Key's places, however it ranks, so the Ghost Key's own entry always
+        // has one. Both are facts about the entries alone, so this is as
+        // order-free as the rest.
+        debug_assert_eq!(MAX_DELEGATED_ENTRIES_PER_GHOSTKEY, 1);
+        let mut best_delegated: BTreeMap<GhostkeyId, (u32, u32, std::cmp::Reverse<EntryKey>)> =
+            BTreeMap::new();
+        for (k, e) in &self.entries {
+            if let Some(d) = &e.delegation {
+                let serial = d.body().map(|b| b.issued_mainnet_height).unwrap_or(0);
+                let rank = (serial, e.mainnet_height, std::cmp::Reverse(*k));
+                let best = best_delegated.entry(e.ghostkey).or_insert(rank);
+                if rank > *best {
+                    *best = rank;
+                }
+            }
+        }
         let mut per: BTreeMap<GhostkeyId, usize> = BTreeMap::new();
         let mut kept: BTreeSet<EntryKey> = BTreeSet::new();
         for (_, k, g) in &ranked {
             let c = per.entry(*g).or_insert(0);
             if *c >= MAX_ENTRIES_PER_GHOSTKEY || kept.len() >= MAX_ENTRIES {
+                continue;
+            }
+            if self.entries[k].delegation.is_some()
+                && best_delegated.get(g).map(|b| b.2 .0) != Some(*k)
+            {
                 continue;
             }
             *c += 1;

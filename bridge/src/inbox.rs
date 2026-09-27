@@ -56,7 +56,7 @@ use freenet_stdlib::prelude::{
 use crate::chain::ChainClient;
 use crate::config::{BridgeConfig, NetworkConfig};
 use crate::freenet::is_not_found;
-use crate::store::{Interest, InterestChange, Store, WatchedScript};
+use crate::store::{DelegationCheck, Interest, InterestChange, Store, WatchedScript};
 
 /// Scripts one Ghost Key may have this bridge watch at once.
 ///
@@ -93,6 +93,17 @@ const WITHDRAWAL_MEMORY_MS: i64 = 24 * 60 * 60 * 1000;
 /// wait. An honest sender watching many addresses names up to 32 in one
 /// request.
 pub const REMOVAL_SHARE_PER_GHOSTKEY: usize = REMOVAL_BUDGET / 64;
+
+/// Of a Ghost Key's share, how much a watch key it delegated to may not use:
+/// requests a watch key signed wait once the Ghost Key has had all but this
+/// many read, so the Ghost Key's own requests, its revocation included, are
+/// always read. See `freenet_bitcoin_inbox::Delegation`.
+pub const OWNER_RESERVE: usize = REMOVAL_SHARE_PER_GHOSTKEY / 4;
+
+/// How far past the bridge's clock a request a watch key signed may be dated
+/// for ordering. The Ghost Key's own requests are ordered by their own time,
+/// as before; a delegated one dated further ahead is taken as made at this.
+pub const DELEGATED_AHEAD_MS: i64 = 60 * 60 * 1000;
 
 /// How long a watch lasts after the Watch that last asked for it: a day, or
 /// longer where a Watch named a height to be held through
@@ -222,6 +233,11 @@ pub struct Pass {
     /// The Ghost Keys of those entries. Their watches do not end in this
     /// pass, since a waiting request may be the Watch that renews one.
     pub waiting: BTreeSet<[u8; 32]>,
+    /// Entries left unread because they are under a delegation this bridge
+    /// refuses: revoked, or superseded by a later one (not one conflicting
+    /// at the same height, which is read and removed). They hold nothing
+    /// back, since no request under such a delegation is ever acted on.
+    pub refused_unread: usize,
     /// Something was held back that the same state and tips could release:
     /// the floor was held, or ending watches failed or found the observer
     /// gone back. Such a pass must run again, not be passed over as quiet.
@@ -366,6 +382,40 @@ impl Processor<'_> {
                     continue;
                 }
             }
+            // An entry under a delegation this bridge already refuses (the
+            // Ghost Key revoked it, or has since used a later one) is left
+            // unread: reading it would spend its Ghost Key's share, and hold
+            // its watches back while waiting, for nothing. The contract cannot
+            // know of a revocation, so such entries keep arriving while their
+            // key sends them; unread, they cost nothing here, and the floor
+            // drops them. They cannot keep the admitted key's entries out of
+            // the inbox either, since the contract ranks a later-issued
+            // delegation first.
+            //
+            // Not so a Conflicting one, issued at the same height as the
+            // delegation admitted, under another key: the contract breaks
+            // that tie its own way, so left unread it could hold the admitted
+            // key's place until the floor passed it. It is read and removed,
+            // which frees the place.
+            //
+            // A removal batch a skipped entry needed and that failed to land
+            // is not sent again for it: the entry only lingers until the
+            // floor passes it, outranking nothing.
+            if let Some(d) = &e.delegation {
+                if let Ok(body) = d.body() {
+                    if matches!(
+                        self.store.delegation_check(
+                            &e.ghostkey.0,
+                            body.issued_mainnet_height,
+                            &body.watch_key.0,
+                        )?,
+                        DelegationCheck::Revoked | DelegationCheck::Superseded
+                    ) {
+                        pass.refused_unread += 1;
+                        continue;
+                    }
+                }
+            }
             if !self.store.is_handled(&k.0)? {
                 // Every entry read is removed, and a removal lasts until the
                 // floor passes it. Past the budget, reading waits for the
@@ -373,8 +423,13 @@ impl Processor<'_> {
                 // rather than growing the removals past what it may hold; and
                 // past its share, a Ghost Key's own requests wait while
                 // everyone else's are read.
+                let share = if e.delegation.is_some() {
+                    REMOVAL_SHARE_PER_GHOSTKEY - OWNER_RESERVE
+                } else {
+                    REMOVAL_SHARE_PER_GHOSTKEY
+                };
                 if handled >= REMOVAL_BUDGET
-                    || self.store.handled_count_for(&e.ghostkey.0)? >= REMOVAL_SHARE_PER_GHOSTKEY
+                    || self.store.handled_count_for(&e.ghostkey.0)? >= share
                 {
                     pass.deferred += 1;
                     pass.waiting.insert(e.ghostkey.0);
@@ -659,10 +714,101 @@ impl Processor<'_> {
                 return Ok(());
             }
         };
+        // Only the Ghost Key itself revokes its watch keys, and it does so
+        // before anything else about the request is judged, so a revocation
+        // riding on a request for a network this bridge does not observe is
+        // not lost with it. On a request a watch key signed the field is
+        // ignored, so a stolen watch key cannot lock its owner's newer one out.
+        if e.delegation.is_none() {
+            // Not past the chain, so a mistake in units cannot lock the Ghost
+            // Key out of delegations for decades: see the field's docs.
+            let bound = tips.mainnet().map(|t| t.saturating_add(WINDOW_BLOCKS));
+            let through = match (req.revoke_watch_keys_through, bound) {
+                (Some(t), Some(b)) if t <= b => Some(t),
+                (Some(t), _) => {
+                    tracing::warn!(
+                        through = t,
+                        "ignoring a revocation of watch keys through a height past the mainnet tip, \
+                         or with the tip unreadable"
+                    );
+                    None
+                }
+                (None, _) => None,
+            };
+            if let Some(through) = through {
+                // Restating a revocation already in force changes nothing,
+                // and clients are asked to restate theirs on every request.
+                if let Some(unwatched) = self.store.revoke_delegations_through(
+                    &e.ghostkey.0,
+                    through,
+                    req.made_at_ms,
+                    now_ms,
+                )? {
+                    for (net, script) in &unwatched {
+                        self.store.remove_watch(*net, script)?;
+                    }
+                    tracing::info!(
+                        through,
+                        stopped = unwatched.len(),
+                        "a Ghost Key revoked its watch keys"
+                    );
+                }
+            }
+        }
+
         let net = req.network;
         if !self.observed.contains(&net) {
             tracing::info!(network = ?net, "dropping a request for a network this bridge does not observe");
             return Ok(());
+        }
+
+        // A request a watch key signed is acted on as its Ghost Key's own,
+        // once the delegation checks out here. The contract has checked the
+        // signatures and the expiry against the entry's date; this checks the
+        // expiry against the mainnet tip as well, which holds while the floor
+        // is held back, and whether the Ghost Key has revoked it or a later
+        // delegation of it has been used (`pass` has already left unread an
+        // entry under a revoked or superseded one; this also refuses one
+        // conflicting at the same height, and stands on its own).
+        let mut delegation_serial = None;
+        let mut request_ms = req.made_at_ms;
+        if let Some(d) = &e.delegation {
+            let body = match d.body() {
+                Ok(b) => b,
+                Err(err) => {
+                    tracing::warn!(
+                        "dropping a delegated request whose delegation does not decode: {err}"
+                    );
+                    return Ok(());
+                }
+            };
+            if let (Some(last), Some(tip)) = (body.expires_mainnet_height, tips.mainnet()) {
+                if tip > last {
+                    tracing::info!("dropping a request under a delegation that has expired");
+                    return Ok(());
+                }
+            }
+            match self.store.admit_delegation(
+                &e.ghostkey.0,
+                body.issued_mainnet_height,
+                &body.watch_key.0,
+            )? {
+                DelegationCheck::Admitted => {}
+                refused => {
+                    tracing::info!(
+                        ?refused,
+                        issued = body.issued_mainnet_height,
+                        "dropping a request under a watch key its Ghost Key no longer honours"
+                    );
+                    return Ok(());
+                }
+            }
+            delegation_serial = Some(body.issued_mainnet_height);
+            // Ordered with the Ghost Key's own requests, but never as though
+            // made more than DELEGATED_AHEAD_MS past the bridge's clock: a
+            // stolen key must not be able to date a request so far ahead that
+            // the Ghost Key's own later ones are ignored as older.
+            request_ms = request_ms.min(now_ms.saturating_add(DELEGATED_AHEAD_MS).max(0) as u64);
         }
 
         let mut changed = 0usize;
@@ -739,8 +885,9 @@ impl Processor<'_> {
                         script: &script.0,
                         ghostkey: &e.ghostkey.0,
                         watching: true,
-                        request_ms: req.made_at_ms,
+                        request_ms,
                         until_height,
+                        delegation_serial,
                     };
                     match self
                         .store
@@ -771,8 +918,9 @@ impl Processor<'_> {
                         script: &script.0,
                         ghostkey: &e.ghostkey.0,
                         watching: false,
-                        request_ms: req.made_at_ms,
+                        request_ms,
                         until_height: None,
+                        delegation_serial,
                     };
                     // Only the sender's own interest is withdrawn. The script
                     // stops being scanned when it was the last one;
@@ -1492,6 +1640,7 @@ mod tests {
             scan_from_height: None,
             made_at_ms,
             watch_until_height: None,
+            revoke_watch_keys_through: None,
         }
     }
 
@@ -1797,6 +1946,617 @@ mod tests {
                 height.map(|h| (h, BlockHash([1; 32]))),
             )
             .unwrap();
+    }
+
+    // --- delegated watch keys ----------------------------------------------------
+
+    fn watch_key(tag: u8) -> SigningKey {
+        SigningKey::from_bytes(&[tag; 32])
+    }
+
+    /// `gk`'s delegation to `watch_key(tag)`, issued at mainnet height `issued`.
+    fn delegation(gk: &TestGhostkey, tag: u8, issued: u32) -> freenet_bitcoin_inbox::Delegation {
+        gk.delegation(bridge(), &watch_key(tag), issued)
+    }
+
+    fn delegated(
+        gk: &TestGhostkey,
+        d: &freenet_bitcoin_inbox::Delegation,
+        tag: u8,
+        height: u32,
+        req: &InboxRequest,
+    ) -> WireEntry {
+        gk.delegated_request(bridge(), height, req, d, &watch_key(tag))
+    }
+
+    fn interest_rows(store: &Store) -> Vec<(Vec<u8>, Vec<u8>)> {
+        store
+            .watches_run_out(SIGNET, i64::MAX, 0, u32::MAX)
+            .unwrap()
+    }
+
+    /// A watch key's Watch is acted on as its Ghost Key's own: the same
+    /// interest, which the Ghost Key's own Unwatch then ends.
+    #[test]
+    fn a_watch_keys_request_is_acted_on_as_its_ghost_keys() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        let d = delegation(gk, 1, 1);
+        let w = delegated(gk, &d, 1, FLOOR + 1, &request(Action::Watch, b"spk", 1));
+        let pass = run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(removed(&pass), 1);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        assert_eq!(
+            interest_rows(&store),
+            vec![(b"spk".to_vec(), gk.id().0.to_vec())],
+            "recorded under the Ghost Key, not the watch key"
+        );
+        run(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![entry(gk, FLOOR + 2, &request(Action::Unwatch, b"spk", 2))],
+            ),
+            &tips(),
+        );
+        assert!(
+            watched(&store).is_empty(),
+            "the Ghost Key's own Unwatch ends it"
+        );
+    }
+
+    /// One timeline per Ghost Key: a watch key's request older than its Ghost
+    /// Key's latest about a script is stale, as the Ghost Key's own would be.
+    #[test]
+    fn a_watch_keys_request_is_ordered_with_its_ghost_keys() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        run(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![entry(gk, FLOOR + 1, &request(Action::Unwatch, b"spk", 5))],
+            ),
+            &tips(),
+        );
+        let d = delegation(gk, 1, 1);
+        let w = delegated(gk, &d, 1, FLOOR + 1, &request(Action::Watch, b"spk", 3));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert!(
+            watched(&store).is_empty(),
+            "older than the Ghost Key's Unwatch"
+        );
+        let w = delegated(gk, &d, 1, FLOOR + 2, &request(Action::Watch, b"spk", 6));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+    }
+
+    /// A watch key buys no allowance of its own.
+    #[test]
+    fn a_watch_keys_requests_count_against_its_ghost_keys_limit() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        run_with(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![entry(gk, FLOOR + 1, &request(Action::Watch, b"s1", 1))],
+            ),
+            &tips(),
+            1,
+        );
+        let d = delegation(gk, 1, 1);
+        let w = delegated(gk, &d, 1, FLOOR + 2, &request(Action::Watch, b"s2", 2));
+        run_with(&store, &inbox(FLOOR, vec![w]), &tips(), 1);
+        assert_eq!(watched(&store), vec![b"s1".to_vec()]);
+    }
+
+    /// The Ghost Key revokes through a serial on any request of its own; a
+    /// delegation at or below it is refused from then on, one above it is
+    /// honoured.
+    #[test]
+    fn a_ghost_key_revokes_its_watch_keys_through_a_serial() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        let revoke = InboxRequest {
+            revoke_watch_keys_through: Some(1),
+            ..request(Action::Watch, b"own", 1)
+        };
+        run(
+            &store,
+            &inbox(FLOOR, vec![entry(gk, FLOOR + 1, &revoke)]),
+            &tips(),
+        );
+        let old = delegation(gk, 1, 1);
+        let w = delegated(gk, &old, 1, FLOOR + 2, &request(Action::Watch, b"spk", 2));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(watched(&store), vec![b"own".to_vec()], "the revoked key");
+        let new = delegation(gk, 2, 2);
+        let w = delegated(gk, &new, 2, FLOOR + 2, &request(Action::Watch, b"spk", 3));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(watched(&store), vec![b"own".to_vec(), b"spk".to_vec()]);
+    }
+
+    fn revoke_at(store: &Store, gk: &TestGhostkey, through: u32, made: u64, height: u32) {
+        let revoke = InboxRequest {
+            revoke_watch_keys_through: Some(through),
+            ..request(Action::Watch, b"own", made)
+        };
+        run(
+            store,
+            &inbox(FLOOR, vec![entry(gk, height, &revoke)]),
+            &tips(),
+        );
+    }
+
+    /// Revoking withdraws what the revoked key recorded, including watches
+    /// held for weeks, so they stop costing the bridge and free the Ghost
+    /// Key's places. The Ghost Key's own watches stay.
+    #[test]
+    fn revoking_a_watch_key_withdraws_what_it_recorded() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        run(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![entry(gk, FLOOR + 1, &request(Action::Watch, b"mine", 1))],
+            ),
+            &tips(),
+        );
+        let d = delegation(gk, 1, 1);
+        let held = InboxRequest {
+            watch_until_height: Some(u32::MAX),
+            ..request(Action::Watch, b"junk", 2)
+        };
+        run(
+            &store,
+            &inbox(FLOOR, vec![delegated(gk, &d, 1, FLOOR + 1, &held)]),
+            &tips(),
+        );
+        assert_eq!(watched(&store), vec![b"junk".to_vec(), b"mine".to_vec()]);
+        revoke_at(&store, gk, 1, 3, FLOOR + 2);
+        assert_eq!(
+            watched(&store),
+            vec![b"mine".to_vec(), b"own".to_vec()],
+            "the revoked key's watch is gone; the Ghost Key's stay"
+        );
+        // And its place is free again under a limit of two.
+        let w = entry(gk, FLOOR + 2, &request(Action::Watch, b"new", 4));
+        run_with(&store, &inbox(FLOOR, vec![w]), &tips(), 3);
+        assert!(watched(&store).contains(&b"new".to_vec()));
+    }
+
+    /// After revoking, the Ghost Key's own request about a script its revoked
+    /// key dated far ahead is still newer: revoking dates what the key
+    /// recorded no later than the revocation. Its Unwatch included.
+    #[test]
+    fn after_revoking_the_ghost_keys_own_requests_are_newer_than_the_keys() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        let d = delegation(gk, 1, 1);
+        let far = u64::MAX;
+        run_at(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![delegated(
+                    gk,
+                    &d,
+                    1,
+                    FLOOR + 1,
+                    &request(Action::Watch, b"a", far),
+                )],
+            ),
+            &tips(),
+            T0,
+        );
+        run_at(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![delegated(
+                    gk,
+                    &d,
+                    1,
+                    FLOOR + 1,
+                    &request(Action::Unwatch, b"b", far),
+                )],
+            ),
+            &tips(),
+            T0,
+        );
+        let revoke = InboxRequest {
+            revoke_watch_keys_through: Some(1),
+            ..request(Action::Watch, b"own", T0 as u64)
+        };
+        run_at(
+            &store,
+            &inbox(FLOOR, vec![entry(gk, FLOOR + 2, &revoke)]),
+            &tips(),
+            T0,
+        );
+        let again = |script: &[u8]| {
+            entry(
+                gk,
+                FLOOR + 2,
+                &request(Action::Watch, script, T0 as u64 + 1),
+            )
+        };
+        run_at(
+            &store,
+            &inbox(FLOOR, vec![again(b"a"), again(b"b")]),
+            &tips(),
+            T0,
+        );
+        assert_eq!(
+            watched(&store),
+            vec![b"a".to_vec(), b"b".to_vec(), b"own".to_vec()],
+            "both watched again at once, not an hour later"
+        );
+    }
+
+    /// A script another requester still wants stays scanned when a revoked
+    /// key's interest in it is withdrawn.
+    #[test]
+    fn revoking_leaves_a_script_another_requester_wants() {
+        let store = Store::open_in_memory().unwrap();
+        let (gk, other) = (&ghostkeys()[0], &ghostkeys()[1]);
+        let d = delegation(gk, 1, 1);
+        run(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![
+                    delegated(gk, &d, 1, FLOOR + 1, &request(Action::Watch, b"spk", 1)),
+                    entry(other, FLOOR + 1, &request(Action::Watch, b"spk", 1)),
+                ],
+            ),
+            &tips(),
+        );
+        revoke_at(&store, gk, 1, 2, FLOOR + 2);
+        assert!(watched(&store).contains(&b"spk".to_vec()));
+    }
+
+    /// A revocation riding on a request for a network this bridge does not
+    /// observe still takes effect.
+    #[test]
+    fn a_revocation_on_a_request_for_an_unobserved_network_still_counts() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        let revoke = InboxRequest {
+            revoke_watch_keys_through: Some(1),
+            network: BitcoinNetwork::Regtest,
+            ..request(Action::Watch, b"own", 1)
+        };
+        run(
+            &store,
+            &inbox(FLOOR, vec![entry(gk, FLOOR + 1, &revoke)]),
+            &tips(),
+        );
+        let d = delegation(gk, 1, 1);
+        let w = delegated(gk, &d, 1, FLOOR + 1, &request(Action::Watch, b"spk", 2));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert!(watched(&store).is_empty());
+    }
+
+    /// Past its expiry by the mainnet tip, a delegation is refused, even when
+    /// the entry's own date (all the contract can see) is not past it.
+    #[test]
+    fn a_delegation_past_its_expiry_by_the_tip_is_refused() {
+        let gk = &ghostkeys()[0];
+        for (last, acted) in [(MAINNET_TIP, true), (MAINNET_TIP - 1, false)] {
+            let store = Store::open_in_memory().unwrap();
+            let d = gk.delegation_expiring(bridge(), &watch_key(1), 1, Some(last));
+            let w = delegated(gk, &d, 1, FLOOR + 1, &request(Action::Watch, b"spk", 1));
+            run(&store, &inbox(FLOOR, vec![w]), &tips());
+            assert_eq!(!watched(&store).is_empty(), acted, "expires at {last}");
+        }
+    }
+
+    /// A watch key cannot date a request so far ahead that its Ghost Key's own
+    /// later requests are ignored as older.
+    #[test]
+    fn a_watch_keys_request_dated_far_ahead_counts_as_made_an_hour_ahead() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        let now = T0;
+        let d = delegation(gk, 1, 1);
+        let w = delegated(
+            gk,
+            &d,
+            1,
+            FLOOR + 1,
+            &request(Action::Watch, b"spk", u64::MAX),
+        );
+        run_at(&store, &inbox(FLOOR, vec![w]), &tips(), now);
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        let later = (now + DELEGATED_AHEAD_MS + 1) as u64;
+        let u = entry(gk, FLOOR + 2, &request(Action::Unwatch, b"spk", later));
+        run_at(&store, &inbox(FLOOR, vec![u]), &tips(), now);
+        assert!(
+            watched(&store).is_empty(),
+            "the Ghost Key's Unwatch is newer"
+        );
+    }
+
+    /// A watch key's requests wait once its Ghost Key has had all but
+    /// OWNER_RESERVE of its share read; the Ghost Key's own are still read.
+    #[test]
+    fn a_watch_key_cannot_spend_the_share_its_ghost_key_keeps() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        store
+            .with_transaction(|| {
+                for i in 0..(REMOVAL_SHARE_PER_GHOSTKEY - OWNER_RESERVE) as u64 {
+                    let mut k = [0xeeu8; 32];
+                    k[..8].copy_from_slice(&i.to_be_bytes());
+                    store.mark_handled(&k, FLOOR + 1, &gk.id().0)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let d = delegation(gk, 1, 1);
+        let w = delegated(gk, &d, 1, FLOOR + 1, &request(Action::Watch, b"theirs", 1));
+        let own = entry(gk, FLOOR + 1, &request(Action::Watch, b"mine", 1));
+        let pass = run(&store, &inbox(FLOOR, vec![w, own]), &tips());
+        assert_eq!(pass.deferred, 1);
+        assert_eq!(watched(&store), vec![b"mine".to_vec()]);
+    }
+
+    /// A revoked key's entries are left unread, so they spend none of the
+    /// Ghost Key's share and hold none of its watches back.
+    #[test]
+    fn a_revoked_keys_entries_are_left_unread() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        revoke_at(&store, gk, 1, 1, FLOOR + 1);
+        let d = delegation(gk, 1, 1);
+        let w = delegated(gk, &d, 1, FLOOR + 2, &request(Action::Watch, b"spk", 2));
+        let pass = run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(pass.refused_unread, 1);
+        assert_eq!(removed(&pass), 0, "not read, so not removed");
+        assert!(pass.waiting.is_empty());
+        assert_eq!(
+            store.handled_count_for(&gk.id().0).unwrap(),
+            1,
+            "only the revocation"
+        );
+    }
+
+    /// A revocation through a height past the mainnet tip, a mistake in units
+    /// say, is ignored rather than locking the Ghost Key out for good.
+    #[test]
+    fn a_revocation_past_the_tip_is_ignored() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        revoke_at(&store, gk, MAINNET_TIP + WINDOW_BLOCKS + 1, 1, FLOOR + 1);
+        let d = delegation(gk, 1, FLOOR);
+        let w = delegated(gk, &d, 1, FLOOR + 1, &request(Action::Watch, b"spk", 2));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert!(watched(&store).contains(&b"spk".to_vec()), "not revoked");
+        revoke_at(&store, gk, MAINNET_TIP, 3, FLOOR + 2);
+        assert!(
+            !watched(&store).contains(&b"spk".to_vec()),
+            "within the bound, revoked"
+        );
+    }
+
+    /// While the mainnet tip cannot be read, nothing bounds a revocation, so
+    /// it is ignored; the Ghost Key's next request restates it.
+    #[test]
+    fn a_revocation_with_the_tip_unreadable_is_ignored() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        let no_mainnet = Tips {
+            by_network: HashMap::from([(SIGNET, SIGNET_TIP)]),
+        };
+        let revoke = InboxRequest {
+            revoke_watch_keys_through: Some(1),
+            ..request(Action::Watch, b"own", 1)
+        };
+        run(
+            &store,
+            &inbox(FLOOR, vec![entry(gk, FLOOR + 1, &revoke)]),
+            &no_mainnet,
+        );
+        let d = delegation(gk, 1, 1);
+        let w = delegated(gk, &d, 1, FLOOR + 1, &request(Action::Watch, b"spk", 2));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert!(watched(&store).contains(&b"spk".to_vec()), "not revoked");
+    }
+
+    /// A delegation issued at the same height as the one admitted, to another
+    /// key, is read and removed, not left holding the watch key's place.
+    #[test]
+    fn a_conflicting_delegations_entry_is_read_and_removed() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        let (a, b) = (delegation(gk, 1, 5), delegation(gk, 2, 5));
+        run(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![delegated(
+                    gk,
+                    &a,
+                    1,
+                    FLOOR + 1,
+                    &request(Action::Watch, b"a", 1),
+                )],
+            ),
+            &tips(),
+        );
+        let w = delegated(gk, &b, 2, FLOOR + 2, &request(Action::Watch, b"b", 2));
+        let pass = run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(pass.refused_unread, 0);
+        assert_eq!(removed(&pass), 1, "read, so its place is freed");
+        assert_eq!(watched(&store), vec![b"a".to_vec()], "but not acted on");
+    }
+
+    /// A watch key's Unwatch ends a watch as the Ghost Key's own would.
+    #[test]
+    fn a_watch_keys_unwatch_ends_its_ghost_keys_watch() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        run(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![entry(gk, FLOOR + 1, &request(Action::Watch, b"spk", 1))],
+            ),
+            &tips(),
+        );
+        let d = delegation(gk, 1, 1);
+        let u = delegated(gk, &d, 1, FLOOR + 2, &request(Action::Unwatch, b"spk", 2));
+        run(&store, &inbox(FLOOR, vec![u]), &tips());
+        assert!(watched(&store).is_empty());
+    }
+
+    /// A watch key's Watch naming a height is held to it, as the Ghost Key's
+    /// own would be (#26).
+    #[test]
+    fn a_watch_keys_watch_is_held_through_its_height() {
+        let store = Store::open_in_memory().unwrap();
+        scanned_at(&store, T0);
+        let gk = &ghostkeys()[0];
+        let d = delegation(gk, 1, 1);
+        let until = SIGNET_TIP + 300;
+        let req = InboxRequest {
+            watch_until_height: Some(until),
+            ..request(Action::Watch, b"spk", 1)
+        };
+        run_at(
+            &store,
+            &inbox(FLOOR, vec![delegated(gk, &d, 1, FLOOR + 1, &req)]),
+            &tips(),
+            T0,
+        );
+        tick(&store, &tips(), when_scanned_to(until + 5));
+        assert_eq!(watched(&store), vec![b"spk".to_vec()]);
+        tick(&store, &tips(), when_scanned_to(until + 6));
+        assert!(watched(&store).is_empty());
+    }
+
+    /// Revoking through 0 revokes only a delegation numbered 0.
+    #[test]
+    fn revoking_through_zero_leaves_later_delegations() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        revoke_at(&store, gk, 0, 1, FLOOR + 1);
+        let d = delegation(gk, 1, 1);
+        let w = delegated(gk, &d, 1, FLOOR + 1, &request(Action::Watch, b"spk", 2));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert!(watched(&store).contains(&b"spk".to_vec()));
+    }
+
+    /// A revocation only rises: a later, lower one changes nothing.
+    #[test]
+    fn a_revocation_floor_never_falls() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        let revoke = |below, made| InboxRequest {
+            revoke_watch_keys_through: Some(below),
+            ..request(Action::Watch, b"own", made)
+        };
+        run(
+            &store,
+            &inbox(FLOOR, vec![entry(gk, FLOOR + 1, &revoke(5, 1))]),
+            &tips(),
+        );
+        run(
+            &store,
+            &inbox(FLOOR, vec![entry(gk, FLOOR + 2, &revoke(2, 2))]),
+            &tips(),
+        );
+        let d = delegation(gk, 1, 3);
+        let w = delegated(gk, &d, 1, FLOOR + 2, &request(Action::Watch, b"spk", 3));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(watched(&store), vec![b"own".to_vec()]);
+    }
+
+    /// Only the Ghost Key revokes: the field on a watch key's request is
+    /// ignored, so a stolen key cannot lock its owner's newer one out.
+    #[test]
+    fn a_watch_key_cannot_revoke() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        let d1 = delegation(gk, 1, 1);
+        let lockout = InboxRequest {
+            revoke_watch_keys_through: Some(u32::MAX),
+            ..request(Action::Watch, b"a", 1)
+        };
+        run(
+            &store,
+            &inbox(FLOOR, vec![delegated(gk, &d1, 1, FLOOR + 1, &lockout)]),
+            &tips(),
+        );
+        let d2 = delegation(gk, 2, 2);
+        let w = delegated(gk, &d2, 2, FLOOR + 2, &request(Action::Watch, b"b", 2));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(watched(&store), vec![b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    /// Once a newer delegation has been used, an older one is refused, and a
+    /// second key under the same serial is refused too.
+    #[test]
+    fn a_newer_delegation_used_supersedes_older_ones() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        let (old, new) = (delegation(gk, 1, 1), delegation(gk, 2, 2));
+        run(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![delegated(
+                    gk,
+                    &new,
+                    2,
+                    FLOOR + 1,
+                    &request(Action::Watch, b"a", 1),
+                )],
+            ),
+            &tips(),
+        );
+        let w = delegated(gk, &old, 1, FLOOR + 2, &request(Action::Watch, b"b", 2));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(watched(&store), vec![b"a".to_vec()], "the older delegation");
+        let twin = delegation(gk, 3, 2);
+        let w = delegated(gk, &twin, 3, FLOOR + 2, &request(Action::Watch, b"c", 3));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(
+            watched(&store),
+            vec![b"a".to_vec()],
+            "another key, same serial"
+        );
+        let w = delegated(gk, &new, 2, FLOOR + 3, &request(Action::Watch, b"d", 4));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(
+            watched(&store),
+            vec![b"a".to_vec(), b"d".to_vec()],
+            "the newest again"
+        );
+    }
+
+    /// A delegation belongs to one Ghost Key: another Ghost Key's floor and
+    /// newest delegation do not touch it.
+    #[test]
+    fn one_ghost_keys_revocation_leaves_anothers_watch_keys_alone() {
+        let store = Store::open_in_memory().unwrap();
+        let (a, b) = (&ghostkeys()[0], &ghostkeys()[1]);
+        let revoke = InboxRequest {
+            revoke_watch_keys_through: Some(10),
+            ..request(Action::Watch, b"own", 1)
+        };
+        run(
+            &store,
+            &inbox(FLOOR, vec![entry(a, FLOOR + 1, &revoke)]),
+            &tips(),
+        );
+        let d = delegation(b, 1, 1);
+        let w = delegated(b, &d, 1, FLOOR + 1, &request(Action::Watch, b"spk", 1));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(watched(&store), vec![b"own".to_vec(), b"spk".to_vec()]);
     }
 
     // --- a watch held through a height (freenet-bitcoin#26) ------------------
@@ -3525,6 +4285,7 @@ mod tests {
                         watching: true,
                         request_ms: 1,
                         until_height: None,
+                        delegation_serial: None,
                     },
                     MAX_WATCHES_PER_GHOSTKEY,
                     T0,
@@ -3684,7 +4445,7 @@ mod tests {
         watch_at(&store, &ghostkeys()[0], 1, T0);
         store
             .execute_for_test(
-                "INSERT INTO script_interests VALUES ('bitcoin', X'00', 7, 1, 0, 0, NULL);",
+                "INSERT INTO script_interests VALUES ('bitcoin', X'00', 7, 1, 0, 0, NULL, NULL);",
             )
             .unwrap();
         scanned_to(

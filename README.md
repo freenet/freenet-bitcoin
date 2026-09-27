@@ -73,8 +73,12 @@ its own database, never replicated. What each party learns is written up in
 
 A bridge decides who may ask it to do work. It takes requests only from Ghost
 Key holders: its inbox admits an entry only when it is signed by a key whose
-certificate chains to Freenet's Ghost Key master key, and every peer checks
-that before storing it. That is what makes a donation buy something concrete,
+certificate chains to Freenet's Ghost Key master key, or by a watch key that
+such a Ghost Key has delegated its watch requests to, and every peer checks
+that before storing it. A delegated watch key is how a background process,
+such as an application's Freenet delegate, keeps asking for watches with the
+Ghost Key nowhere near: its requests count as the Ghost Key's own, and it can
+do nothing else. That is what makes a donation buy something concrete,
 and what stops the inbox being an open invitation to make the bridge scan
 arbitrary scripts. It gates requests only. Observations carry no Ghost Key,
 and reading them needs none.

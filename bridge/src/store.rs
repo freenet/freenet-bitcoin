@@ -63,6 +63,9 @@ pub struct Interest<'a> {
     /// to [`freenet_bitcoin_inbox::MAX_WATCH_AHEAD_BLOCKS`] above the tip
     /// (freenet-bitcoin#26). Ignored for a withdrawal.
     pub until_height: Option<u32>,
+    /// The height the delegation a watch key made the request under was
+    /// issued at (its serial), or `None` for the Ghost Key's own.
+    pub delegation_serial: Option<u32>,
 }
 
 /// What [`Store::set_interest`] did.
@@ -78,6 +81,22 @@ pub enum InterestChange {
     Withdrawn { last: bool },
     /// A withdrawal from a requester that was not watching it.
     Unchanged,
+}
+
+/// A script on one network.
+pub type NetworkScript = (BitcoinNetwork, Vec<u8>);
+
+/// What [`Store::admit_delegation`] decided.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DelegationCheck {
+    /// Act on the request.
+    Admitted,
+    /// Below the floor the Ghost Key raised.
+    Revoked,
+    /// A newer delegation of this Ghost Key has been used.
+    Superseded,
+    /// Another watch key under the same serial was used first.
+    Conflicting,
 }
 
 /// A script the bridge is currently synchronizing.
@@ -394,6 +413,10 @@ impl Store {
                 -- The height a Watch holds its script through, whatever its
                 -- day says (freenet-bitcoin#26). NULL for none.
                 until_height   INTEGER,
+                -- The height the delegation a watch key made this request
+                -- under was issued at; NULL for the Ghost Key's own. Revoking the delegation
+                -- withdraws what it recorded.
+                delegation_serial INTEGER,
                 PRIMARY KEY (network, script_pubkey, ghostkey)
             );
             CREATE INDEX IF NOT EXISTS script_interests_by_ghostkey
@@ -434,6 +457,19 @@ impl Store {
             CREATE INDEX IF NOT EXISTS inbox_handled_by_ghostkey
                 ON inbox_handled (ghostkey);
 
+            -- Per Ghost Key, the watch keys it has delegated to: the mainnet
+            -- height its delegations are revoked through (raised by the Ghost
+            -- Key's own requests, never lowered; NULL for none), and the
+            -- latest delegation seen used. A delegation's serial is the
+            -- mainnet height it was issued at. The only record of a revocation: see
+            -- docs/deployment.md before deleting this database.
+            CREATE TABLE IF NOT EXISTS watch_delegations (
+                ghostkey        BLOB PRIMARY KEY,
+                revoked_through INTEGER,
+                newest_serial   INTEGER,
+                newest_key      BLOB
+            );
+
             -- Left behind by the HTTP request service this bridge used to run.
             DROP TABLE IF EXISTS challenges;
             "#,
@@ -452,6 +488,20 @@ impl Store {
         if !interests_have_until {
             self.conn
                 .execute_batch("ALTER TABLE script_interests ADD COLUMN until_height INTEGER;")?;
+        }
+        // Likewise `delegation_serial`, from before delegated watch keys: no
+        // request recorded then came from one.
+        let interests_have_delegation = self
+            .conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('script_interests') \
+                 WHERE name = 'delegation_serial'",
+            )?
+            .exists([])?;
+        if !interests_have_delegation {
+            self.conn.execute_batch(
+                "ALTER TABLE script_interests ADD COLUMN delegation_serial INTEGER;",
+            )?;
         }
         // A checkpoint below every block record kept reads as a reorg at a
         // height nothing was recorded for, and the round retracts every
@@ -1202,10 +1252,11 @@ impl Store {
         self.conn.execute(
             "INSERT INTO script_interests
                  (network, script_pubkey, ghostkey, watching, request_ms, recorded_ms,
-                  until_height)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                  until_height, delegation_serial)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(network, script_pubkey, ghostkey) DO UPDATE SET
-                 watching = ?4, request_ms = ?5, recorded_ms = ?6, until_height = ?7",
+                 watching = ?4, request_ms = ?5, recorded_ms = ?6, until_height = ?7,
+                 delegation_serial = ?8",
             params![
                 net,
                 i.script,
@@ -1213,7 +1264,8 @@ impl Store {
                 i.watching as i64,
                 request_ms,
                 now_ms,
-                until_height
+                until_height,
+                i.delegation_serial
             ],
         )?;
 
@@ -1224,6 +1276,143 @@ impl Store {
                 last: self.watchers(i.network, i.script)? == 0,
             },
         })
+    }
+
+    /// Whether a request signed by `watch_key` under a delegation of
+    /// `ghostkey` numbered `serial` may be acted on, recording the delegation
+    /// as the newest seen when it is. Refused at or below the serial the Ghost
+    /// Key revoked through, below the newest delegation seen used, or at the
+    /// same serial for another key. Call inside [`Store::with_transaction`].
+    pub fn admit_delegation(
+        &self,
+        ghostkey: &[u8],
+        serial: u32,
+        watch_key: &[u8],
+    ) -> anyhow::Result<DelegationCheck> {
+        let check = self.delegation_check(ghostkey, serial, watch_key)?;
+        if check != DelegationCheck::Admitted {
+            return Ok(check);
+        }
+        self.conn.execute(
+            "INSERT INTO watch_delegations (ghostkey, newest_serial, newest_key)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(ghostkey) DO UPDATE SET newest_serial = ?2, newest_key = ?3
+             WHERE newest_serial IS NULL OR newest_serial < ?2",
+            params![ghostkey, i64::from(serial), watch_key],
+        )?;
+        Ok(DelegationCheck::Admitted)
+    }
+
+    /// What [`Self::admit_delegation`] would decide, recording nothing.
+    pub fn delegation_check(
+        &self,
+        ghostkey: &[u8],
+        serial: u32,
+        watch_key: &[u8],
+    ) -> anyhow::Result<DelegationCheck> {
+        let serial = i64::from(serial);
+        type Row = (Option<i64>, Option<i64>, Option<Vec<u8>>);
+        let row: Option<Row> = self
+            .conn
+            .query_row(
+                "SELECT revoked_through, newest_serial, newest_key FROM watch_delegations
+                 WHERE ghostkey = ?1",
+                params![ghostkey],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let (revoked, newest) = match row {
+            None => (None, None),
+            Some((r, s, k)) => (r, s.zip(k)),
+        };
+        if revoked.is_some_and(|r| serial <= r) {
+            return Ok(DelegationCheck::Revoked);
+        }
+        if let Some((n, k)) = &newest {
+            if serial < *n {
+                return Ok(DelegationCheck::Superseded);
+            }
+            if serial == *n {
+                return Ok(if k.as_slice() == watch_key {
+                    DelegationCheck::Admitted
+                } else {
+                    DelegationCheck::Conflicting
+                });
+            }
+        }
+        Ok(DelegationCheck::Admitted)
+    }
+
+    /// Revoke every delegation of `ghostkey` numbered at or below `through`:
+    /// refuse them from now on, and withdraw every watch a request under one
+    /// of them recorded, returning `None` if an earlier revocation already
+    /// covered `through`, else the scripts nobody watches any more. Never
+    /// lowers an earlier revocation. Only for a request the Ghost Key itself
+    /// signed, made at `made_at_ms`. Call inside [`Store::with_transaction`]
+    /// with the watch removals it implies.
+    ///
+    /// Every row a revoked key recorded, watching or withdrawn, is dated no
+    /// later than the revoking request, so the Ghost Key's next request about
+    /// the script is newer than anything the revoked key sent, however far
+    /// ahead that key dated its own.
+    pub fn revoke_delegations_through(
+        &self,
+        ghostkey: &[u8],
+        through: u32,
+        made_at_ms: u64,
+        now_ms: i64,
+    ) -> anyhow::Result<Option<Vec<NetworkScript>>> {
+        let through = i64::from(through);
+        let made_at_ms = made_at_ms.min(i64::MAX as u64) as i64;
+        let held: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT revoked_through FROM watch_delegations WHERE ghostkey = ?1",
+                params![ghostkey],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if held.is_some_and(|h| h >= through) {
+            return Ok(None);
+        }
+        self.conn.execute(
+            "INSERT INTO watch_delegations (ghostkey, revoked_through) VALUES (?1, ?2)
+             ON CONFLICT(ghostkey) DO UPDATE SET revoked_through = ?2",
+            params![ghostkey, through],
+        )?;
+        // What the revoked keys recorded, withdrawn as the Ghost Key's own
+        // Unwatch would withdraw it, so it frees the Ghost Key's places and
+        // a delayed copy cannot bring it back. Their held heights go too.
+        let rows: Vec<(String, Vec<u8>)> = self
+            .conn
+            .prepare(
+                "SELECT network, script_pubkey FROM script_interests
+                 WHERE ghostkey = ?1 AND watching = 1 AND delegation_serial <= ?2",
+            )?
+            .query_map(params![ghostkey, through], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        self.conn.execute(
+            "UPDATE script_interests
+             SET watching = 0, recorded_ms = ?3, until_height = NULL
+             WHERE ghostkey = ?1 AND watching = 1 AND delegation_serial <= ?2",
+            params![ghostkey, through, now_ms],
+        )?;
+        self.conn.execute(
+            "UPDATE script_interests SET request_ms = MIN(request_ms, ?3)
+             WHERE ghostkey = ?1 AND delegation_serial <= ?2",
+            params![ghostkey, through, made_at_ms],
+        )?;
+        let mut unwatched = Vec::new();
+        for (net, script) in rows {
+            let Ok(net) = net.parse::<BitcoinNetwork>() else {
+                continue;
+            };
+            if self.watchers(net, &script)? == 0 {
+                unwatched.push((net, script));
+            }
+        }
+        Ok(Some(unwatched))
     }
 
     /// How many requesters currently want `script`.
@@ -1499,7 +1688,7 @@ mod tests {
     fn a_watch_row_that_cannot_be_read_fails_the_expiry() {
         let s = store();
         s.execute_for_test(
-            "INSERT INTO script_interests VALUES ('signet', X'00', 7, 1, 0, 0, NULL);",
+            "INSERT INTO script_interests VALUES ('signet', X'00', 7, 1, 0, 0, NULL, NULL);",
         )
         .unwrap();
         assert!(s
@@ -1612,6 +1801,7 @@ mod tests {
             watching,
             request_ms,
             until_height: None,
+            delegation_serial: None,
         }
     }
 
@@ -1805,7 +1995,7 @@ mod tests {
         let s = store();
         let gk = [1u8; 32];
         s.execute_for_test(&format!(
-            "INSERT INTO script_interests VALUES ('signet', X'616263', X'{}', 0, 5, 5, 900);",
+            "INSERT INTO script_interests VALUES ('signet', X'616263', X'{}', 0, 5, 5, 900, NULL);",
             "01".repeat(32)
         ))
         .unwrap();
@@ -1817,6 +2007,49 @@ mod tests {
                 .is_empty(),
             "runs out with its day: the old height was not taken up"
         );
+    }
+
+    /// A database from before delegated watch keys (heights, no delegation
+    /// column, no delegations table) opens, keeps its watches, and takes both.
+    #[test]
+    fn a_database_from_before_watch_keys_opens_and_takes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(&format!(
+                "CREATE TABLE script_interests (
+                     network TEXT NOT NULL, script_pubkey BLOB NOT NULL,
+                     ghostkey BLOB NOT NULL, watching INTEGER NOT NULL,
+                     request_ms INTEGER NOT NULL, recorded_ms INTEGER NOT NULL,
+                     until_height INTEGER,
+                     PRIMARY KEY (network, script_pubkey, ghostkey));
+                 INSERT INTO script_interests VALUES ('signet', X'616263', X'{}', 1, 5, 5, NULL);",
+                "01".repeat(32)
+            ))
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.watches_run_out(BitcoinNetwork::Signet, 10, 0, 0).unwrap(),
+            vec![(b"abc".to_vec(), vec![1u8; 32])]
+        );
+        assert_eq!(
+            s.admit_delegation(&[1u8; 32], 7, &[2u8; 32]).unwrap(),
+            DelegationCheck::Admitted
+        );
+        assert!(
+            s.revoke_delegations_through(&[1u8; 32], 7, 0, 0)
+                .unwrap()
+                .is_some_and(|u| u.is_empty()),
+            "the old row was the Ghost Key's own, so it stays"
+        );
+        assert_eq!(
+            s.admit_delegation(&[1u8; 32], 7, &[2u8; 32]).unwrap(),
+            DelegationCheck::Revoked
+        );
+        drop(s);
+        Store::open(&path).expect("and opens again once migrated");
     }
 
     /// A database from before watches could be held through a height keeps

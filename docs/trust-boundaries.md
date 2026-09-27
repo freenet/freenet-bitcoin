@@ -91,7 +91,9 @@ transaction.
 **Takes requests only through its inbox contract.** It has no network
 listener. What reaches it has already been checked by every peer that stored
 it: a Ghost Key certificate chaining to the master key, and that key's
-signature over a request addressed to this bridge.
+signature over a request addressed to this bridge, or that key's signature on
+a delegation to a watch key plus the watch key's signature on the request (see
+`Delegation` in the inbox crate).
 
 **Trusted for:** availability, and for chain state — which blocks are on
 Bitcoin, what height each is at, and where the tip is. Those assertions are not
@@ -175,6 +177,15 @@ Keys. They receive an address and an amount and pay it with any wallet.
 | Seller marks their own order paid without payment | Requires bridge-signed evidence any peer re-verifies; a bare seller signature is not accepted |
 | Flood one address contract to exhaust state | `MAX_CLAIMS` cap, pruned deterministically, keeping the most recent evidence |
 | Enumerate who watches what | Requests are sealed to the bridge and removed once read; the bridge's record of who asked for what stays in its own database |
+| Write requests as a Ghost Key with a watch key it never delegated to | The contract checks the Ghost Key's signature on the delegation and the watch key's on the entry; a delegation signed by another Ghost Key, or for another bridge, is refused |
+| Pass a signature the Ghost Key gave for something else off as a delegation, or the reverse | Delegations, the Ghost Key's own entries and a watch key's entries are signed in three separate domains, and none decodes as another |
+| Re-wrap a watch key's entry in another delegation to the same key, to take its Ghost Key's places | The watch key's signature covers a digest of the delegation it was made under |
+| A stolen watch key keeps its owner's revocation out of the inbox | A watch key takes at most 1 of its Ghost Key's 2 places, and at most all but `OWNER_RESERVE` of its share of the bridge's reading, so the Ghost Key's own request is always admitted and read |
+| A revoked watch key keeps its replacement out of the inbox | Of a Ghost Key's watch keys' entries, only the one under the latest-issued delegation keeps the place, however the others are dated; a delegation cannot claim to be issued after the entries that use it, which are dated within a few blocks of the chain, so none can claim a height ahead to outrank every later one |
+| A stolen watch key keeps working after revocation | The bridge refuses any delegation issued at or below the mainnet height the Ghost Key revoked through, and leaves its entries unread; an expiry, if set, is checked by the contract against the entry's date and by the bridge against the mainnet tip |
+| A stolen watch key's watches outlive its revocation | Revoking withdraws every watch a request under a revoked delegation recorded, with the heights it held them through, freeing the Ghost Key's places, and dates everything that key recorded no later than the revocation, so the Ghost Key's next requests are newer. A height the key raised on a watch the Ghost Key recorded itself stays until the Ghost Key unwatches it |
+| A stolen watch key dates requests far ahead so its owner's later ones look older | A watch key's request counts as made at most an hour past the bridge's clock |
+| A stolen watch key unwatches its owner's payment addresses | **Not stopped until revocation.** A watch key acts as its Ghost Key for Watch and Unwatch; the owner revokes it and sends Watch again for everything it still wants, since revoking also withdraws the watches the key renewed |
 
 **Not in the table, because nothing stops it:** a trusted bridge asserting
 chain state that is not Bitcoin's. No check anchors a header to the real chain,

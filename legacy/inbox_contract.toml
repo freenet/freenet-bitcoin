@@ -10,4 +10,8 @@
 # pointer names. Entries are recorded so scripts/deploy.sh can refuse to move
 # the bridge back onto a retired generation.
 #
-# No inbox generation has been deployed yet, so none is superseded.
+[[entry]]
+version = "I1"
+description = "The first deployed inbox (#4, #10). Superseded by the one that admits entries a delegated watch key signed; its entries without a delegation are the same bytes in its successor."
+date = "2026-09-26"
+code_hash = "387f25c22f59019bd12e844c5c78d702fbd91c930edc1c5d68aa8c15f30e4414"
