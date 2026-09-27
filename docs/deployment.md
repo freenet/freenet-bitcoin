@@ -241,6 +241,13 @@ silently freezes at whatever generation it last named — pointing every reader
 at contracts the bridge no longer writes to. That is the failure the pointer
 exists to prevent, reintroduced by following the paragraph above.
 
+**Nor is `watch_delegations`.** It is the only record of which watch keys a
+Ghost Key has revoked. Deleted, every revocation is forgotten until the Ghost
+Key's next request restates it, which a client should do on each of its own
+requests (`revoke_watch_keys_through`), and a revoked key works again in the
+meantime. Keep the database unless every Ghost Key that ever revoked a watch
+key will be back soon.
+
 The bridge handles this itself and needs no special procedure: before writing,
 it reads the standing record back off the network and adopts its version
 whenever that record verifies under the bridge's own key. So deleting the
@@ -321,12 +328,23 @@ contract id as `serving the request inbox`.
   background process can ask for watches with no Ghost Key at hand. The
   contract checks the Ghost Key's certificate, its signature on the delegation,
   that the delegation names this bridge and has not expired by the entry's
-  date, and the watch key's signature on the entry. The bridge then acts on the
-  request as the Ghost Key's own: the same interests, per-Ghost Key limits and
-  `made_at_ms` ordering. It refuses one under a delegation whose serial is below
-  the floor the Ghost Key raised (`revoke_watch_keys_below` on one of the Ghost
-  Key's own requests) or below the newest delegation of that Ghost Key it has
-  seen used (`watch_delegations`, in the database).
+  date, and the watch key's signature on the entry, which covers the
+  delegation. A watch key holds at most one of its Ghost Key's two places. The
+  bridge acts on the request as the Ghost Key's own (the same interests,
+  limits and ordering, the request's time counted at most an hour past the
+  bridge's clock), reads a watch key's requests only up to all but
+  `OWNER_RESERVE` of the Ghost Key's share, and refuses one under a delegation
+  that is revoked (`revoke_watch_keys_through` on the Ghost Key's own request,
+  which also withdraws what the revoked key recorded), superseded by a newer
+  one seen used, dated more than a week past its clock, or expired by the
+  mainnet tip. `watch_delegations` in the database is where revocations live:
+  see Recovery.
+- **Rolling back past delegated watch keys is not supported.** A bridge from
+  before them, reading the inbox that admits them, cannot verify a delegated
+  entry, so it holds back watch expiry while one is present and never acts on
+  one; and `scripts/deploy.sh` refuses to install the retired inbox. Fix
+  forward. Nothing checks yet that the binary and the inbox WASM agree
+  (#21).
 - **A Watch may name a height to be held through** (`watch_until_height`,
   #26), so a client that goes away stays watched: the bridge keeps such a
   watch past its day until the block `deep_confirmations - 1` below its scan
@@ -520,8 +538,9 @@ enabling `txindex`.
   refuses to publish scan watermarks while a node is in IBD, because during IBD
   an absence of payments means nothing and the claim would be misleading.
 - **Requests come only through the inbox.** There is no service to expose and
-  no reverse proxy to run. The inbox admits only Ghost Key signed entries,
-  verified by every peer, and holds at most 2 waiting requests per Ghost Key
+  no reverse proxy to run. The inbox admits only entries a Ghost Key signed,
+  itself or through a watch key it delegated to, verified by every peer, and
+  holds at most 2 waiting requests per Ghost Key (1 of them from a watch key)
   and 128 in all; a request gives its place back as soon as the bridge has
   read it. The bridge adds its own limit: 1000 watched scripts per Ghost Key.
   A request cannot move the scan cursor (see "Backfilling history" above).

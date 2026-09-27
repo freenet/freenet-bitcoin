@@ -201,6 +201,11 @@ pub fn sender_height(floor: u32) -> u32 {
 /// validates the state.
 pub const MAX_ENTRIES: usize = 128;
 
+/// Of those, how many a watch key the Ghost Key delegated to may hold (see
+/// [`Delegation`]): the rest are kept for the Ghost Key's own entries, so a
+/// stolen watch key cannot keep its owner's revocation out of the inbox.
+pub const MAX_DELEGATED_ENTRIES_PER_GHOSTKEY: usize = 1;
+
 /// Entries one Ghost Key may hold at once.
 ///
 /// A Ghost Key decides who may write; this decides how much of the inbox one
@@ -283,6 +288,7 @@ const ENTRY_DOMAIN: &[u8] = b"freenet-bitcoin/inbox-entry/v1\0";
 const WATCH_ENTRY_DOMAIN: &[u8] = b"freenet-bitcoin/inbox-watch-key-entry/v1\0";
 /// What a Ghost Key signs to delegate its watch requests to a watch key.
 const DELEGATION_DOMAIN: &[u8] = b"freenet-bitcoin/inbox-watch-delegation/v1\0";
+const DELEGATION_DIGEST_DOMAIN: &str = "freenet-bitcoin/inbox-watch-delegation-digest/v1";
 const FLOOR_DOMAIN: &[u8] = b"freenet-bitcoin/inbox-floor/v1\0";
 const REMOVAL_DOMAIN: &[u8] = b"freenet-bitcoin/inbox-removal/v1\0";
 const BATCH_KEY_DOMAIN: &str = "freenet-bitcoin/inbox-removal-key/v1";
@@ -422,13 +428,18 @@ pub struct InboxRequest {
     /// [`MAX_WATCH_AHEAD_BLOCKS`], which says what the bridge does with it (freenet-bitcoin#26).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch_until_height: Option<u32>,
-    /// From the Ghost Key itself: refuse every [`Delegation`] of this Ghost
-    /// Key whose `serial` is below this, from now on. Raises a floor the
-    /// bridge keeps per Ghost Key; it never falls. Ignored on a request a
-    /// watch key signed, so a stolen watch key cannot lock its owner's newer
-    /// one out. Left out of the encoding when `None`.
+    /// From the Ghost Key itself: revoke every [`Delegation`] of this Ghost
+    /// Key whose `serial` is at or below this. The bridge refuses them from
+    /// then on and withdraws every watch a request under one of them
+    /// recorded. It raises a mark the bridge keeps per Ghost Key, which never
+    /// falls, and is applied whatever the request's `made_at_ms`, as a mark
+    /// that only rises need not be ordered. Ignored on a request a watch key
+    /// signed, so a stolen watch key cannot lock its owner's newer one out.
+    /// A sender may send its current value on every request of its own, which
+    /// also restores it to a bridge that lost its database. Left out of the
+    /// encoding when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revoke_watch_keys_below: Option<u64>,
+    pub revoke_watch_keys_through: Option<u64>,
 }
 
 impl InboxRequest {
@@ -494,20 +505,33 @@ impl InboxEntryBody {
         from_cbor(body)
     }
 
-    /// The exact bytes a watch key signs for this body, which the entry
-    /// carries as its `scoped_payload`: no vault is involved.
-    pub fn watch_key_signing_payload(&self) -> Result<Vec<u8>, String> {
+    /// The exact bytes a watch key signs for this body under `delegation`,
+    /// which the entry carries as its `scoped_payload`: no vault is involved.
+    ///
+    /// They include a digest of the delegation, so the signature holds only
+    /// under the delegation it was made under. Otherwise anyone could re-wrap
+    /// a watch key's entry in another delegation to the same key, making a
+    /// new entry that takes its Ghost Key's places in the inbox.
+    pub fn watch_key_signing_payload(&self, delegation: &Delegation) -> Result<Vec<u8>, String> {
         let mut v = WATCH_ENTRY_DOMAIN.to_vec();
+        v.extend_from_slice(&delegation.digest());
         v.extend(to_cbor(self)?);
         Ok(v)
     }
 
-    /// Recover the body from what a watch key signed.
-    pub fn from_watch_key_signing_payload(payload: &[u8]) -> Result<Self, String> {
-        let body = payload
+    /// Recover the body from what a watch key signed, and the digest of the
+    /// delegation it was signed under.
+    pub fn from_watch_key_signing_payload(payload: &[u8]) -> Result<([u8; 32], Self), String> {
+        let rest = payload
             .strip_prefix(WATCH_ENTRY_DOMAIN)
             .ok_or("the signed payload is not a watch key's inbox entry")?;
-        from_cbor(body)
+        if rest.len() < 32 {
+            return Err("a watch key's inbox entry is too short".into());
+        }
+        let (digest, body) = rest.split_at(32);
+        let mut d = [0u8; 32];
+        d.copy_from_slice(digest);
+        Ok((d, from_cbor(body)?))
     }
 }
 
@@ -533,6 +557,18 @@ pub const MAX_DELEGATION_BYTES: usize = 1024;
 /// that cannot reach the Ghost Key, keep asking for watches after the person
 /// has gone away, including for addresses derived after they left.
 ///
+/// **One watch key per Ghost Key and bridge.** The bridge honours only the
+/// newest delegation of a Ghost Key it has seen used, so two applications, or
+/// two devices, that each delegate the same Ghost Key to their own key disable
+/// whichever delegated first. A request so refused is removed like any other
+/// read request; its sender learns only from the script's scan watermark never
+/// appearing. Share one watch key, or use a Ghost Key each.
+///
+/// **What the Ghost Key keeps for itself.** An entry a watch key signs takes at
+/// most one of its Ghost Key's places in the inbox, and at most all but
+/// `OWNER_RESERVE` of its share of the bridge's reading, so a stolen watch key
+/// cannot crowd out the Ghost Key's own requests, its revocation included.
+///
 /// It is in the clear in the inbox, where every peer checks it, so it names
 /// nothing the inbox otherwise keeps sealed: no network, and no script. A
 /// reader of the inbox learns that a Ghost Key delegated to some key, when it
@@ -544,10 +580,13 @@ pub struct DelegationBody {
     pub bridge: BridgeId,
     /// The key that may sign requests.
     pub watch_key: WatchKeyId,
-    /// Orders one Ghost Key's delegations: the bridge refuses one below the
-    /// newest it has seen used, or below the floor a request from the Ghost
-    /// Key raised ([`InboxRequest::revoke_watch_keys_below`]). A sender uses
-    /// a strictly increasing value, such as the time in milliseconds.
+    /// When the delegation was made, in milliseconds since the Unix epoch by
+    /// the Ghost Key holder's clock, and what orders one Ghost Key's
+    /// delegations: the bridge refuses one below the newest it has seen used,
+    /// one at or below the mark the Ghost Key raised
+    /// ([`InboxRequest::revoke_watch_keys_through`]), and one dated more than
+    /// a week past its own clock, so no delegation can be numbered beyond
+    /// every revocation.
     pub serial: u64,
     /// The last Bitcoin mainnet height an entry under this delegation may be
     /// dated. The contract enforces it, as entries are dated by the mainnet
@@ -590,6 +629,13 @@ impl Delegation {
             scoped_payload: ByteBuf(scoped_payload),
             signature: ByteBuf(signature),
         }
+    }
+
+    /// What a watch key's entry signature binds this delegation by.
+    pub fn digest(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new_derive_key(DELEGATION_DIGEST_DOMAIN);
+        h.update(&self.scoped_payload);
+        *h.finalize().as_bytes()
     }
 
     /// The body, decoded without checking the signature. Only for entries
@@ -651,7 +697,7 @@ impl WireEntry {
         let certificate_pem = canonical_certificate(&certificate_pem)?;
         let cert = GhostkeyCertificateV1::from_armored_string(&certificate_pem)
             .map_err(|e| format!("certificate does not parse: {e:?}"))?;
-        let payload = body.watch_key_signing_payload()?;
+        let payload = body.watch_key_signing_payload(&delegation)?;
         let signature = watch_key.sign(&payload).to_bytes().to_vec();
         Ok(WireEntry {
             entry: InboxEntry {
@@ -709,7 +755,8 @@ impl InboxEntry {
     /// every entry in a state that passed [`InboxStateV1::verify`] is.
     pub fn body(&self) -> Result<InboxEntryBody, String> {
         if self.delegation.is_some() {
-            return InboxEntryBody::from_watch_key_signing_payload(&self.scoped_payload);
+            return InboxEntryBody::from_watch_key_signing_payload(&self.scoped_payload)
+                .map(|(_, body)| body);
         }
         let scoped: ScopedPayload = from_cbor(&self.scoped_payload)?;
         InboxEntryBody::from_signing_payload(&scoped.payload)
@@ -857,7 +904,12 @@ pub(crate) fn verify_entry_signature(
             watch
                 .verify_strict(&entry.scoped_payload, &Signature::from_bytes(&sig))
                 .map_err(|_| "the watch key did not sign this entry")?;
-            InboxEntryBody::from_watch_key_signing_payload(&entry.scoped_payload)?
+            let (digest, body) =
+                InboxEntryBody::from_watch_key_signing_payload(&entry.scoped_payload)?;
+            if digest != delegation.digest() {
+                return Err("the watch key signed this entry under another delegation".into());
+            }
+            body
         }
         None => {
             claimed

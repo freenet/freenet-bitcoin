@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     canonical_certificate, cert_key, certifies, names_claimed_key, verify_certificate,
     verify_entry_signature, BatchKey, ByteBuf, CertKey, EntryKey, GhostkeyId, InboxEntry,
-    InboxEntryBody, InboxParameters, RemovalBatch, RemovedPrefix, SignedFloor, MAX_ENTRIES,
-    MAX_ENTRIES_PER_GHOSTKEY, MAX_REMOVAL_BATCHES, MAX_REMOVED, WINDOW_BLOCKS,
+    InboxEntryBody, InboxParameters, RemovalBatch, RemovedPrefix, SignedFloor,
+    MAX_DELEGATED_ENTRIES_PER_GHOSTKEY, MAX_ENTRIES, MAX_ENTRIES_PER_GHOSTKEY, MAX_REMOVAL_BATCHES,
+    MAX_REMOVED, WINDOW_BLOCKS,
 };
 use freenet_bitcoin_common::from_cbor;
 
@@ -301,6 +302,7 @@ impl InboxStateV1 {
 
         let mut referenced: BTreeSet<CertKey> = BTreeSet::new();
         let mut per: BTreeMap<GhostkeyId, usize> = BTreeMap::new();
+        let mut delegated: BTreeMap<GhostkeyId, usize> = BTreeMap::new();
         for (k, e) in &self.entries {
             if e.key() != *k {
                 return Err("entry filed under a key that is not its digest".into());
@@ -324,6 +326,16 @@ impl InboxStateV1 {
                 return Err(format!(
                     "a Ghost Key holds more than {MAX_ENTRIES_PER_GHOSTKEY} entries"
                 ));
+            }
+            if e.delegation.is_some() {
+                let d = delegated.entry(e.ghostkey).or_insert(0);
+                *d += 1;
+                if *d > MAX_DELEGATED_ENTRIES_PER_GHOSTKEY {
+                    return Err(format!(
+                        "a Ghost Key's watch keys hold more than \
+                         {MAX_DELEGATED_ENTRIES_PER_GHOSTKEY} entries"
+                    ));
+                }
             }
         }
         if referenced.len() != self.certificates.len() {
@@ -406,11 +418,23 @@ impl InboxStateV1 {
             .collect();
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         let mut per: BTreeMap<GhostkeyId, usize> = BTreeMap::new();
+        let mut delegated: BTreeMap<GhostkeyId, usize> = BTreeMap::new();
         let mut kept: BTreeSet<EntryKey> = BTreeSet::new();
         for (_, k, g) in &ranked {
             let c = per.entry(*g).or_insert(0);
             if *c >= MAX_ENTRIES_PER_GHOSTKEY || kept.len() >= MAX_ENTRIES {
                 continue;
+            }
+            // A watch key's entries take at most their own share of the
+            // Ghost Key's places, however they rank, so the Ghost Key's own
+            // entry always has one. Whether an entry is delegated is a fact
+            // about the entry alone, so this is as order-free as the rest.
+            if self.entries[k].delegation.is_some() {
+                let d = delegated.entry(*g).or_insert(0);
+                if *d >= MAX_DELEGATED_ENTRIES_PER_GHOSTKEY {
+                    continue;
+                }
+                *d += 1;
             }
             *c += 1;
             kept.insert(*k);

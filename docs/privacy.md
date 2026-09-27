@@ -155,7 +155,10 @@ Ghost Key, and never learns that Freenet was involved.
 2. **Inbox metadata.** Anyone reading a bridge's inbox sees which Ghost Keys
    send it requests, when, and how large each sealed request is. Requests are
    not padded, so size hints at how many scripts one names, and whether a
-   Watch names a height to be held through (about 24 bytes more).
+   Watch names a height to be held through (about 24 bytes more). A request a
+   watch key signed also shows, in the clear, the delegation it was made
+   under: that the Ghost Key delegated to that key, the delegation's serial
+   (the time it was made) and any expiry.
 3. **Freenet traffic analysis.** Subscribing to `BitcoinAddressContract(X)`
    signals interest in X to an observer well-placed on the network. Inherent to
    the platform.

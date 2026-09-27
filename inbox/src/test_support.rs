@@ -109,11 +109,22 @@ impl TestGhostkey {
     /// This Ghost Key's delegation of `bridge` watch requests to `watch_key`,
     /// signed as the vault signs it.
     pub fn delegation(&self, bridge: BridgeId, watch_key: &SigningKey, serial: u64) -> Delegation {
+        self.delegation_expiring(bridge, watch_key, serial, None)
+    }
+
+    /// [`Self::delegation`], expiring after `expires_mainnet_height`.
+    pub fn delegation_expiring(
+        &self,
+        bridge: BridgeId,
+        watch_key: &SigningKey,
+        serial: u64,
+        expires_mainnet_height: Option<u32>,
+    ) -> Delegation {
         let body = DelegationBody {
             bridge,
             watch_key: WatchKeyId(watch_key.verifying_key().to_bytes()),
             serial,
-            expires_mainnet_height: None,
+            expires_mainnet_height,
         };
         let scoped = to_cbor(&ScopedPayload {
             requestor: SignatureRequestor::WebApp(ContractInstanceId::new([7u8; 32])),

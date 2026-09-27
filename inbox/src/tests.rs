@@ -460,6 +460,85 @@ fn a_watch_keys_entries_count_against_its_ghost_keys_cap() {
     s.verify(&params()).unwrap();
 }
 
+/// A watch key takes at most one of its Ghost Key's places, however it
+/// ranks, so the Ghost Key's own newest entry, a revocation say, is always
+/// kept; and a state holding more is refused.
+#[test]
+fn a_watch_key_cannot_crowd_its_ghost_key_out_of_the_inbox() {
+    let gk = &ghostkeys()[0];
+    let d = delegate(gk, &delegation_body(1));
+    let top = 100 + WINDOW_BLOCKS;
+    let theirs = [
+        delegated_entry(gk, d.clone(), &watch_sk(), top, 1),
+        delegated_entry(gk, d.clone(), &watch_sk(), top, 2),
+    ];
+    let own = entry(gk, 102, 3);
+    let s = one_by_one(100, &[theirs[0].clone(), theirs[1].clone(), own.clone()]);
+    assert_eq!(s.entries.len(), 2);
+    assert!(
+        s.entries.contains_key(&own.entry.key()),
+        "the Ghost Key's own is kept"
+    );
+    s.verify(&params()).unwrap();
+
+    let mut forged = s.clone();
+    forged.entries.remove(&own.entry.key());
+    for w in &theirs {
+        forged.entries.insert(w.entry.key(), w.entry.clone());
+    }
+    assert!(
+        forged.verify(&params()).is_err(),
+        "two from one Ghost Key's watch keys"
+    );
+}
+
+/// A watch key's signature holds only under the delegation it was made
+/// under: re-wrapped in another delegation to the same key, the entry is
+/// refused, so nobody can copy it into new entries that take its Ghost Key's
+/// places.
+#[test]
+fn a_watch_keys_entry_cannot_be_rewrapped_in_another_delegation() {
+    let gk = &ghostkeys()[0];
+    let w = delegated_entry(gk, delegate(gk, &delegation_body(1)), &watch_sk(), 102, 1);
+    let mut copied = w.clone();
+    copied.entry.delegation = Some(delegate(gk, &delegation_body(2)));
+    let err = admit(copied).unwrap_err();
+    assert!(err.contains("another delegation"), "{err}");
+}
+
+/// A state holding entries of both kinds, from several Ghost Keys, is read
+/// entry by entry with each attributed to its own Ghost Key.
+#[test]
+fn a_bridge_reads_both_kinds_of_entry_side_by_side() {
+    let gks = ghostkeys();
+    let es = [
+        entry(&gks[0], 102, 1),
+        delegated_entry(
+            &gks[1],
+            delegate(&gks[1], &delegation_body(1)),
+            &watch_sk(),
+            102,
+            2,
+        ),
+        delegated_entry(
+            &gks[0],
+            delegate(&gks[0], &delegation_body(1)),
+            &watch_sk(),
+            103,
+            3,
+        ),
+    ];
+    let s = with_entries(100, &es);
+    s.verify(&params()).unwrap();
+    let read = s.verified_entries(&params());
+    assert_eq!(read.len(), 3);
+    for w in &es {
+        let (_, e) = read.iter().find(|(k, _)| *k == w.entry.key()).unwrap();
+        assert_eq!(e.ghostkey, w.entry.ghostkey);
+        assert_eq!(e.body().unwrap(), w.entry.body().unwrap());
+    }
+}
+
 /// `InboxEntry` exactly as it was before delegations. Copied, not derived.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Debug)]
 struct EntryBeforeDelegations {
@@ -1048,12 +1127,17 @@ fn verify_refuses_an_unused_certificate_before_checking_any() {
 fn pool(gks: &[Gk], per_key: usize) -> (Vec<WireEntry>, Vec<RemovalBatch>) {
     let mut entries = Vec::new();
     for (gi, gk) in gks.iter().enumerate() {
+        let d = delegate(gk, &delegation_body(1));
         for i in 0..per_key {
-            entries.push(entry(
-                gk,
-                100 + ((i * 3 + gi) as u32 % (WINDOW_BLOCKS + 1)),
-                (i + 10 * gi) as u8,
-            ));
+            let height = 100 + ((i * 3 + gi) as u32 % (WINDOW_BLOCKS + 1));
+            let tag = (i + 10 * gi) as u8;
+            // Every third entry a watch key signed, so the merge laws and the
+            // caps, including the watch keys' own, are held to them too.
+            entries.push(if (i + gi) % 3 == 2 {
+                delegated_entry(gk, d.clone(), &watch_sk(), height, tag)
+            } else {
+                entry(gk, height, tag)
+            });
         }
     }
     let mut batches = Vec::new();
@@ -1331,7 +1415,14 @@ fn above_both_caps_summary_and_delta_exchange_settles_on_one_full_inbox() {
 #[test]
 fn two_peers_converge_through_summaries_and_deltas() {
     let gks = ghostkeys();
-    let a = with_entries(100, &[entry(&gks[0], 103, 1), entry(&gks[1], 104, 2)]);
+    let delegated = delegated_entry(
+        &gks[1],
+        delegate(&gks[1], &delegation_body(1)),
+        &watch_sk(),
+        104,
+        2,
+    );
+    let a = with_entries(100, &[entry(&gks[0], 103, 1), delegated.clone()]);
     let b = with_entries(102, &[entry(&gks[2], 105, 3), entry(&gks[0], 103, 1)]);
     assert_eq!(
         (a.entries.len(), b.entries.len()),
@@ -1348,6 +1439,12 @@ fn two_peers_converge_through_summaries_and_deltas() {
     }
     assert_eq!(bytes(&a2), bytes(&b2));
     assert_eq!(bytes(&a2), bytes(&merged(&a, &b)));
+    assert_eq!(
+        b2.entries.get(&delegated.entry.key()),
+        Some(&delegated.entry),
+        "the delegated entry reached b whole"
+    );
+    b2.verify(&params()).unwrap();
 }
 
 /// A sender records a floor broadcast as delivered when it queues it, so it
@@ -1963,7 +2060,7 @@ mod sealing {
             scan_from_height: Some(900_000),
             made_at_ms: 1_757_000_000_000,
             watch_until_height: None,
-            revoke_watch_keys_below: None,
+            revoke_watch_keys_through: None,
         }
     }
 
@@ -2101,7 +2198,7 @@ mod sealing {
 
         // And the revocation floor, only when set. It says only how far to
         // revoke this sender's own watch keys.
-        r.revoke_watch_keys_below = Some(9);
+        r.revoke_watch_keys_through = Some(9);
         let bytes = freenet_bitcoin_common::to_cbor(&r).unwrap();
         let value: ciborium::Value = ciborium::de::from_reader(bytes.as_slice()).unwrap();
         let n = value.as_map().expect("a request encodes as a map").len();
@@ -2168,9 +2265,9 @@ mod sealing {
     /// bytes; present, ignored by a bridge from before it, which knows no
     /// delegations to revoke.
     #[test]
-    fn an_old_bridge_ignores_revoke_watch_keys_below() {
+    fn an_old_bridge_ignores_revoke_watch_keys_through() {
         let mut r = request();
-        r.revoke_watch_keys_below = Some(u64::MAX);
+        r.revoke_watch_keys_through = Some(u64::MAX);
         r.watch_until_height = Some(7);
         let sealed = seal(&bridge(), &gk(), 100, &r).unwrap();
         let plaintext = open(&bridge_sk(), &gk(), 100, &sealed).unwrap();
@@ -2180,7 +2277,7 @@ mod sealing {
         assert_eq!(
             unseal(&bridge_sk(), &gk(), 100, &sealed)
                 .unwrap()
-                .revoke_watch_keys_below,
+                .revoke_watch_keys_through,
             Some(u64::MAX)
         );
     }
