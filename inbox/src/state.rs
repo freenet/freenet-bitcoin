@@ -64,6 +64,7 @@ impl WireEntry {
                 cert: cert_key(&certificate_pem),
                 scoped_payload: ByteBuf(scoped_payload),
                 signature: ByteBuf(signature),
+                delegation: None,
             },
             certificate_pem,
         })

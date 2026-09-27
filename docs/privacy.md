@@ -106,6 +106,14 @@ Mitigations, in descending order of effectiveness:
 - **Use a distinct Ghost Key per relying party.** The vault supports this; it
   does not enforce it.
 
+**Delegated watch keys.** A Ghost Key may delegate its watch requests to a
+watch key (see `freenet_bitcoin_inbox::Delegation`). The delegation travels
+in the clear with every entry the watch key signs, because every peer checks
+it, so a reader of the inbox also learns that the Ghost Key delegated to that
+key, the serial it gave the delegation (a time, if the sender uses one), any
+expiry, and which of its requests came from the watch key. The delegation names
+no network and no script: those stay sealed.
+
 The bridge is trusted with this correlation. Nobody else is. It stays in one
 SQLite file and is never replicated.
 

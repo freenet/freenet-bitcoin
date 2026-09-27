@@ -316,6 +316,17 @@ contract id as `serving the request inbox`.
   each script (`script_interests`), and a script stops being scanned only when
   the last requester withdraws. A watch registered before the inbox existed has
   no requester on record, so no unwatch ends it.
+- **A request may come from a delegated watch key** (`Delegation` in the
+  inbox crate): a key a Ghost Key signed a delegation to, so an application's
+  background process can ask for watches with no Ghost Key at hand. The
+  contract checks the Ghost Key's certificate, its signature on the delegation,
+  that the delegation names this bridge and has not expired by the entry's
+  date, and the watch key's signature on the entry. The bridge then acts on the
+  request as the Ghost Key's own: the same interests, per-Ghost Key limits and
+  `made_at_ms` ordering. It refuses one under a delegation whose serial is below
+  the floor the Ghost Key raised (`revoke_watch_keys_below` on one of the Ghost
+  Key's own requests) or below the newest delegation of that Ghost Key it has
+  seen used (`watch_delegations`, in the database).
 - **A Watch may name a height to be held through** (`watch_until_height`,
   #26), so a client that goes away stays watched: the bridge keeps such a
   watch past its day until the block `deep_confirmations - 1` below its scan

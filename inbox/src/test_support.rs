@@ -14,7 +14,10 @@ use ghostkey_lib::notary_certificate::NotaryCertificateV1;
 use ghostkey_lib::util::create_keypair;
 use rand::rngs::OsRng;
 
-use crate::{GhostkeyId, InboxEntryBody, InboxParameters, MasterKey, Sealed, WireEntry};
+use crate::{
+    Delegation, DelegationBody, GhostkeyId, InboxEntryBody, InboxParameters, MasterKey, Sealed,
+    WatchKeyId, WireEntry,
+};
 
 /// A master key and notary, standing in for Freenet's Ghost Key authority.
 pub struct TestAuthority {
@@ -101,5 +104,44 @@ impl TestGhostkey {
         let sealed = crate::seal::seal(&bridge, &self.id(), mainnet_height, request)
             .expect("a well-formed request seals");
         self.entry(bridge, mainnet_height, sealed)
+    }
+
+    /// This Ghost Key's delegation of `bridge` watch requests to `watch_key`,
+    /// signed as the vault signs it.
+    pub fn delegation(&self, bridge: BridgeId, watch_key: &SigningKey, serial: u64) -> Delegation {
+        let body = DelegationBody {
+            bridge,
+            watch_key: WatchKeyId(watch_key.verifying_key().to_bytes()),
+            serial,
+            expires_mainnet_height: None,
+        };
+        let scoped = to_cbor(&ScopedPayload {
+            requestor: SignatureRequestor::WebApp(ContractInstanceId::new([7u8; 32])),
+            payload: body.signing_payload().expect("body encodes"),
+        })
+        .expect("scoped payload encodes");
+        let sig = self.sk.sign(&scoped).to_bytes().to_vec();
+        Delegation::from_sign_result(scoped, sig)
+    }
+
+    /// An entry carrying `request` as this Ghost Key's own, but signed by
+    /// `watch_key` under `delegation`: what a background sender sends.
+    pub fn delegated_request(
+        &self,
+        bridge: BridgeId,
+        mainnet_height: u32,
+        request: &crate::InboxRequest,
+        delegation: &Delegation,
+        watch_key: &SigningKey,
+    ) -> WireEntry {
+        let sealed = crate::seal::seal(&bridge, &self.id(), mainnet_height, request)
+            .expect("a well-formed request seals");
+        let body = InboxEntryBody {
+            bridge,
+            mainnet_height,
+            sealed,
+        };
+        WireEntry::delegated(self.pem.clone(), delegation.clone(), watch_key, &body)
+            .expect("a delegated entry builds")
     }
 }

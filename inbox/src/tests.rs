@@ -266,6 +266,263 @@ fn tampering_with_any_field_is_refused() {
     );
 }
 
+// --- delegated watch keys -------------------------------------------------------
+
+fn watch_sk() -> SigningKey {
+    SigningKey::from_bytes(&[77u8; 32])
+}
+
+fn delegation_body(serial: u64) -> DelegationBody {
+    DelegationBody {
+        bridge: bridge(),
+        watch_key: WatchKeyId(watch_sk().verifying_key().to_bytes()),
+        serial,
+        expires_mainnet_height: None,
+    }
+}
+
+/// `body`, signed by `gk` as the vault signs it: a scoped payload.
+fn delegate(gk: &Gk, body: &DelegationBody) -> Delegation {
+    let scoped = to_cbor(&ScopedPayload {
+        requestor: webapp(),
+        payload: body.signing_payload().unwrap(),
+    })
+    .unwrap();
+    let sig = gk.sk.sign(&scoped).to_bytes().to_vec();
+    Delegation::from_sign_result(scoped, sig)
+}
+
+fn delegated_entry(gk: &Gk, d: Delegation, key: &SigningKey, height: u32, tag: u8) -> WireEntry {
+    let body = InboxEntryBody {
+        bridge: bridge(),
+        mainnet_height: height,
+        sealed: sealed(tag),
+    };
+    WireEntry::delegated(gk.pem.clone(), d, key, &body).unwrap()
+}
+
+fn admit(w: WireEntry) -> Result<InboxStateV1, String> {
+    let mut s = open_at(100);
+    s.apply_delta(
+        &params(),
+        &InboxDelta {
+            entries: vec![w],
+            ..Default::default()
+        },
+    )?;
+    Ok(s)
+}
+
+#[test]
+fn an_entry_a_delegated_watch_key_signed_is_admitted_as_its_ghost_keys() {
+    let gk = &ghostkeys()[0];
+    let w = delegated_entry(gk, delegate(gk, &delegation_body(1)), &watch_sk(), 102, 1);
+    let s = admit(w.clone()).unwrap();
+    s.verify(&params()).unwrap();
+    let e = s.entries.values().next().unwrap();
+    assert_eq!(e.ghostkey, GhostkeyId(gk.sk.verifying_key().to_bytes()));
+    assert_eq!(e.body().unwrap().sealed, sealed(1));
+    assert_eq!(
+        e.delegation.as_ref().unwrap().body().unwrap(),
+        delegation_body(1)
+    );
+    assert_eq!(s.verified_entries(&params()).len(), 1, "a bridge reads it");
+}
+
+/// Everything a delegated entry rests on is checked, each on its own.
+#[test]
+fn a_delegated_entry_is_refused_unless_every_link_holds() {
+    let (gk, other) = (&ghostkeys()[0], &ghostkeys()[1]);
+    let at = |body: DelegationBody, key: &SigningKey, height: u32| {
+        admit(delegated_entry(gk, delegate(gk, &body), key, height, 1))
+    };
+    assert!(at(delegation_body(1), &watch_sk(), 102).is_ok());
+
+    assert!(
+        at(delegation_body(1), &SigningKey::from_bytes(&[5u8; 32]), 102).is_err(),
+        "signed by a key the delegation does not name"
+    );
+    assert!(
+        admit(delegated_entry(
+            gk,
+            delegate(other, &delegation_body(1)),
+            &watch_sk(),
+            102,
+            1
+        ))
+        .is_err(),
+        "delegated by another Ghost Key than the entry's"
+    );
+    assert!(
+        at(
+            DelegationBody {
+                bridge: BridgeId([3u8; 32]),
+                ..delegation_body(1)
+            },
+            &watch_sk(),
+            102
+        )
+        .is_err(),
+        "a delegation for another bridge"
+    );
+    let expiring = |last| DelegationBody {
+        expires_mainnet_height: Some(last),
+        ..delegation_body(1)
+    };
+    assert!(
+        at(expiring(102), &watch_sk(), 102).is_ok(),
+        "dated at its last height"
+    );
+    assert!(
+        at(expiring(101), &watch_sk(), 102).is_err(),
+        "dated after it expired"
+    );
+
+    // The all-zero point is weak: anyone can sign for it.
+    let weak = DelegationBody {
+        watch_key: WatchKeyId([0u8; 32]),
+        ..delegation_body(1)
+    };
+    // Refused for being weak, by name: strict verification would refuse the
+    // watch key's signature anyway, so only the reason tells the checks apart.
+    let err = at(weak, &watch_sk(), 102).unwrap_err();
+    assert!(err.contains("weak"), "a weak watch key: {err}");
+
+    let mut w = delegated_entry(gk, delegate(gk, &delegation_body(1)), &watch_sk(), 102, 1);
+    let d = w.entry.delegation.as_mut().unwrap();
+    d.signature.0[0] ^= 1;
+    assert!(admit(w).is_err(), "the delegation's signature must verify");
+
+    let mut w = delegated_entry(gk, delegate(gk, &delegation_body(1)), &watch_sk(), 102, 1);
+    w.entry.mainnet_height += 1;
+    assert!(admit(w).is_err(), "copied height must match the signed one");
+
+    let mut w = delegated_entry(gk, delegate(gk, &delegation_body(1)), &watch_sk(), 102, 1);
+    let d = w.entry.delegation.as_mut().unwrap();
+    d.scoped_payload.0.resize(MAX_DELEGATION_BYTES + 1, 0);
+    // Refused for its size, before any signature is checked.
+    let err = admit(w).unwrap_err();
+    assert!(err.contains("limit"), "an oversized delegation: {err}");
+}
+
+/// The watch key's signature and the Ghost Key's live in different domains,
+/// so neither passes for the other: a Ghost Key's entry with a delegation
+/// attached, or a delegated entry with its delegation taken off, is refused.
+/// The second is also what an inbox contract from before delegations sees of
+/// a delegated entry, since it ignores the field: such a contract refuses it.
+#[test]
+fn a_watch_keys_signature_and_a_ghost_keys_never_pass_for_each_other() {
+    let gk = &ghostkeys()[0];
+    let mut w = entry(gk, 102, 1);
+    w.entry.delegation = Some(delegate(gk, &delegation_body(1)));
+    assert!(
+        admit(w).is_err(),
+        "a Ghost Key's entry with a delegation attached"
+    );
+
+    let mut w = delegated_entry(gk, delegate(gk, &delegation_body(1)), &watch_sk(), 102, 1);
+    w.entry.delegation = None;
+    assert!(
+        admit(w).is_err(),
+        "a delegated entry without its delegation"
+    );
+
+    // A delegation signed as an entry body, or an entry body as a delegation,
+    // does not decode across the domains.
+    let body = InboxEntryBody {
+        bridge: bridge(),
+        mainnet_height: 102,
+        sealed: sealed(1),
+    };
+    assert!(DelegationBody::from_signing_payload(&body.signing_payload().unwrap()).is_err());
+    assert!(
+        InboxEntryBody::from_signing_payload(&delegation_body(1).signing_payload().unwrap())
+            .is_err()
+    );
+    assert!(
+        InboxEntryBody::from_watch_key_signing_payload(&body.signing_payload().unwrap()).is_err()
+    );
+}
+
+/// A watch key's entries share its Ghost Key's place in the inbox: no second
+/// allowance.
+#[test]
+fn a_watch_keys_entries_count_against_its_ghost_keys_cap() {
+    let gk = &ghostkeys()[0];
+    let d = delegate(gk, &delegation_body(1));
+    let es = vec![
+        entry(gk, 101, 1),
+        entry(gk, 101, 2),
+        delegated_entry(gk, d, &watch_sk(), 101, 3),
+    ];
+    let s = one_by_one(100, &es);
+    assert_eq!(s.entries.len(), MAX_ENTRIES_PER_GHOSTKEY);
+    s.verify(&params()).unwrap();
+}
+
+/// `InboxEntry` exactly as it was before delegations. Copied, not derived.
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Debug)]
+struct EntryBeforeDelegations {
+    mainnet_height: u32,
+    ghostkey: GhostkeyId,
+    cert: CertKey,
+    scoped_payload: ByteBuf,
+    signature: ByteBuf,
+}
+
+/// An entry without a delegation is the same bytes as before delegations
+/// existed, so its key, and every state holding only such entries, is too:
+/// a sender built before this change sends entries the new contract takes.
+#[test]
+fn an_entry_without_a_delegation_is_the_same_bytes_as_before() {
+    let e = entry(&ghostkeys()[0], 102, 1).entry;
+    let old = EntryBeforeDelegations {
+        mainnet_height: e.mainnet_height,
+        ghostkey: e.ghostkey,
+        cert: e.cert,
+        scoped_payload: e.scoped_payload.clone(),
+        signature: e.signature.clone(),
+    };
+    assert_eq!(to_cbor(&e).unwrap(), to_cbor(&old).unwrap());
+    let back: InboxEntry = freenet_bitcoin_common::from_cbor(&to_cbor(&old).unwrap()).unwrap();
+    assert_eq!(back, e);
+    assert!(admit(entry(&ghostkeys()[0], 102, 1)).is_ok());
+}
+
+/// A contract from before delegations decodes a delegated entry without
+/// the delegation, and then finds the Ghost Key did not sign it.
+#[test]
+fn a_contract_from_before_delegations_refuses_a_delegated_entry() {
+    let gk = &ghostkeys()[0];
+    let w = delegated_entry(gk, delegate(gk, &delegation_body(1)), &watch_sk(), 102, 1);
+    let old: EntryBeforeDelegations =
+        freenet_bitcoin_common::from_cbor(&to_cbor(&w.entry).unwrap()).unwrap();
+    let as_old_sees_it: InboxEntry =
+        freenet_bitcoin_common::from_cbor(&to_cbor(&old).unwrap()).unwrap();
+    assert!(as_old_sees_it.delegation.is_none());
+    assert!(verify_entry_signature(&as_old_sees_it, &params()).is_err());
+}
+
+/// A delegation as the vault would return it, with a realistic scoped
+/// payload, fits well inside the bound.
+#[test]
+fn a_real_sized_delegation_fits() {
+    let gk = &ghostkeys()[0];
+    let d = delegate(
+        gk,
+        &DelegationBody {
+            expires_mainnet_height: Some(u32::MAX),
+            serial: u64::MAX,
+            ..delegation_body(1)
+        },
+    );
+    assert!(
+        d.scoped_payload.len() <= MAX_DELEGATION_BYTES / 2,
+        "{} bytes",
+        d.scoped_payload.len()
+    );
+}
+
 #[test]
 fn an_entry_for_another_bridge_is_refused() {
     let gk = &ghostkeys()[0];
@@ -1706,6 +1963,7 @@ mod sealing {
             scan_from_height: Some(900_000),
             made_at_ms: 1_757_000_000_000,
             watch_until_height: None,
+            revoke_watch_keys_below: None,
         }
     }
 
@@ -1840,6 +2098,14 @@ mod sealing {
                 "watch_until_height"
             ]
         );
+
+        // And the revocation floor, only when set. It says only how far to
+        // revoke this sender's own watch keys.
+        r.revoke_watch_keys_below = Some(9);
+        let bytes = freenet_bitcoin_common::to_cbor(&r).unwrap();
+        let value: ciborium::Value = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let n = value.as_map().expect("a request encodes as a map").len();
+        assert_eq!(n, 7);
     }
 
     /// `InboxRequest` exactly as it was before `watch_until_height`
@@ -1896,6 +2162,27 @@ mod sealing {
         let new: InboxRequest = freenet_bitcoin_common::from_cbor(&to_cbor(&old).unwrap()).unwrap();
         assert_eq!(new, request());
         assert_eq!(new.watch_until_height, None);
+    }
+
+    /// The revocation floor is the same kind of addition: absent, the same
+    /// bytes; present, ignored by a bridge from before it, which knows no
+    /// delegations to revoke.
+    #[test]
+    fn an_old_bridge_ignores_revoke_watch_keys_below() {
+        let mut r = request();
+        r.revoke_watch_keys_below = Some(u64::MAX);
+        r.watch_until_height = Some(7);
+        let sealed = seal(&bridge(), &gk(), 100, &r).unwrap();
+        let plaintext = open(&bridge_sk(), &gk(), 100, &sealed).unwrap();
+        let old: RequestBeforeHorizon =
+            freenet_bitcoin_common::from_cbor(&plaintext).expect("an old bridge reads it");
+        assert_eq!(old, before_horizon(&r));
+        assert_eq!(
+            unseal(&bridge_sk(), &gk(), 100, &sealed)
+                .unwrap()
+                .revoke_watch_keys_below,
+            Some(u64::MAX)
+        );
     }
 
     #[test]

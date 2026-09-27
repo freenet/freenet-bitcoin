@@ -80,6 +80,25 @@ pub enum InterestChange {
     Unchanged,
 }
 
+/// What [`Store::admit_delegation`] decided.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DelegationCheck {
+    /// Act on the request.
+    Admitted,
+    /// Below the floor the Ghost Key raised.
+    Revoked,
+    /// A newer delegation of this Ghost Key has been used.
+    Superseded,
+    /// Another watch key under the same serial was used first.
+    Conflicting,
+}
+
+fn serial_from(bytes: &[u8]) -> anyhow::Result<u64> {
+    Ok(u64::from_be_bytes(bytes.try_into().map_err(|_| {
+        anyhow::anyhow!("a delegation serial is not 8 bytes")
+    })?))
+}
+
 /// A script the bridge is currently synchronizing.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WatchedScript {
@@ -433,6 +452,17 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS inbox_handled_by_ghostkey
                 ON inbox_handled (ghostkey);
+
+            -- Per Ghost Key, the watch keys it has delegated to: the lowest
+            -- delegation serial still honoured (raised by the Ghost Key's own
+            -- requests, never lowered), and the newest delegation seen used.
+            -- Serials are u64, kept as 8 big-endian bytes and compared here.
+            CREATE TABLE IF NOT EXISTS watch_delegations (
+                ghostkey       BLOB PRIMARY KEY,
+                floor          BLOB NOT NULL,
+                newest_serial  BLOB,
+                newest_key     BLOB
+            );
 
             -- Left behind by the HTTP request service this bridge used to run.
             DROP TABLE IF EXISTS challenges;
@@ -1224,6 +1254,89 @@ impl Store {
                 last: self.watchers(i.network, i.script)? == 0,
             },
         })
+    }
+
+    /// Whether a request signed by `watch_key` under a delegation of
+    /// `ghostkey` numbered `serial` may be acted on, recording the delegation
+    /// as the newest seen when it is. Refused below the Ghost Key's floor,
+    /// below the newest delegation seen used, or at the same serial for
+    /// another key. Call inside [`Store::with_transaction`].
+    pub fn admit_delegation(
+        &self,
+        ghostkey: &[u8],
+        serial: u64,
+        watch_key: &[u8],
+    ) -> anyhow::Result<DelegationCheck> {
+        type Row = (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
+        let row: Option<Row> = self
+            .conn
+            .query_row(
+                "SELECT floor, newest_serial, newest_key FROM watch_delegations
+                 WHERE ghostkey = ?1",
+                params![ghostkey],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let (floor, newest) = match &row {
+            None => (0, None),
+            Some((f, s, k)) => (
+                serial_from(f)?,
+                match (s, k) {
+                    (Some(s), Some(k)) => Some((serial_from(s)?, k.clone())),
+                    _ => None,
+                },
+            ),
+        };
+        if serial < floor {
+            return Ok(DelegationCheck::Revoked);
+        }
+        if let Some((n, k)) = &newest {
+            if serial < *n {
+                return Ok(DelegationCheck::Superseded);
+            }
+            if serial == *n {
+                return Ok(if k.as_slice() == watch_key {
+                    DelegationCheck::Admitted
+                } else {
+                    DelegationCheck::Conflicting
+                });
+            }
+        }
+        self.conn.execute(
+            "INSERT INTO watch_delegations (ghostkey, floor, newest_serial, newest_key)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(ghostkey) DO UPDATE SET newest_serial = ?3, newest_key = ?4",
+            params![
+                ghostkey,
+                floor.to_be_bytes().to_vec(),
+                serial.to_be_bytes().to_vec(),
+                watch_key
+            ],
+        )?;
+        Ok(DelegationCheck::Admitted)
+    }
+
+    /// Refuse every delegation of `ghostkey` numbered below `floor` from now
+    /// on. Never lowers the floor. Only for a request the Ghost Key itself
+    /// signed. Call inside [`Store::with_transaction`].
+    pub fn raise_delegation_floor(&self, ghostkey: &[u8], floor: u64) -> anyhow::Result<()> {
+        let held: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT floor FROM watch_delegations WHERE ghostkey = ?1",
+                params![ghostkey],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if held.as_deref().map(serial_from).transpose()?.unwrap_or(0) >= floor {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO watch_delegations (ghostkey, floor) VALUES (?1, ?2)
+             ON CONFLICT(ghostkey) DO UPDATE SET floor = ?2",
+            params![ghostkey, floor.to_be_bytes().to_vec()],
+        )?;
+        Ok(())
     }
 
     /// How many requesters currently want `script`.
