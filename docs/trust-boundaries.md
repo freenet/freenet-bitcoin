@@ -181,10 +181,11 @@ Keys. They receive an address and an amount and pay it with any wallet.
 | Pass a signature the Ghost Key gave for something else off as a delegation, or the reverse | Delegations, the Ghost Key's own entries and a watch key's entries are signed in three separate domains, and none decodes as another |
 | Re-wrap a watch key's entry in another delegation to the same key, to take its Ghost Key's places | The watch key's signature covers a digest of the delegation it was made under |
 | A stolen watch key keeps its owner's revocation out of the inbox | A watch key takes at most 1 of its Ghost Key's 2 places, and at most all but `OWNER_RESERVE` of its share of the bridge's reading, so the Ghost Key's own request is always admitted and read |
+| A revoked watch key keeps its replacement out of the inbox | Of a Ghost Key's watch keys' entries, only the one under the delegation with the highest serial keeps the place, however the others are dated |
 | A stolen watch key keeps working after revocation | The bridge refuses any delegation at or below the serial the Ghost Key revoked through, and one dated more than a week past its clock, so none is numbered past every revocation; an expiry, if set, is checked by the contract against the entry's date and by the bridge against the mainnet tip |
-| A stolen watch key's watches outlive its revocation | Revoking withdraws every watch a request under a revoked delegation recorded, held heights included, freeing the Ghost Key's places |
+| A stolen watch key's watches outlive its revocation | Revoking withdraws every watch a request under a revoked delegation recorded, with the heights it held them through, freeing the Ghost Key's places, and dates everything that key recorded no later than the revocation, so the Ghost Key's next requests are newer. A height the key raised on a watch the Ghost Key recorded itself stays until the Ghost Key unwatches it |
 | A stolen watch key dates requests far ahead so its owner's later ones look older | A watch key's request counts as made at most an hour past the bridge's clock |
-| A stolen watch key unwatches its owner's payment addresses | **Not stopped until revocation.** A watch key acts as its Ghost Key for Watch and Unwatch; the owner revokes it and watches again |
+| A stolen watch key unwatches its owner's payment addresses | **Not stopped until revocation.** A watch key acts as its Ghost Key for Watch and Unwatch; the owner revokes it and sends Watch again for everything it still wants, since revoking also withdraws the watches the key renewed |
 
 **Not in the table, because nothing stops it:** a trusted bridge asserting
 chain state that is not Bitcoin's. No check anchors a header to the real chain,

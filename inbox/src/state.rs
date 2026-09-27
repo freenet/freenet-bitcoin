@@ -417,24 +417,38 @@ impl InboxStateV1 {
             .map(|(k, e)| (e.mainnet_height, *k, e.ghostkey))
             .collect();
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        // Of each Ghost Key's entries a watch key signed, only the one under
+        // the newest delegation (highest serial, then newest, then lowest
+        // key) may stay. A revoked key's entries can then never keep the
+        // place from the key that replaced it, however they are dated. It
+        // takes at most MAX_DELEGATED_ENTRIES_PER_GHOSTKEY (one) of the Ghost
+        // Key's places, however it ranks, so the Ghost Key's own entry always
+        // has one. Both are facts about the entries alone, so this is as
+        // order-free as the rest.
+        debug_assert_eq!(MAX_DELEGATED_ENTRIES_PER_GHOSTKEY, 1);
+        let mut best_delegated: BTreeMap<GhostkeyId, (u64, u32, std::cmp::Reverse<EntryKey>)> =
+            BTreeMap::new();
+        for (k, e) in &self.entries {
+            if let Some(d) = &e.delegation {
+                let serial = d.body().map(|b| b.serial).unwrap_or(0);
+                let rank = (serial, e.mainnet_height, std::cmp::Reverse(*k));
+                let best = best_delegated.entry(e.ghostkey).or_insert(rank);
+                if rank > *best {
+                    *best = rank;
+                }
+            }
+        }
         let mut per: BTreeMap<GhostkeyId, usize> = BTreeMap::new();
-        let mut delegated: BTreeMap<GhostkeyId, usize> = BTreeMap::new();
         let mut kept: BTreeSet<EntryKey> = BTreeSet::new();
         for (_, k, g) in &ranked {
             let c = per.entry(*g).or_insert(0);
             if *c >= MAX_ENTRIES_PER_GHOSTKEY || kept.len() >= MAX_ENTRIES {
                 continue;
             }
-            // A watch key's entries take at most their own share of the
-            // Ghost Key's places, however they rank, so the Ghost Key's own
-            // entry always has one. Whether an entry is delegated is a fact
-            // about the entry alone, so this is as order-free as the rest.
-            if self.entries[k].delegation.is_some() {
-                let d = delegated.entry(*g).or_insert(0);
-                if *d >= MAX_DELEGATED_ENTRIES_PER_GHOSTKEY {
-                    continue;
-                }
-                *d += 1;
+            if self.entries[k].delegation.is_some()
+                && best_delegated.get(g).map(|b| b.2 .0) != Some(*k)
+            {
+                continue;
             }
             *c += 1;
             kept.insert(*k);

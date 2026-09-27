@@ -431,7 +431,11 @@ pub struct InboxRequest {
     /// From the Ghost Key itself: revoke every [`Delegation`] of this Ghost
     /// Key whose `serial` is at or below this. The bridge refuses them from
     /// then on and withdraws every watch a request under one of them
-    /// recorded. It raises a mark the bridge keeps per Ghost Key, which never
+    /// recorded, renewals of the Ghost Key's own watches included, so send
+    /// Watch again for everything still wanted. Revoke through the newest
+    /// serial issued before the delegation that is to stay, not through
+    /// "now" (a clock can run ahead), and never through a value past every
+    /// serial you will use: nothing lowers a revocation. It raises a mark the bridge keeps per Ghost Key, which never
     /// falls, and is applied whatever the request's `made_at_ms`, as a mark
     /// that only rises need not be ordered. Ignored on a request a watch key
     /// signed, so a stolen watch key cannot lock its owner's newer one out.

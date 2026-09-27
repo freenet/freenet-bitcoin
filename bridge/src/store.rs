@@ -83,6 +83,9 @@ pub enum InterestChange {
     Unchanged,
 }
 
+/// A script on one network.
+pub type NetworkScript = (BitcoinNetwork, Vec<u8>);
+
 /// What [`Store::admit_delegation`] decided.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DelegationCheck {
@@ -1331,17 +1334,25 @@ impl Store {
 
     /// Revoke every delegation of `ghostkey` numbered at or below `through`:
     /// refuse them from now on, and withdraw every watch a request under one
-    /// of them recorded, returning the scripts nobody watches any more. Never
+    /// of them recorded, returning `None` if an earlier revocation already
+    /// covered `through`, else the scripts nobody watches any more. Never
     /// lowers an earlier revocation. Only for a request the Ghost Key itself
-    /// signed. Call inside [`Store::with_transaction`] with the watch
-    /// removals it implies.
+    /// signed, made at `made_at_ms`. Call inside [`Store::with_transaction`]
+    /// with the watch removals it implies.
+    ///
+    /// Every row a revoked key recorded, watching or withdrawn, is dated no
+    /// later than the revoking request, so the Ghost Key's next request about
+    /// the script is newer than anything the revoked key sent, however far
+    /// ahead that key dated its own.
     pub fn revoke_delegations_through(
         &self,
         ghostkey: &[u8],
         through: u64,
+        made_at_ms: u64,
         now_ms: i64,
-    ) -> anyhow::Result<Vec<(BitcoinNetwork, Vec<u8>)>> {
+    ) -> anyhow::Result<Option<Vec<NetworkScript>>> {
         let through = through.min(i64::MAX as u64) as i64;
+        let made_at_ms = made_at_ms.min(i64::MAX as u64) as i64;
         let held: Option<i64> = self
             .conn
             .query_row(
@@ -1352,7 +1363,7 @@ impl Store {
             .optional()?
             .flatten();
         if held.is_some_and(|h| h >= through) {
-            return Ok(vec![]);
+            return Ok(None);
         }
         self.conn.execute(
             "INSERT INTO watch_delegations (ghostkey, revoked_through) VALUES (?1, ?2)
@@ -1376,6 +1387,11 @@ impl Store {
              WHERE ghostkey = ?1 AND watching = 1 AND delegation_serial <= ?2",
             params![ghostkey, through, now_ms],
         )?;
+        self.conn.execute(
+            "UPDATE script_interests SET request_ms = MIN(request_ms, ?3)
+             WHERE ghostkey = ?1 AND delegation_serial <= ?2",
+            params![ghostkey, through, made_at_ms],
+        )?;
         let mut unwatched = Vec::new();
         for (net, script) in rows {
             let Ok(net) = net.parse::<BitcoinNetwork>() else {
@@ -1385,7 +1401,7 @@ impl Store {
                 unwatched.push((net, script));
             }
         }
-        Ok(unwatched)
+        Ok(Some(unwatched))
     }
 
     /// How many requesters currently want `script`.
@@ -2012,9 +2028,9 @@ mod tests {
             DelegationCheck::Admitted
         );
         assert!(
-            s.revoke_delegations_through(&[1u8; 32], 7, 0)
+            s.revoke_delegations_through(&[1u8; 32], 7, 0, 0)
                 .unwrap()
-                .is_empty(),
+                .is_some_and(|u| u.is_empty()),
             "the old row was the Ghost Key's own, so it stays"
         );
         assert_eq!(

@@ -682,17 +682,23 @@ impl Processor<'_> {
         // ignored, so a stolen watch key cannot lock its owner's newer one out.
         if e.delegation.is_none() {
             if let Some(through) = req.revoke_watch_keys_through {
-                let unwatched =
-                    self.store
-                        .revoke_delegations_through(&e.ghostkey.0, through, now_ms)?;
-                for (net, script) in &unwatched {
-                    self.store.remove_watch(*net, script)?;
-                }
-                tracing::info!(
+                // Restating a revocation already in force changes nothing,
+                // and clients are asked to restate theirs on every request.
+                if let Some(unwatched) = self.store.revoke_delegations_through(
+                    &e.ghostkey.0,
                     through,
-                    stopped = unwatched.len(),
-                    "a Ghost Key revoked its watch keys"
-                );
+                    req.made_at_ms,
+                    now_ms,
+                )? {
+                    for (net, script) in &unwatched {
+                        self.store.remove_watch(*net, script)?;
+                    }
+                    tracing::info!(
+                        through,
+                        stopped = unwatched.len(),
+                        "a Ghost Key revoked its watch keys"
+                    );
+                }
             }
         }
 
@@ -2072,6 +2078,75 @@ mod tests {
         assert!(watched(&store).contains(&b"new".to_vec()));
     }
 
+    /// After revoking, the Ghost Key's own request about a script its revoked
+    /// key dated far ahead is still newer: revoking dates what the key
+    /// recorded no later than the revocation. Its Unwatch included.
+    #[test]
+    fn after_revoking_the_ghost_keys_own_requests_are_newer_than_the_keys() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        let d = delegation(gk, 1, 1);
+        let far = u64::MAX;
+        run_at(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![delegated(
+                    gk,
+                    &d,
+                    1,
+                    FLOOR + 1,
+                    &request(Action::Watch, b"a", far),
+                )],
+            ),
+            &tips(),
+            T0,
+        );
+        run_at(
+            &store,
+            &inbox(
+                FLOOR,
+                vec![delegated(
+                    gk,
+                    &d,
+                    1,
+                    FLOOR + 1,
+                    &request(Action::Unwatch, b"b", far),
+                )],
+            ),
+            &tips(),
+            T0,
+        );
+        let revoke = InboxRequest {
+            revoke_watch_keys_through: Some(1),
+            ..request(Action::Watch, b"own", T0 as u64)
+        };
+        run_at(
+            &store,
+            &inbox(FLOOR, vec![entry(gk, FLOOR + 2, &revoke)]),
+            &tips(),
+            T0,
+        );
+        let again = |script: &[u8]| {
+            entry(
+                gk,
+                FLOOR + 2,
+                &request(Action::Watch, script, T0 as u64 + 1),
+            )
+        };
+        run_at(
+            &store,
+            &inbox(FLOOR, vec![again(b"a"), again(b"b")]),
+            &tips(),
+            T0,
+        );
+        assert_eq!(
+            watched(&store),
+            vec![b"a".to_vec(), b"b".to_vec(), b"own".to_vec()],
+            "both watched again at once, not an hour later"
+        );
+    }
+
     /// A script another requester still wants stays scanned when a revoked
     /// key's interest in it is withdrawn.
     #[test]
@@ -2120,7 +2195,6 @@ mod tests {
     /// than a week past the bridge's clock is refused.
     #[test]
     fn a_delegation_dated_far_ahead_is_refused() {
-        let store = Store::open_in_memory().unwrap();
         let gk = &ghostkeys()[0];
         let now = 1_000_000;
         for (serial, acted) in [
@@ -2133,7 +2207,6 @@ mod tests {
             run_at(&store, &inbox(FLOOR, vec![w]), &tips(), now);
             assert_eq!(!watched(&store).is_empty(), acted, "serial {serial}");
         }
-        drop(store);
     }
 
     /// Past its expiry by the mainnet tip, a delegation is refused, even when
@@ -2256,7 +2329,7 @@ mod tests {
         assert!(watched(&store).contains(&b"spk".to_vec()));
     }
 
-    /// The revocation floor only rises: a later, lower one changes nothing.
+    /// A revocation only rises: a later, lower one changes nothing.
     #[test]
     fn a_revocation_floor_never_falls() {
         let store = Store::open_in_memory().unwrap();

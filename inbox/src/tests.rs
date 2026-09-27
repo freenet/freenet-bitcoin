@@ -492,6 +492,35 @@ fn a_watch_key_cannot_crowd_its_ghost_key_out_of_the_inbox() {
     );
 }
 
+/// Of a Ghost Key's watch keys' entries, the one under the newest delegation
+/// keeps the place, however the others are dated: a revoked key cannot keep
+/// its replacement out of the inbox.
+#[test]
+fn the_newest_delegation_keeps_the_watch_keys_place() {
+    let gk = &ghostkeys()[0];
+    let old_key = SigningKey::from_bytes(&[5u8; 32]);
+    let old = delegate(
+        gk,
+        &DelegationBody {
+            watch_key: WatchKeyId(old_key.verifying_key().to_bytes()),
+            ..delegation_body(1)
+        },
+    );
+    let new = delegate(gk, &delegation_body(2));
+    let top = 100 + WINDOW_BLOCKS;
+    let thief = delegated_entry(gk, old, &old_key, top, 1);
+    let honest = delegated_entry(gk, new, &watch_sk(), 102, 2);
+    for order in [
+        [thief.clone(), honest.clone()],
+        [honest.clone(), thief.clone()],
+    ] {
+        let s = one_by_one(100, &order);
+        assert!(s.entries.contains_key(&honest.entry.key()));
+        assert!(!s.entries.contains_key(&thief.entry.key()));
+        s.verify(&params()).unwrap();
+    }
+}
+
 /// A watch key's signature holds only under the delegation it was made
 /// under: re-wrapped in another delegation to the same key, the entry is
 /// refused, so nobody can copy it into new entries that take its Ghost Key's
