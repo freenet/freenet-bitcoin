@@ -2342,6 +2342,30 @@ mod tests {
         );
     }
 
+    /// While the mainnet tip cannot be read, nothing bounds a revocation, so
+    /// it is ignored; the Ghost Key's next request restates it.
+    #[test]
+    fn a_revocation_with_the_tip_unreadable_is_ignored() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        let no_mainnet = Tips {
+            by_network: HashMap::from([(SIGNET, SIGNET_TIP)]),
+        };
+        let revoke = InboxRequest {
+            revoke_watch_keys_through: Some(1),
+            ..request(Action::Watch, b"own", 1)
+        };
+        run(
+            &store,
+            &inbox(FLOOR, vec![entry(gk, FLOOR + 1, &revoke)]),
+            &no_mainnet,
+        );
+        let d = delegation(gk, 1, 1);
+        let w = delegated(gk, &d, 1, FLOOR + 1, &request(Action::Watch, b"spk", 2));
+        run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert!(watched(&store).contains(&b"spk".to_vec()), "not revoked");
+    }
+
     /// A delegation issued at the same height as the one admitted, to another
     /// key, is read and removed, not left holding the watch key's place.
     #[test]

@@ -436,9 +436,8 @@ pub struct InboxRequest {
     /// recorded, renewals of the Ghost Key's own watches included, so send
     /// Watch again for everything still wanted. To rotate, issue the new
     /// delegation at a later height than the old one and revoke through the
-    /// height just below it. Nothing lowers a revocation, and a delegation can
-    /// be issued no later than the entries that use it are dated, so revoking
-    /// through a height far ahead blocks every delegation until then.
+    /// height just below it. A revocation, once recorded, lasts: nothing
+    /// lowers it.
     ///
     /// The bridge ignores a value more than [`WINDOW_BLOCKS`] above its
     /// mainnet tip, or any value while it cannot read the tip, so a mistake
