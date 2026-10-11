@@ -197,6 +197,131 @@ pub fn stale_report(was: bool, now: bool, since_report: Option<Duration>) -> Opt
     (now && due).then_some(true)
 }
 
+/// What a pass did with one entry in the copy it read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Acted on in this pass. `act` logs what came of it.
+    Read,
+    /// Read by an earlier pass; its removal has not reached this copy yet.
+    AlreadyRead,
+    /// Left waiting: the removal budget, or its Ghost Key's share, is spent.
+    Deferred,
+    /// Left unread: under a delegation this bridge refuses.
+    Refused,
+    /// Left unread: dated below the floor this bridge signed.
+    BehindTheFloor,
+    /// Left unread: dated above that floor's window.
+    AboveTheWindow,
+}
+
+/// One entry a pass saw, and what it did with it, so the worker can say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seen {
+    pub key: EntryKey,
+    pub ghostkey: [u8; 32],
+    pub mainnet_height: u32,
+    pub outcome: Outcome,
+}
+
+/// How long an entry's report is remembered after the last pass that saw
+/// it. An entry lives about half an hour, so this outlasts it; what it stops
+/// is a node that serves one copy and then another, or a reconnect, logging
+/// every entry again.
+pub const REPORT_MEMORY: Duration = Duration::from_secs(60 * 60);
+
+/// Past this many entries the memory keeps only what the latest pass saw,
+/// which costs some repeated lines and nothing else. A pass sees at most
+/// what one copy holds, which the contract caps far below this.
+pub const REPORT_MEMORY_CAP: usize = 4096;
+
+/// What was last reported for each entry, and when a pass last saw it.
+pub type ReportMemory = HashMap<EntryKey, (Outcome, Instant)>;
+
+/// Which of the entries a pass saw are worth a line: each entry once, and
+/// again whenever what the bridge does with it changes, so every verified
+/// entry that reached this node can be found in the log by its entry key,
+/// however it was handled. Before this, an entry left unread for any reason
+/// but the removal budget left no trace at any level, so "the bridge never
+/// saw it" and "the bridge saw it and skipped it" could not be told apart
+/// (freenet/freenet-core#5842). An entry that fails verification is still
+/// only counted, in the stale-copy report.
+///
+/// A pass that reads an entry logs it from `act`, so `Read` is never returned
+/// here, and an entry seen as already read after being read is not news. An
+/// entry no pass has seen for [`REPORT_MEMORY`] is forgotten.
+pub fn entry_reports(memory: &mut ReportMemory, seen: &[Seen], now: Instant) -> Vec<Seen> {
+    let class = |o: Outcome| match o {
+        Outcome::AlreadyRead => Outcome::Read,
+        o => o,
+    };
+    // Forget first, so an entry seen again after a long gap, such as a
+    // connection that was down, is news again rather than refreshed.
+    memory.retain(|_, (_, at)| now.saturating_duration_since(*at) < REPORT_MEMORY);
+    let mut out = Vec::new();
+    for s in seen {
+        let changed = memory.get(&s.key).map(|(o, _)| class(*o)) != Some(class(s.outcome));
+        if changed && s.outcome != Outcome::Read {
+            out.push(*s);
+        }
+        memory.insert(s.key, (s.outcome, now));
+    }
+    if memory.len() > REPORT_MEMORY_CAP {
+        memory.retain(|_, (_, at)| *at == now);
+    }
+    out
+}
+
+/// The line for an entry a pass left unread, or found already read: whether
+/// it warns, and what it says. `None` for one this pass read,
+/// which `act` reports.
+///
+/// WARN only for an entry above the window, which a copy the node validated
+/// cannot hold, so it means this build and the contract disagree. The others
+/// are the inbox working as designed, and each is said once per entry.
+pub fn unread_line(o: Outcome) -> Option<(bool, &'static str)> {
+    Some(match o {
+        Outcome::Read => return None,
+        Outcome::AlreadyRead => (
+            false,
+            "inbox request already read; its removal has not reached this node's copy yet",
+        ),
+        Outcome::Deferred => (
+            false,
+            "inbox request waits: the removal budget, or its Ghost Key's share of it, is spent \
+             until the floor passes earlier removals",
+        ),
+        Outcome::Refused => (
+            false,
+            "inbox request left unread: the watch key that signed it was revoked or \
+             superseded by its Ghost Key",
+        ),
+        Outcome::BehindTheFloor => (
+            false,
+            "inbox request skipped: this node's copy still holds it, dated below the floor \
+             this bridge signed, so it was read earlier or dropped unread when that floor was set",
+        ),
+        Outcome::AboveTheWindow => (
+            true,
+            "inbox request left unread: dated more than WINDOW_BLOCKS above the floor this \
+             bridge signed, which the contract should have refused (freenet-bitcoin#21)",
+        ),
+    })
+}
+
+fn log_unread(s: &Seen, floor: Option<u32>) {
+    let Some((warn, msg)) = unread_line(s.outcome) else {
+        return;
+    };
+    let entry = hex::encode(s.key.0);
+    let ghostkey = hex::encode(&s.ghostkey[..8]);
+    let height = s.mainnet_height;
+    if warn {
+        tracing::warn!(entry = %entry, ghostkey = %ghostkey, height, floor, "{msg}");
+    } else {
+        tracing::info!(entry = %entry, ghostkey = %ghostkey, height, floor, "{msg}");
+    }
+}
+
 /// Whether the floor is still held. The hold is kept on the monotonic clock,
 /// so no step of the wall clock stretches it or cuts it short.
 fn floor_held(until: Option<Instant>) -> bool {
@@ -271,6 +396,9 @@ pub struct Pass {
     /// above: a skipped entry may be the renewal, and nothing else would
     /// tell us it was skipped.
     pub unverified: usize,
+    /// Every entry that passed verification, and what this pass did with it.
+    /// See [`entry_reports`].
+    pub seen: Vec<Seen>,
 }
 
 pub struct Processor<'a> {
@@ -352,7 +480,16 @@ impl Processor<'_> {
         // everywhere: an earlier pass may have read it against a fresher
         // copy, and only this copy has yet to hear that.
         let mut behind_the_floor = 0usize;
+        let mut seen = Vec::with_capacity(entries.len());
         for (k, e) in entries {
+            let mut saw = |outcome| {
+                seen.push(Seen {
+                    key: k,
+                    ghostkey: e.ghostkey.0,
+                    mainnet_height: e.mainnet_height,
+                    outcome,
+                })
+            };
             // Below a floor this bridge signed: a stale copy of the inbox. It
             // was either acted on already or dropped unread when that floor
             // was set, and the floor sent below removes it. Above that floor's
@@ -366,6 +503,7 @@ impl Processor<'_> {
                     // renewal sent against an older floor lands here too, and
                     // is skipped unread: no watch ends against such a copy.
                     behind_the_floor += 1;
+                    saw(Outcome::BehindTheFloor);
                     continue;
                 }
                 if e.mainnet_height > f.saturating_add(WINDOW_BLOCKS) {
@@ -379,6 +517,7 @@ impl Processor<'_> {
                     // copy's. It is reachable only where this build and the
                     // contract disagree about the window, which is
                     // freenet-bitcoin#21.
+                    saw(Outcome::AboveTheWindow);
                     continue;
                 }
             }
@@ -412,6 +551,13 @@ impl Processor<'_> {
                         DelegationCheck::Revoked | DelegationCheck::Superseded
                     ) {
                         pass.refused_unread += 1;
+                        // One read before its delegation was revoked, whose
+                        // removal has not landed here, is reported as read.
+                        saw(if self.store.is_handled(&k.0)? {
+                            Outcome::AlreadyRead
+                        } else {
+                            Outcome::Refused
+                        });
                         continue;
                     }
                 }
@@ -433,18 +579,37 @@ impl Processor<'_> {
                 {
                     pass.deferred += 1;
                     pass.waiting.insert(e.ghostkey.0);
+                    saw(Outcome::Deferred);
                     continue;
                 }
-                self.store.with_transaction(|| {
-                    self.act(e, tips, now_ms)?;
-                    self.store
-                        .mark_handled(&k.0, e.mainnet_height, &e.ghostkey.0)
-                })?;
+                // Everything `act` logs carries the entry, so a request can
+                // be followed from the sender's entry key to what came of it.
+                // `pass` is synchronous, so the guard never crosses an await.
+                // ERROR level only so that a filter keeping any of `act`'s
+                // lines, its warnings included, keeps these fields with them.
+                let _span = tracing::error_span!(
+                    "inbox_entry",
+                    entry = %hex::encode(k.0),
+                    ghostkey = %hex::encode(&e.ghostkey.0[..8]),
+                    height = e.mainnet_height,
+                )
+                .entered();
+                self.store
+                    .with_transaction(|| {
+                        self.act(e, tips, now_ms)?;
+                        self.store
+                            .mark_handled(&k.0, e.mainnet_height, &e.ghostkey.0)
+                    })
+                    .with_context(|| format!("reading inbox entry {}", hex::encode(k.0)))?;
                 handled += 1;
                 pass.acted += 1;
+                saw(Outcome::Read);
+            } else {
+                saw(Outcome::AlreadyRead);
             }
             read_heights.insert(e.mainnet_height);
         }
+        pass.seen = seen;
         if pass.deferred > 0 {
             tracing::warn!(
                 deferred = pass.deferred,
@@ -1218,9 +1383,12 @@ impl InboxWorker {
         // compiles and is caught by the test rather than by the type checker
         // only while this one happens to be unused.
         let mut floor_armed_at: Option<Instant> = None;
+        // Kept across connections, so a reconnect does not log every entry
+        // in the copy again.
+        let mut reported = ReportMemory::new();
         loop {
             let started = Instant::now();
-            if let Err(e) = self.session(&mut floor_armed_at).await {
+            if let Err(e) = self.session(&mut floor_armed_at, &mut reported).await {
                 tracing::warn!("request inbox connection ended: {e:#}");
             }
             backoff = next_backoff(backoff, started.elapsed());
@@ -1229,7 +1397,11 @@ impl InboxWorker {
     }
 
     /// One connection's worth of serving. Returns only with an error.
-    async fn session(&self, floor_armed_at: &mut Option<Instant>) -> Result<()> {
+    async fn session(
+        &self,
+        floor_armed_at: &mut Option<Instant>,
+        reported: &mut ReportMemory,
+    ) -> Result<()> {
         // Bounded for the same reason the observer's connect is: a connect
         // that hangs is a session that never starts and never reports.
         let (stream, _) = tokio::time::timeout(
@@ -1312,7 +1484,7 @@ impl InboxWorker {
                         self.open(&mut api, &mut session, &store).await?
                     }
                     Step::Process(bytes) => {
-                        self.on_state(&mut api, key, &processor, &mut session, &bytes)
+                        self.on_state(&mut api, key, &processor, &mut session, reported, &bytes)
                             .await?
                     }
                     Step::Reconnect => return Err(anyhow!("the node closed the connection")),
@@ -1327,6 +1499,7 @@ impl InboxWorker {
         key: ContractKey,
         processor: &Processor<'_>,
         session: &mut Session,
+        reported: &mut ReportMemory,
         bytes: &[u8],
     ) -> Result<()> {
         let tips = session.tips(&self.networks);
@@ -1381,6 +1554,9 @@ impl InboxWorker {
         session
             .quiet
             .after_pass(fingerprint, !pass.delta.is_empty() || pass.gated);
+        for s in entry_reports(reported, &pass.seen, Instant::now()) {
+            log_unread(&s, pass.signed_floor);
+        }
         if pass.acted > 0 {
             tracing::info!(acted = pass.acted, "read the request inbox");
         }
@@ -1662,6 +1838,159 @@ mod tests {
         s
     }
 
+    fn outcomes(pass: &Pass) -> Vec<Outcome> {
+        pass.seen.iter().map(|s| s.outcome).collect()
+    }
+
+    fn seen(n: u8, outcome: Outcome) -> Seen {
+        Seen {
+            key: EntryKey([n; 32]),
+            ghostkey: [n; 32],
+            mainnet_height: FLOOR + 1,
+            outcome,
+        }
+    }
+
+    /// Each entry is reported once, and again only when what the bridge does
+    /// with it changes; one it read is reported by `act`, not here.
+    #[test]
+    fn an_entry_is_reported_once_and_again_when_its_outcome_changes() {
+        let mut memory = ReportMemory::new();
+        let t = Instant::now();
+        let refused = seen(1, Outcome::Refused);
+        let deferred = seen(2, Outcome::Deferred);
+        assert_eq!(
+            entry_reports(&mut memory, &[refused, deferred], t),
+            [refused, deferred]
+        );
+        assert!(
+            entry_reports(&mut memory, &[refused, deferred], t).is_empty(),
+            "the same outcome again is not news"
+        );
+        let read = seen(2, Outcome::Read);
+        assert!(
+            entry_reports(&mut memory, &[refused, read], t).is_empty(),
+            "a read is reported by act"
+        );
+        assert!(
+            entry_reports(&mut memory, &[refused, seen(2, Outcome::AlreadyRead)], t).is_empty(),
+            "already read after being read is not news"
+        );
+        let behind = seen(1, Outcome::BehindTheFloor);
+        assert_eq!(entry_reports(&mut memory, &[behind], t), [behind]);
+        let first = seen(3, Outcome::AlreadyRead);
+        assert_eq!(
+            entry_reports(&mut memory, &[first], t),
+            [first],
+            "the first sight of an entry read before a restart is reported: its removal has not landed"
+        );
+    }
+
+    /// A node that serves one copy and then another, or a reconnect, does
+    /// not log every entry again; an entry unseen for REPORT_MEMORY does.
+    #[test]
+    fn an_entry_missing_from_one_copy_is_not_reported_again_until_forgotten() {
+        let mut memory = ReportMemory::new();
+        let t = Instant::now();
+        let behind = seen(1, Outcome::BehindTheFloor);
+        assert_eq!(entry_reports(&mut memory, &[behind], t), [behind]);
+        assert!(entry_reports(&mut memory, &[], t).is_empty());
+        let later = t + REPORT_MEMORY - Duration::from_secs(1);
+        assert!(
+            entry_reports(&mut memory, &[behind], later).is_empty(),
+            "a copy without it in between does not make it news"
+        );
+        assert_eq!(
+            entry_reports(&mut memory, &[behind], later + REPORT_MEMORY),
+            [behind],
+            "unseen for REPORT_MEMORY, as across a long reconnect, it is news again"
+        );
+        assert!(entry_reports(&mut memory, &[], later + 3 * REPORT_MEMORY).is_empty());
+        assert!(
+            memory.is_empty(),
+            "and an entry no longer served is forgotten"
+        );
+    }
+
+    /// Past the cap the memory keeps only what the latest pass saw.
+    #[test]
+    fn the_report_memory_is_bounded() {
+        let mut memory = ReportMemory::new();
+        let t = Instant::now();
+        for i in 0..=REPORT_MEMORY_CAP as u32 {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&i.to_be_bytes());
+            memory.insert(EntryKey(key), (Outcome::Refused, t));
+        }
+        let s = seen(0xff, Outcome::Refused);
+        entry_reports(&mut memory, &[s], t + Duration::from_secs(1));
+        assert_eq!(memory.len(), 1);
+        assert!(memory.contains_key(&s.key));
+    }
+
+    /// The line itself: its level, and that it carries the entry key a
+    /// sender knows its request by. Only this test reaches these callsites,
+    /// so the scoped subscriber decides their interest (see #5314 in
+    /// freenet-core for what happens when a test shares a callsite).
+    #[test]
+    fn an_unread_entry_is_logged_with_its_key_and_level() {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let w = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || w.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_unread(&seen(0xab, Outcome::Refused), Some(FLOOR));
+            log_unread(&seen(0xcd, Outcome::AboveTheWindow), Some(FLOOR));
+            log_unread(&seen(0xef, Outcome::Read), Some(FLOOR));
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "a read is not logged here: {out}");
+        assert!(lines[0].contains(" INFO ") && lines[0].contains(&"ab".repeat(32)));
+        assert!(
+            lines[0].contains(&format!("ghostkey={}", "ab".repeat(8))),
+            "{out}"
+        );
+        assert!(lines[0].contains(&format!("height={}", FLOOR + 1)));
+        assert!(lines[0].contains(&format!("floor={FLOOR}")));
+        assert!(lines[1].contains(" WARN ") && lines[1].contains(&"cd".repeat(32)));
+        assert!(lines[1].contains(&format!("ghostkey={}", "cd".repeat(8))));
+    }
+
+    /// Only an entry above the window warns: a validated copy cannot hold
+    /// one, so it is a disagreement with the contract. Every other outcome
+    /// but a read gets a line of its own.
+    #[test]
+    fn only_an_entry_above_the_window_warns() {
+        assert_eq!(unread_line(Outcome::Read), None);
+        for o in [
+            Outcome::AlreadyRead,
+            Outcome::Deferred,
+            Outcome::Refused,
+            Outcome::BehindTheFloor,
+        ] {
+            assert_eq!(unread_line(o).map(|(w, _)| w), Some(false), "{o:?}");
+        }
+        assert_eq!(
+            unread_line(Outcome::AboveTheWindow).map(|(w, _)| w),
+            Some(true)
+        );
+    }
+
     /// A hold that stands for both halves, as a connection arms them.
     fn try_run_held(
         store: &Store,
@@ -1824,6 +2153,7 @@ mod tests {
         ];
         let pass = run(&store, &inbox(FLOOR, two.clone()), &tips());
         assert_eq!((pass.acted, pass.deferred), (1, 1));
+        assert_eq!(outcomes(&pass), [Outcome::Read, Outcome::Deferred]);
         assert_eq!(watched(&store).len(), 1);
         assert_eq!(removed(&pass), 1, "only what was read is removed");
 
@@ -2313,8 +2643,17 @@ mod tests {
         revoke_at(&store, gk, 1, 1, FLOOR + 1);
         let d = delegation(gk, 1, 1);
         let w = delegated(gk, &d, 1, FLOOR + 2, &request(Action::Watch, b"spk", 2));
-        let pass = run(&store, &inbox(FLOOR, vec![w]), &tips());
+        let pass = run(&store, &inbox(FLOOR, vec![w.clone()]), &tips());
         assert_eq!(pass.refused_unread, 1);
+        assert_eq!(outcomes(&pass), [Outcome::Refused]);
+        assert_eq!(
+            (
+                pass.seen[0].key,
+                pass.seen[0].ghostkey,
+                pass.seen[0].mainnet_height
+            ),
+            (w.entry.key(), gk.id().0, FLOOR + 2)
+        );
         assert_eq!(removed(&pass), 0, "not read, so not removed");
         assert!(pass.waiting.is_empty());
         assert_eq!(
@@ -2322,6 +2661,22 @@ mod tests {
             1,
             "only the revocation"
         );
+    }
+
+    /// An entry read before its key was revoked, still in a copy its removal
+    /// has not reached, is reported as read, not as left unread.
+    #[test]
+    fn an_entry_read_before_its_key_was_revoked_is_reported_as_read() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        let d = delegation(gk, 1, 1);
+        let w = delegated(gk, &d, 1, FLOOR + 2, &request(Action::Watch, b"spk", 2));
+        let first = run(&store, &inbox(FLOOR, vec![w.clone()]), &tips());
+        assert_eq!(outcomes(&first), [Outcome::Read]);
+        revoke_at(&store, gk, 1, 3, FLOOR + 1);
+        let pass = run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(pass.refused_unread, 1);
+        assert_eq!(outcomes(&pass), [Outcome::AlreadyRead]);
     }
 
     /// A revocation through a height past the mainnet tip, a mistake in units
@@ -3195,8 +3550,21 @@ mod tests {
             declared < reconnects,
             "the hold is declared inside the reconnect loop, so every reconnection arms it again"
         );
+        // The entry reports' memory the same way, or every reconnection logs
+        // every entry in the copy again.
+        let memory = run
+            .find(concat!("let mut rep", "orted = ReportMemory::new()"))
+            .expect("the worker no longer keeps the report memory across sessions");
         assert!(
-            run.contains(concat!("self.session(&mut floor_arm", "ed_at)")),
+            memory < reconnects,
+            "the report memory is made per connection"
+        );
+        assert!(
+            run.contains(concat!("ed_at, &mut rep", "orted)")),
+            "the session no longer takes the worker's report memory"
+        );
+        assert!(
+            run.contains(concat!("self.session(&mut floor_arm", "ed_at, ")),
             "the session no longer takes the worker's hold"
         );
         // In `session`, past the slice above: the pass must be given when each
@@ -3595,9 +3963,11 @@ mod tests {
             FLOOR + 1,
             &request(Action::Watch, b"spk", 1),
         );
-        run(&store, &inbox(FLOOR, vec![w.clone()]), &tips());
+        let first = run(&store, &inbox(FLOOR, vec![w.clone()]), &tips());
+        assert_eq!(outcomes(&first), [Outcome::Read]);
         let pass = run(&store, &inbox(FLOOR, vec![w]), &tips());
         assert_eq!(pass.acted, 0);
+        assert_eq!(outcomes(&pass), [Outcome::AlreadyRead]);
         assert_eq!(removed(&pass), 1, "the lost removal is sent again");
     }
 
@@ -3705,6 +4075,10 @@ mod tests {
         let pass = run(&store, &state, &tips());
         assert_eq!(pass.acted, 0);
         assert!(watched(&store).is_empty());
+        assert_eq!(outcomes(&pass), [Outcome::AboveTheWindow]);
+        assert_eq!(pass.seen[0].key, far.entry.key());
+        assert_eq!(pass.seen[0].mainnet_height, FLOOR + WINDOW_BLOCKS + 5);
+        assert_eq!(pass.seen[0].ghostkey, ghostkeys()[0].id().0);
     }
 
     #[test]
@@ -3739,6 +4113,7 @@ mod tests {
         let pass = run(&store, &inbox(FLOOR, vec![old]), &tips());
         assert_eq!(pass.acted, 0);
         assert!(watched(&store).is_empty());
+        assert_eq!(outcomes(&pass), [Outcome::BehindTheFloor]);
         assert_eq!(
             pass.delta.floor.map(|f| f.height),
             Some(FLOOR + 5),
