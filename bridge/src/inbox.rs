@@ -197,6 +197,113 @@ pub fn stale_report(was: bool, now: bool, since_report: Option<Duration>) -> Opt
     (now && due).then_some(true)
 }
 
+/// What a pass did with one entry in the copy it read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Acted on in this pass. `act` logs what came of it.
+    Read,
+    /// Read by an earlier pass; its removal has not reached this copy yet.
+    AlreadyRead,
+    /// Left waiting: the removal budget, or its Ghost Key's share, is spent.
+    Deferred,
+    /// Left unread: under a delegation this bridge refuses.
+    Refused,
+    /// Left unread: dated below the floor this bridge signed.
+    BehindTheFloor,
+    /// Left unread: dated above that floor's window.
+    AboveTheWindow,
+}
+
+/// One entry a pass saw, and what it did with it, so the worker can say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seen {
+    pub key: EntryKey,
+    pub ghostkey: [u8; 32],
+    pub mainnet_height: u32,
+    pub outcome: Outcome,
+}
+
+/// Which of the entries a pass saw are worth a line: each entry once, and
+/// again whenever what the bridge does with it changes, so a request that
+/// reached this node can always be found in the log by its entry key, however
+/// it was handled. Before this, an entry left unread for any reason but the
+/// removal budget left no trace at any level, so "the bridge never saw it"
+/// and "the bridge saw it and skipped it" could not be told apart
+/// (freenet/freenet-core#5842).
+///
+/// `reported` is what was last reported per entry; it is replaced by what
+/// this pass saw, so an entry gone from the copy is forgotten. A pass that
+/// reads an entry logs it from `act`, so `Read` is never returned here, and an
+/// entry seen as already read after being read is not news.
+pub fn entry_reports(reported: &mut HashMap<EntryKey, Outcome>, seen: &[Seen]) -> Vec<Seen> {
+    let class = |o: Outcome| match o {
+        Outcome::AlreadyRead => Outcome::Read,
+        o => o,
+    };
+    let mut now = HashMap::with_capacity(seen.len());
+    let mut out = Vec::new();
+    for s in seen {
+        let changed = reported.get(&s.key).map(|o| class(*o)) != Some(class(s.outcome));
+        if changed && s.outcome != Outcome::Read {
+            out.push(*s);
+        }
+        now.insert(s.key, s.outcome);
+    }
+    *reported = now;
+    out
+}
+
+/// The line for an entry a pass left unread, or found already read: its
+/// whether it warns, and what it says. `None` for one this pass read,
+/// which `act` reports.
+///
+/// WARN only for an entry above the window, which a copy the node validated
+/// cannot hold, so it means this build and the contract disagree. The others
+/// are the inbox working as designed, and each is said once per entry.
+pub fn unread_line(o: Outcome) -> Option<(bool, &'static str)> {
+    Some(match o {
+        Outcome::Read => return None,
+        Outcome::AlreadyRead => (
+            false,
+            "inbox request already read; its removal has not reached this node's copy yet",
+        ),
+        Outcome::Deferred => (
+            false,
+            "inbox request waits for the floor: the removal budget, or its Ghost Key's share \
+             of it, is spent",
+        ),
+        Outcome::Refused => (
+            false,
+            "inbox request left unread: the watch key that signed it was revoked or \
+             superseded by its Ghost Key",
+        ),
+        Outcome::BehindTheFloor => (
+            false,
+            "inbox request left unread: this node's copy still holds it, dated below the \
+             floor this bridge signed",
+        ),
+        Outcome::AboveTheWindow => (
+            true,
+            "inbox request left unread: dated above the window over the floor this bridge \
+             signed, which the contract should have refused (freenet-bitcoin#21)",
+        ),
+    })
+}
+
+fn log_unread(s: &Seen, floor: Option<u32>) {
+    let Some((warn, msg)) = unread_line(s.outcome) else {
+        return;
+    };
+    let entry = hex::encode(s.key.0);
+    let ghostkey = hex::encode(&s.ghostkey[..8]);
+    let height = s.mainnet_height;
+    if warn {
+        tracing::warn!(entry, ghostkey, height, floor, "{msg}");
+    } else {
+        tracing::info!(entry, ghostkey, height, floor, "{msg}");
+    }
+}
+
 /// Whether the floor is still held. The hold is kept on the monotonic clock,
 /// so no step of the wall clock stretches it or cuts it short.
 fn floor_held(until: Option<Instant>) -> bool {
@@ -271,6 +378,9 @@ pub struct Pass {
     /// above: a skipped entry may be the renewal, and nothing else would
     /// tell us it was skipped.
     pub unverified: usize,
+    /// Every entry that passed verification, and what this pass did with it.
+    /// See [`entry_reports`].
+    pub seen: Vec<Seen>,
 }
 
 pub struct Processor<'a> {
@@ -352,7 +462,16 @@ impl Processor<'_> {
         // everywhere: an earlier pass may have read it against a fresher
         // copy, and only this copy has yet to hear that.
         let mut behind_the_floor = 0usize;
+        let mut seen = Vec::with_capacity(entries.len());
         for (k, e) in entries {
+            let mut saw = |outcome| {
+                seen.push(Seen {
+                    key: k,
+                    ghostkey: e.ghostkey.0,
+                    mainnet_height: e.mainnet_height,
+                    outcome,
+                })
+            };
             // Below a floor this bridge signed: a stale copy of the inbox. It
             // was either acted on already or dropped unread when that floor
             // was set, and the floor sent below removes it. Above that floor's
@@ -366,6 +485,7 @@ impl Processor<'_> {
                     // renewal sent against an older floor lands here too, and
                     // is skipped unread: no watch ends against such a copy.
                     behind_the_floor += 1;
+                    saw(Outcome::BehindTheFloor);
                     continue;
                 }
                 if e.mainnet_height > f.saturating_add(WINDOW_BLOCKS) {
@@ -379,6 +499,7 @@ impl Processor<'_> {
                     // copy's. It is reachable only where this build and the
                     // contract disagree about the window, which is
                     // freenet-bitcoin#21.
+                    saw(Outcome::AboveTheWindow);
                     continue;
                 }
             }
@@ -412,6 +533,7 @@ impl Processor<'_> {
                         DelegationCheck::Revoked | DelegationCheck::Superseded
                     ) {
                         pass.refused_unread += 1;
+                        saw(Outcome::Refused);
                         continue;
                     }
                 }
@@ -433,8 +555,18 @@ impl Processor<'_> {
                 {
                     pass.deferred += 1;
                     pass.waiting.insert(e.ghostkey.0);
+                    saw(Outcome::Deferred);
                     continue;
                 }
+                // Everything `act` logs carries the entry, so a request can
+                // be followed from the sender's entry key to what came of it.
+                let _span = tracing::info_span!(
+                    "inbox_entry",
+                    entry = %hex::encode(k.0),
+                    ghostkey = %hex::encode(&e.ghostkey.0[..8]),
+                    height = e.mainnet_height,
+                )
+                .entered();
                 self.store.with_transaction(|| {
                     self.act(e, tips, now_ms)?;
                     self.store
@@ -442,9 +574,13 @@ impl Processor<'_> {
                 })?;
                 handled += 1;
                 pass.acted += 1;
+                saw(Outcome::Read);
+            } else {
+                saw(Outcome::AlreadyRead);
             }
             read_heights.insert(e.mainnet_height);
         }
+        pass.seen = seen;
         if pass.deferred > 0 {
             tracing::warn!(
                 deferred = pass.deferred,
@@ -1272,6 +1408,7 @@ impl InboxWorker {
             quiet: QuietCache::default(),
             was_stale: false,
             stale_reported_at: None,
+            reported: HashMap::new(),
         };
 
         let mut driver = Driver::default();
@@ -1381,6 +1518,9 @@ impl InboxWorker {
         session
             .quiet
             .after_pass(fingerprint, !pass.delta.is_empty() || pass.gated);
+        for s in entry_reports(&mut session.reported, &pass.seen) {
+            log_unread(&s, pass.signed_floor);
+        }
         if pass.acted > 0 {
             tracing::info!(acted = pass.acted, "read the request inbox");
         }
@@ -1507,6 +1647,9 @@ struct Session {
     /// lasts is repeated at the rate [`stale_report`] allows rather than
     /// once for the life of a connection. See [`STALE_RELOG_MS`].
     stale_reported_at: Option<Instant>,
+    /// What was last reported for each entry in the copy, so each entry is
+    /// reported once and again only when that changes. See [`entry_reports`].
+    reported: HashMap<EntryKey, Outcome>,
 }
 
 impl Session {
@@ -1660,6 +1803,86 @@ mod tests {
         )
         .unwrap();
         s
+    }
+
+    fn outcomes(pass: &Pass) -> Vec<Outcome> {
+        pass.seen.iter().map(|s| s.outcome).collect()
+    }
+
+    fn seen(n: u8, outcome: Outcome) -> Seen {
+        Seen {
+            key: EntryKey([n; 32]),
+            ghostkey: [n; 32],
+            mainnet_height: FLOOR + 1,
+            outcome,
+        }
+    }
+
+    /// Each entry is reported once, and again only when what the bridge does
+    /// with it changes; one it read is reported by `act`, not here.
+    #[test]
+    fn an_entry_is_reported_once_and_again_when_its_outcome_changes() {
+        let mut reported = HashMap::new();
+        let refused = seen(1, Outcome::Refused);
+        let deferred = seen(2, Outcome::Deferred);
+        assert_eq!(
+            entry_reports(&mut reported, &[refused, deferred]),
+            [refused, deferred]
+        );
+        assert!(
+            entry_reports(&mut reported, &[refused, deferred]).is_empty(),
+            "the same outcome again is not news"
+        );
+        let read = seen(2, Outcome::Read);
+        assert!(
+            entry_reports(&mut reported, &[refused, read]).is_empty(),
+            "a read is reported by act"
+        );
+        assert!(
+            entry_reports(&mut reported, &[refused, seen(2, Outcome::AlreadyRead)]).is_empty(),
+            "already read after being read is not news"
+        );
+        let behind = seen(1, Outcome::BehindTheFloor);
+        assert_eq!(entry_reports(&mut reported, &[behind]), [behind]);
+        assert_eq!(
+            reported.len(),
+            1,
+            "an entry gone from the copy is forgotten"
+        );
+        assert_eq!(
+            entry_reports(&mut reported, &[seen(2, Outcome::AlreadyRead)]),
+            [seen(2, Outcome::AlreadyRead)],
+            "so it is reported again if it comes back"
+        );
+    }
+
+    /// The first sight of an entry read earlier, in another session or before
+    /// a restart, is reported: its removal has not landed.
+    #[test]
+    fn an_entry_first_seen_already_read_is_reported() {
+        let mut reported = HashMap::new();
+        let s = seen(3, Outcome::AlreadyRead);
+        assert_eq!(entry_reports(&mut reported, &[s]), [s]);
+    }
+
+    /// Only an entry above the window warns: a validated copy cannot hold
+    /// one, so it is a disagreement with the contract. Every other outcome
+    /// but a read gets a line of its own.
+    #[test]
+    fn only_an_entry_above_the_window_warns() {
+        assert_eq!(unread_line(Outcome::Read), None);
+        for o in [
+            Outcome::AlreadyRead,
+            Outcome::Deferred,
+            Outcome::Refused,
+            Outcome::BehindTheFloor,
+        ] {
+            assert_eq!(unread_line(o).map(|(w, _)| w), Some(false), "{o:?}");
+        }
+        assert_eq!(
+            unread_line(Outcome::AboveTheWindow).map(|(w, _)| w),
+            Some(true)
+        );
     }
 
     /// A hold that stands for both halves, as a connection arms them.
@@ -1824,6 +2047,7 @@ mod tests {
         ];
         let pass = run(&store, &inbox(FLOOR, two.clone()), &tips());
         assert_eq!((pass.acted, pass.deferred), (1, 1));
+        assert_eq!(outcomes(&pass), [Outcome::Read, Outcome::Deferred]);
         assert_eq!(watched(&store).len(), 1);
         assert_eq!(removed(&pass), 1, "only what was read is removed");
 
@@ -2315,6 +2539,7 @@ mod tests {
         let w = delegated(gk, &d, 1, FLOOR + 2, &request(Action::Watch, b"spk", 2));
         let pass = run(&store, &inbox(FLOOR, vec![w]), &tips());
         assert_eq!(pass.refused_unread, 1);
+        assert_eq!(outcomes(&pass), [Outcome::Refused]);
         assert_eq!(removed(&pass), 0, "not read, so not removed");
         assert!(pass.waiting.is_empty());
         assert_eq!(
@@ -3595,9 +3820,11 @@ mod tests {
             FLOOR + 1,
             &request(Action::Watch, b"spk", 1),
         );
-        run(&store, &inbox(FLOOR, vec![w.clone()]), &tips());
+        let first = run(&store, &inbox(FLOOR, vec![w.clone()]), &tips());
+        assert_eq!(outcomes(&first), [Outcome::Read]);
         let pass = run(&store, &inbox(FLOOR, vec![w]), &tips());
         assert_eq!(pass.acted, 0);
+        assert_eq!(outcomes(&pass), [Outcome::AlreadyRead]);
         assert_eq!(removed(&pass), 1, "the lost removal is sent again");
     }
 
@@ -3705,6 +3932,10 @@ mod tests {
         let pass = run(&store, &state, &tips());
         assert_eq!(pass.acted, 0);
         assert!(watched(&store).is_empty());
+        assert_eq!(outcomes(&pass), [Outcome::AboveTheWindow]);
+        assert_eq!(pass.seen[0].key, far.entry.key());
+        assert_eq!(pass.seen[0].mainnet_height, FLOOR + WINDOW_BLOCKS + 5);
+        assert_eq!(pass.seen[0].ghostkey, ghostkeys()[0].id().0);
     }
 
     #[test]
@@ -3739,6 +3970,7 @@ mod tests {
         let pass = run(&store, &inbox(FLOOR, vec![old]), &tips());
         assert_eq!(pass.acted, 0);
         assert!(watched(&store).is_empty());
+        assert_eq!(outcomes(&pass), [Outcome::BehindTheFloor]);
         assert_eq!(
             pass.delta.floor.map(|f| f.height),
             Some(FLOOR + 5),
