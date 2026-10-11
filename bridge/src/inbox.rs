@@ -223,38 +223,55 @@ pub struct Seen {
     pub outcome: Outcome,
 }
 
+/// How long an entry's report is remembered after the last pass that saw
+/// it. An entry lives about half an hour, so this outlasts it; what it stops
+/// is a node that serves one copy and then another, or a reconnect, logging
+/// every entry again.
+pub const REPORT_MEMORY: Duration = Duration::from_secs(60 * 60);
+
+/// Entries whose report is remembered at most. Past it the memory keeps only
+/// what the latest pass saw, which costs some repeated lines and nothing else.
+pub const REPORT_MEMORY_CAP: usize = 4096;
+
+/// What was last reported for each entry, and when a pass last saw it.
+pub type ReportMemory = HashMap<EntryKey, (Outcome, Instant)>;
+
 /// Which of the entries a pass saw are worth a line: each entry once, and
-/// again whenever what the bridge does with it changes, so a request that
-/// reached this node can always be found in the log by its entry key, however
-/// it was handled. Before this, an entry left unread for any reason but the
-/// removal budget left no trace at any level, so "the bridge never saw it"
-/// and "the bridge saw it and skipped it" could not be told apart
-/// (freenet/freenet-core#5842).
+/// again whenever what the bridge does with it changes, so every verified
+/// entry that reached this node can be found in the log by its entry key,
+/// however it was handled. Before this, an entry left unread for any reason
+/// but the removal budget left no trace at any level, so "the bridge never
+/// saw it" and "the bridge saw it and skipped it" could not be told apart
+/// (freenet/freenet-core#5842). An entry that fails verification is still
+/// only counted, in the stale-copy report.
 ///
-/// `reported` is what was last reported per entry; it is replaced by what
-/// this pass saw, so an entry gone from the copy is forgotten. A pass that
-/// reads an entry logs it from `act`, so `Read` is never returned here, and an
-/// entry seen as already read after being read is not news.
-pub fn entry_reports(reported: &mut HashMap<EntryKey, Outcome>, seen: &[Seen]) -> Vec<Seen> {
+/// A pass that reads an entry logs it from `act`, so `Read` is never returned
+/// here, and an entry seen as already read after being read is not news. An
+/// entry no pass has seen for [`REPORT_MEMORY`] is forgotten.
+pub fn entry_reports(memory: &mut ReportMemory, seen: &[Seen], now: Instant) -> Vec<Seen> {
     let class = |o: Outcome| match o {
         Outcome::AlreadyRead => Outcome::Read,
         o => o,
     };
-    let mut now = HashMap::with_capacity(seen.len());
+    // Forget first, so an entry seen again after a long gap, such as a
+    // connection that was down, is news again rather than refreshed.
+    memory.retain(|_, (_, at)| now.saturating_duration_since(*at) < REPORT_MEMORY);
     let mut out = Vec::new();
     for s in seen {
-        let changed = reported.get(&s.key).map(|o| class(*o)) != Some(class(s.outcome));
+        let changed = memory.get(&s.key).map(|(o, _)| class(*o)) != Some(class(s.outcome));
         if changed && s.outcome != Outcome::Read {
             out.push(*s);
         }
-        now.insert(s.key, s.outcome);
+        memory.insert(s.key, (s.outcome, now));
     }
-    *reported = now;
+    if memory.len() > REPORT_MEMORY_CAP {
+        memory.retain(|_, (_, at)| *at == now);
+    }
     out
 }
 
-/// The line for an entry a pass left unread, or found already read: its
-/// whether it warns, and what it says. `None` for one this pass read,
+/// The line for an entry a pass left unread, or found already read: whether
+/// it warns, and what it says. `None` for one this pass read,
 /// which `act` reports.
 ///
 /// WARN only for an entry above the window, which a copy the node validated
@@ -269,8 +286,8 @@ pub fn unread_line(o: Outcome) -> Option<(bool, &'static str)> {
         ),
         Outcome::Deferred => (
             false,
-            "inbox request waits for the floor: the removal budget, or its Ghost Key's share \
-             of it, is spent",
+            "inbox request waits: the removal budget, or its Ghost Key's share of it, is spent \
+             until the floor passes earlier removals",
         ),
         Outcome::Refused => (
             false,
@@ -279,13 +296,13 @@ pub fn unread_line(o: Outcome) -> Option<(bool, &'static str)> {
         ),
         Outcome::BehindTheFloor => (
             false,
-            "inbox request left unread: this node's copy still holds it, dated below the \
-             floor this bridge signed",
+            "inbox request skipped: this node's copy still holds it, dated below the floor \
+             this bridge signed, so it was read earlier or dropped unread when that floor was set",
         ),
         Outcome::AboveTheWindow => (
             true,
-            "inbox request left unread: dated above the window over the floor this bridge \
-             signed, which the contract should have refused (freenet-bitcoin#21)",
+            "inbox request left unread: dated more than WINDOW_BLOCKS above the floor this \
+             bridge signed, which the contract should have refused (freenet-bitcoin#21)",
         ),
     })
 }
@@ -298,9 +315,9 @@ fn log_unread(s: &Seen, floor: Option<u32>) {
     let ghostkey = hex::encode(&s.ghostkey[..8]);
     let height = s.mainnet_height;
     if warn {
-        tracing::warn!(entry, ghostkey, height, floor, "{msg}");
+        tracing::warn!(entry = %entry, ghostkey = %ghostkey, height, floor, "{msg}");
     } else {
-        tracing::info!(entry, ghostkey, height, floor, "{msg}");
+        tracing::info!(entry = %entry, ghostkey = %ghostkey, height, floor, "{msg}");
     }
 }
 
@@ -560,18 +577,23 @@ impl Processor<'_> {
                 }
                 // Everything `act` logs carries the entry, so a request can
                 // be followed from the sender's entry key to what came of it.
-                let _span = tracing::info_span!(
+                // `pass` is synchronous, so the guard never crosses an await.
+                // ERROR level only so that a filter keeping any of `act`'s
+                // lines, its warnings included, keeps these fields with them.
+                let _span = tracing::error_span!(
                     "inbox_entry",
                     entry = %hex::encode(k.0),
                     ghostkey = %hex::encode(&e.ghostkey.0[..8]),
                     height = e.mainnet_height,
                 )
                 .entered();
-                self.store.with_transaction(|| {
-                    self.act(e, tips, now_ms)?;
-                    self.store
-                        .mark_handled(&k.0, e.mainnet_height, &e.ghostkey.0)
-                })?;
+                self.store
+                    .with_transaction(|| {
+                        self.act(e, tips, now_ms)?;
+                        self.store
+                            .mark_handled(&k.0, e.mainnet_height, &e.ghostkey.0)
+                    })
+                    .with_context(|| format!("reading inbox entry {}", hex::encode(k.0)))?;
                 handled += 1;
                 pass.acted += 1;
                 saw(Outcome::Read);
@@ -1354,9 +1376,12 @@ impl InboxWorker {
         // compiles and is caught by the test rather than by the type checker
         // only while this one happens to be unused.
         let mut floor_armed_at: Option<Instant> = None;
+        // Kept across connections, so a reconnect does not log every entry
+        // in the copy again.
+        let mut reported = ReportMemory::new();
         loop {
             let started = Instant::now();
-            if let Err(e) = self.session(&mut floor_armed_at).await {
+            if let Err(e) = self.session(&mut floor_armed_at, &mut reported).await {
                 tracing::warn!("request inbox connection ended: {e:#}");
             }
             backoff = next_backoff(backoff, started.elapsed());
@@ -1365,7 +1390,11 @@ impl InboxWorker {
     }
 
     /// One connection's worth of serving. Returns only with an error.
-    async fn session(&self, floor_armed_at: &mut Option<Instant>) -> Result<()> {
+    async fn session(
+        &self,
+        floor_armed_at: &mut Option<Instant>,
+        reported: &mut ReportMemory,
+    ) -> Result<()> {
         // Bounded for the same reason the observer's connect is: a connect
         // that hangs is a session that never starts and never reports.
         let (stream, _) = tokio::time::timeout(
@@ -1408,7 +1437,6 @@ impl InboxWorker {
             quiet: QuietCache::default(),
             was_stale: false,
             stale_reported_at: None,
-            reported: HashMap::new(),
         };
 
         let mut driver = Driver::default();
@@ -1449,7 +1477,7 @@ impl InboxWorker {
                         self.open(&mut api, &mut session, &store).await?
                     }
                     Step::Process(bytes) => {
-                        self.on_state(&mut api, key, &processor, &mut session, &bytes)
+                        self.on_state(&mut api, key, &processor, &mut session, reported, &bytes)
                             .await?
                     }
                     Step::Reconnect => return Err(anyhow!("the node closed the connection")),
@@ -1464,6 +1492,7 @@ impl InboxWorker {
         key: ContractKey,
         processor: &Processor<'_>,
         session: &mut Session,
+        reported: &mut ReportMemory,
         bytes: &[u8],
     ) -> Result<()> {
         let tips = session.tips(&self.networks);
@@ -1518,7 +1547,7 @@ impl InboxWorker {
         session
             .quiet
             .after_pass(fingerprint, !pass.delta.is_empty() || pass.gated);
-        for s in entry_reports(&mut session.reported, &pass.seen) {
+        for s in entry_reports(reported, &pass.seen, Instant::now()) {
             log_unread(&s, pass.signed_floor);
         }
         if pass.acted > 0 {
@@ -1647,9 +1676,6 @@ struct Session {
     /// lasts is repeated at the rate [`stale_report`] allows rather than
     /// once for the life of a connection. See [`STALE_RELOG_MS`].
     stale_reported_at: Option<Instant>,
-    /// What was last reported for each entry in the copy, so each entry is
-    /// reported once and again only when that changes. See [`entry_reports`].
-    reported: HashMap<EntryKey, Outcome>,
 }
 
 impl Session {
@@ -1822,47 +1848,120 @@ mod tests {
     /// with it changes; one it read is reported by `act`, not here.
     #[test]
     fn an_entry_is_reported_once_and_again_when_its_outcome_changes() {
-        let mut reported = HashMap::new();
+        let mut memory = ReportMemory::new();
+        let t = Instant::now();
         let refused = seen(1, Outcome::Refused);
         let deferred = seen(2, Outcome::Deferred);
         assert_eq!(
-            entry_reports(&mut reported, &[refused, deferred]),
+            entry_reports(&mut memory, &[refused, deferred], t),
             [refused, deferred]
         );
         assert!(
-            entry_reports(&mut reported, &[refused, deferred]).is_empty(),
+            entry_reports(&mut memory, &[refused, deferred], t).is_empty(),
             "the same outcome again is not news"
         );
         let read = seen(2, Outcome::Read);
         assert!(
-            entry_reports(&mut reported, &[refused, read]).is_empty(),
+            entry_reports(&mut memory, &[refused, read], t).is_empty(),
             "a read is reported by act"
         );
         assert!(
-            entry_reports(&mut reported, &[refused, seen(2, Outcome::AlreadyRead)]).is_empty(),
+            entry_reports(&mut memory, &[refused, seen(2, Outcome::AlreadyRead)], t).is_empty(),
             "already read after being read is not news"
         );
         let behind = seen(1, Outcome::BehindTheFloor);
-        assert_eq!(entry_reports(&mut reported, &[behind]), [behind]);
+        assert_eq!(entry_reports(&mut memory, &[behind], t), [behind]);
+        let first = seen(3, Outcome::AlreadyRead);
         assert_eq!(
-            reported.len(),
-            1,
-            "an entry gone from the copy is forgotten"
-        );
-        assert_eq!(
-            entry_reports(&mut reported, &[seen(2, Outcome::AlreadyRead)]),
-            [seen(2, Outcome::AlreadyRead)],
-            "so it is reported again if it comes back"
+            entry_reports(&mut memory, &[first], t),
+            [first],
+            "the first sight of an entry read before a restart is reported: its removal has not landed"
         );
     }
 
-    /// The first sight of an entry read earlier, in another session or before
-    /// a restart, is reported: its removal has not landed.
+    /// A node that serves one copy and then another, or a reconnect, does
+    /// not log every entry again; an entry unseen for REPORT_MEMORY does.
     #[test]
-    fn an_entry_first_seen_already_read_is_reported() {
-        let mut reported = HashMap::new();
-        let s = seen(3, Outcome::AlreadyRead);
-        assert_eq!(entry_reports(&mut reported, &[s]), [s]);
+    fn an_entry_missing_from_one_copy_is_not_reported_again_until_forgotten() {
+        let mut memory = ReportMemory::new();
+        let t = Instant::now();
+        let behind = seen(1, Outcome::BehindTheFloor);
+        assert_eq!(entry_reports(&mut memory, &[behind], t), [behind]);
+        assert!(entry_reports(&mut memory, &[], t).is_empty());
+        let later = t + REPORT_MEMORY - Duration::from_secs(1);
+        assert!(
+            entry_reports(&mut memory, &[behind], later).is_empty(),
+            "a copy without it in between does not make it news"
+        );
+        assert_eq!(
+            entry_reports(&mut memory, &[behind], later + REPORT_MEMORY),
+            [behind],
+            "unseen for REPORT_MEMORY, as across a long reconnect, it is news again"
+        );
+        assert!(entry_reports(&mut memory, &[], later + 3 * REPORT_MEMORY).is_empty());
+        assert!(
+            memory.is_empty(),
+            "and an entry no longer served is forgotten"
+        );
+    }
+
+    /// Past the cap the memory keeps only what the latest pass saw.
+    #[test]
+    fn the_report_memory_is_bounded() {
+        let mut memory = ReportMemory::new();
+        let t = Instant::now();
+        for i in 0..=REPORT_MEMORY_CAP as u32 {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&i.to_be_bytes());
+            memory.insert(EntryKey(key), (Outcome::Refused, t));
+        }
+        let s = seen(0xff, Outcome::Refused);
+        entry_reports(&mut memory, &[s], t + Duration::from_secs(1));
+        assert_eq!(memory.len(), 1);
+        assert!(memory.contains_key(&s.key));
+    }
+
+    /// The line itself: its level, and that it carries the entry key a
+    /// sender knows its request by. Only this test reaches these callsites,
+    /// so the scoped subscriber decides their interest (see #5314 in
+    /// freenet-core for what happens when a test shares a callsite).
+    #[test]
+    fn an_unread_entry_is_logged_with_its_key_and_level() {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let w = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || w.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_unread(&seen(0xab, Outcome::Refused), Some(FLOOR));
+            log_unread(&seen(0xcd, Outcome::AboveTheWindow), Some(FLOOR));
+            log_unread(&seen(0xef, Outcome::Read), Some(FLOOR));
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "a read is not logged here: {out}");
+        assert!(lines[0].contains(" INFO ") && lines[0].contains(&"ab".repeat(32)));
+        assert!(
+            lines[0].contains(&format!("ghostkey={}", "ab".repeat(8))),
+            "{out}"
+        );
+        assert!(lines[0].contains(&format!("height={}", FLOOR + 1)));
+        assert!(lines[0].contains(&format!("floor={FLOOR}")));
+        assert!(lines[1].contains(" WARN ") && lines[1].contains(&"cd".repeat(32)));
+        assert!(lines[1].contains(&format!("ghostkey={}", "cd".repeat(8))));
     }
 
     /// Only an entry above the window warns: a validated copy cannot hold
@@ -2537,9 +2636,17 @@ mod tests {
         revoke_at(&store, gk, 1, 1, FLOOR + 1);
         let d = delegation(gk, 1, 1);
         let w = delegated(gk, &d, 1, FLOOR + 2, &request(Action::Watch, b"spk", 2));
-        let pass = run(&store, &inbox(FLOOR, vec![w]), &tips());
+        let pass = run(&store, &inbox(FLOOR, vec![w.clone()]), &tips());
         assert_eq!(pass.refused_unread, 1);
         assert_eq!(outcomes(&pass), [Outcome::Refused]);
+        assert_eq!(
+            (
+                pass.seen[0].key,
+                pass.seen[0].ghostkey,
+                pass.seen[0].mainnet_height
+            ),
+            (w.entry.key(), gk.id().0, FLOOR + 2)
+        );
         assert_eq!(removed(&pass), 0, "not read, so not removed");
         assert!(pass.waiting.is_empty());
         assert_eq!(
@@ -3420,8 +3527,21 @@ mod tests {
             declared < reconnects,
             "the hold is declared inside the reconnect loop, so every reconnection arms it again"
         );
+        // The entry reports' memory the same way, or every reconnection logs
+        // every entry in the copy again.
+        let memory = run
+            .find(concat!("let mut rep", "orted = ReportMemory::new()"))
+            .expect("the worker no longer keeps the report memory across sessions");
         assert!(
-            run.contains(concat!("self.session(&mut floor_arm", "ed_at)")),
+            memory < reconnects,
+            "the report memory is made per connection"
+        );
+        assert!(
+            run.contains(concat!("ed_at, &mut rep", "orted)")),
+            "the session no longer takes the worker's report memory"
+        );
+        assert!(
+            run.contains(concat!("self.session(&mut floor_arm", "ed_at, ")),
             "the session no longer takes the worker's hold"
         );
         // In `session`, past the slice above: the pass must be given when each
