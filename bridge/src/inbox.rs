@@ -229,8 +229,9 @@ pub struct Seen {
 /// every entry again.
 pub const REPORT_MEMORY: Duration = Duration::from_secs(60 * 60);
 
-/// Entries whose report is remembered at most. Past it the memory keeps only
-/// what the latest pass saw, which costs some repeated lines and nothing else.
+/// Past this many entries the memory keeps only what the latest pass saw,
+/// which costs some repeated lines and nothing else. A pass sees at most
+/// what one copy holds, which the contract caps far below this.
 pub const REPORT_MEMORY_CAP: usize = 4096;
 
 /// What was last reported for each entry, and when a pass last saw it.
@@ -550,7 +551,13 @@ impl Processor<'_> {
                         DelegationCheck::Revoked | DelegationCheck::Superseded
                     ) {
                         pass.refused_unread += 1;
-                        saw(Outcome::Refused);
+                        // One read before its delegation was revoked, whose
+                        // removal has not landed here, is reported as read.
+                        saw(if self.store.is_handled(&k.0)? {
+                            Outcome::AlreadyRead
+                        } else {
+                            Outcome::Refused
+                        });
                         continue;
                     }
                 }
@@ -2654,6 +2661,22 @@ mod tests {
             1,
             "only the revocation"
         );
+    }
+
+    /// An entry read before its key was revoked, still in a copy its removal
+    /// has not reached, is reported as read, not as left unread.
+    #[test]
+    fn an_entry_read_before_its_key_was_revoked_is_reported_as_read() {
+        let store = Store::open_in_memory().unwrap();
+        let gk = &ghostkeys()[0];
+        let d = delegation(gk, 1, 1);
+        let w = delegated(gk, &d, 1, FLOOR + 2, &request(Action::Watch, b"spk", 2));
+        let first = run(&store, &inbox(FLOOR, vec![w.clone()]), &tips());
+        assert_eq!(outcomes(&first), [Outcome::Read]);
+        revoke_at(&store, gk, 1, 3, FLOOR + 1);
+        let pass = run(&store, &inbox(FLOOR, vec![w]), &tips());
+        assert_eq!(pass.refused_unread, 1);
+        assert_eq!(outcomes(&pass), [Outcome::AlreadyRead]);
     }
 
     /// A revocation through a height past the mainnet tip, a mistake in units
